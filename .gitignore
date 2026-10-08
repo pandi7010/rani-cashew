@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 captures/
+recordings/
 logs/
 runs/
 temp_train.py

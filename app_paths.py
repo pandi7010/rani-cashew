@@ -18,6 +18,8 @@ NAV_ICONS_DIR = ASSETS_DIR / "nav_icons"
 RUNS_DIR = BASE_DIR / "runs"
 LOGS_DIR = BASE_DIR / "logs"
 AUTO_LABELER_SCRIPT = BASE_DIR / "ai_auto_labeler.py"
+FFC_GAIN_MAP_PATH = BASE_DIR / "ffc_gain_map.png"      # white calibration (flat-field) map
+RECORDINGS_DIR = BASE_DIR / "recordings"                # camera frames recorded for replay tests
 
 # Copies of the magic wand and TCM Studio tools (see external_tools/README.md).
 EXTERNAL_TOOLS_DIR = BASE_DIR / "external_tools"

@@ -28,7 +28,8 @@ import app_paths
 import preprocess
 import flow_geometry as fg
 from class_registry import ClassRegistry, normalize_name
-from usb_camera import CameraThread, CameraSettings
+from camera_backends import CameraThread, CameraSettings, FlatField
+from relay_output import RelayOutput, FIRST_EJECTOR, LAST_EJECTOR
 
 log = app_paths.setup_logging("grader")
 
@@ -431,7 +432,7 @@ class SharedState:
 
         self.cam_gain, self.cam_r, self.cam_g, self.cam_b = 1.0, 1.0, 1.0, 1.0
         self.analog_gain, self.digital_gain = 1.0, 1.0
-        self.camera_settings = CameraSettings()             # USB camera / test source (usb_camera.py)
+        self.camera_settings = CameraSettings()             # camera / test source (camera_backends.py)
         self.flow_direction = fg.RIGHT_TO_LEFT              # also fixes the line orientation (vertical / horizontal)
         self.line_y_full = None                             # position of a horizontal decision line
         self.opencv_filter = {
@@ -443,7 +444,6 @@ class SharedState:
         }
         
         self.yolo_conf = DEFAULT_YOLO_CONF
-        self.master_ejector_enabled = False     # ejectors stay OFF until the operator switches them on
         
         self.phase = "READY"
         self.frame = None
@@ -625,7 +625,11 @@ class SharedState:
                 self.line_x_full = cfg.get("line_x_full")
                 self.line_y_full = cfg.get("line_y_full")
                 self.flow_direction = fg.valid_flow(cfg.get("flow_direction", fg.RIGHT_TO_LEFT))
-                self.camera_settings = CameraSettings.from_dict(cfg.get("usb_camera"))
+                if "camera_source" in cfg:
+                    self.camera_settings = CameraSettings.from_dict(cfg["camera_source"])
+                else:   # config from before camera_backends.py: the exposure was stored with the colour gains
+                    old_exposure = (cfg.get("camera") or {}).get("exposure")
+                    self.camera_settings = CameraSettings(exposure_us=float(old_exposure) if old_exposure else None)
                 loaded_classes = cfg.get("capture_classes", {})
                 if loaded_classes:
                     for k, v in loaded_classes.items():
@@ -666,7 +670,7 @@ class SharedState:
                     "line_x_full": self.line_x_full,
                     "line_y_full": self.line_y_full,
                     "flow_direction": self.flow_direction,
-                    "usb_camera": self.camera_settings.to_dict(),
+                    "camera_source": self.camera_settings.to_dict(),
                     "capture_classes": self.capture_classes,
                     "active_capture_class_id": self.active_capture_class_id,
                     "camera": {
@@ -712,7 +716,7 @@ class SharedState:
                 "is_conveyor_on": self.is_conveyor_on,
                 "gain": self.cam_gain, "r": self.cam_r, "g": self.cam_g, "b": self.cam_b,
                 "a_gain": self.analog_gain, "d_gain": self.digital_gain,
-                "exposure": "auto" if self.camera_settings.auto_exposure else self.camera_settings.exposure
+                "exposure": self.camera_settings.exposure_us if self.camera_settings.exposure_us is not None else "camera default"
             }
 
     def handle_mouse_down(self, pt: Tuple[int, int]):
@@ -769,7 +773,7 @@ class ProcessingThread(threading.Thread):
         self.display_queue = display_queue
         self.stop_event = stop_event
         self.shared_state = shared_state
-        self.controller = controller
+        self.controller = controller    # RelayOutput: the only way a relay is fired
         self.fire_counts = fire_counts 
         self.fire_lock = fire_lock      
         self.model = None
@@ -889,7 +893,8 @@ class ProcessingThread(threading.Thread):
                     self.display_queue.put((err_frame, {"scale": 1.0, "x_off": 0, "y_off": 0, "orig_w": 1000, "orig_h": 800}))
                     continue
                 
-                (frame_full, w, h) = data
+                frame_full, w, h = data[0], data[1], data[2]
+                self.frame_time = data[3] if len(data) > 3 else time.time()    # when the camera took the frame
                 if frame_full is None: continue
                 
                 with self.shared_state.lock:
@@ -1452,9 +1457,7 @@ class ProcessingThread(threading.Thread):
                 if act_id is not None and 1 <= act_id <= NUM_ACTUATORS:
                     d_ms, p_ms = self.shared_state.get_timing(act_id)
 
-                    if self.shared_state.master_ejector_enabled:
-                        self.controller.pulse_actuator(act_id, d_ms, p_ms)
-                        print(f"[FIRE] Ejector {act_id} fired for Cashew ID {obj['id']} ({label}) - Delay: {d_ms}ms, Pulse: {p_ms}ms")
+                    self.controller.fire(act_id, d_ms, p_ms, source=f"ID {obj['id']} {label}")
                     
                     with self.fire_lock:
                         self.fire_counts[int(display_cid)] = self.fire_counts.get(int(display_cid),0) + 1
@@ -1676,10 +1679,13 @@ class App(tk.Tk):
         self.camera_queue = queue.Queue(maxsize=2)
         self.display_queue = queue.Queue(maxsize=2)
         
-        self.camera_thread = CameraThread(self.camera_queue, self.stop_event, self.shared_state.camera_settings)
+        self.flat_field = FlatField(app_paths.FFC_GAIN_MAP_PATH)
+        self.camera_thread = CameraThread(self.camera_queue, self.stop_event, self.shared_state.camera_settings, self.flat_field)
+        # Every relay pulse of the grader goes through this object (relays 1-40 only, dry-run, master switch).
+        self.relay_output = RelayOutput(self.controller)
         self.processing_thread = ProcessingThread(
             self.model_path, self.registry, self.camera_queue, self.display_queue, 
-            self.stop_event, self.shared_state, self.controller, self.fire_counts, self.fire_lock,
+            self.stop_event, self.shared_state, self.relay_output, self.fire_counts, self.fire_lock,
             model=yolo_model
         )
         
@@ -2383,7 +2389,7 @@ class App(tk.Tk):
         p_pneu = tk.Frame(self.page_container, bg=self.colors["surface"])
         self.pages["Pneumatic"] = p_pneu
         # Right controls panel
-        pn_controls = tk.Frame(p_pneu, bg=self.colors["surface"], width=300, padx=20, pady=20)
+        pn_controls = tk.Frame(p_pneu, bg=self.colors["surface"], width=320, padx=15, pady=15)
         pn_controls.pack(side="right", fill="y", padx=(10,0))
         pn_controls.pack_propagate(False)
         
@@ -2406,32 +2412,99 @@ class App(tk.Tk):
         
         ttk.Button(pn_controls, text="RECALCULATE FROM DISTANCES", style="Secondary.TButton", command=self._recalculate_all_from_distances).pack(fill=tk.X, pady=(0, 10))
         
-        ttk.Button(pn_controls, text="FIRE ALL", style="Danger.TButton", command=self._fire_all).pack(fill=tk.X, pady=(0, 10))
-        ttk.Button(pn_controls, text="SEQUENCE ALL", style="Danger.TButton", command=self._sequence_all).pack(fill=tk.X, pady=(0, 10))
         ttk.Button(pn_controls, text="OPEN PLC DIAGNOSTICS", style="Primary.TButton", command=lambda: self.controller.open_diagnostics_gui() if hasattr(self.controller, 'open_diagnostics_gui') else None).pack(fill=tk.X, pady=(0, 10))
 
-        
-        ttk.Separator(pn_controls, orient="horizontal").pack(fill=tk.X, pady=20)
-        
-        # Safety: the ejectors are OFF at every start; the operator switches them on.
+        ttk.Separator(pn_controls, orient="horizontal").pack(fill=tk.X, pady=10)
+
+        surf = self.colors["surface"]
+        # DRY-RUN: on at every start. Nothing reaches the PLC; what would fire is only counted and logged.
+        self.dry_run_var = tk.BooleanVar(value=True)
+        # MASTER EJECTOR: off at every start. Blocks firing that comes from grading.
         self.master_ejector_var = tk.BooleanVar(value=False)
-        self.shared_state.master_ejector_enabled = False
-        
+
+        def refresh_safety_labels():
+            dry, master = self.relay_output.dry_run, self.relay_output.master_enabled
+            self.dry_run_btn.config(text="DRY-RUN: ON (nothing is sent to the PLC)" if dry else "DRY-RUN: OFF (REAL valves)",
+                                    fg=self.colors["success"] if dry else self.colors["danger"])
+            self.master_ej_btn.config(text="MASTER EJECTOR: ON" if master else "MASTER EJECTOR: OFF")
+            if not master:
+                text, colour = "● Grading does not fire", self.colors["text_muted"]
+            elif dry:
+                text, colour = "● Grading: dry-run only", self.colors["warning"]
+            else:
+                text, colour = "● Grading fires REAL valves", self.colors["danger"]
+            self.master_ej_led.config(text=text, fg=colour)
+
+        def toggle_dry_run():
+            want = self.dry_run_var.get()
+            if not want and not messagebox.askyesno("DRY-RUN OFF", "With DRY-RUN off, test buttons and grading (if MASTER EJECTOR is on) energise REAL valves.\n\nSwitch DRY-RUN off?"):
+                self.dry_run_var.set(True)
+                want = True
+            self.relay_output.dry_run = want
+            log.info("DRY-RUN %s", "ON" if want else "OFF")
+            refresh_safety_labels()
+
         def toggle_ejector():
-            state = self.master_ejector_var.get()
-            self.shared_state.master_ejector_enabled = state
-            color = self.colors["success"] if state else self.colors["danger"]
-            text = "MASTER EJECTOR: ON" if state else "MASTER EJECTOR: OFF"
-            self.master_ej_btn.config(text=text)
-            self.master_ej_led.config(fg=color, text="● Operating" if state else "● Fire Off")
-        
-        self.master_ej_btn = tk.Checkbutton(pn_controls, text="MASTER EJECTOR: OFF", variable=self.master_ejector_var, command=toggle_ejector, bg=self.colors["surface"], fg="white", selectcolor=self.colors["surface_light"], font=("Roboto", 11, "bold"), indicatoron=False)
-        self.master_ej_btn.pack(fill=tk.X, pady=(0, 10))
-        
-        led_frm = tk.Frame(pn_controls, bg=self.colors["surface"])
-        led_frm.pack(fill=tk.X, pady=(0, 10))
-        self.master_ej_led = tk.Label(led_frm, text="● Fire Off", font=("Roboto", 14, "bold"), bg=self.colors["surface"], fg=self.colors["danger"])
+            self.relay_output.master_enabled = self.master_ejector_var.get()
+            log.info("MASTER EJECTOR %s", "ON" if self.relay_output.master_enabled else "OFF")
+            refresh_safety_labels()
+
+        self.dry_run_btn = tk.Checkbutton(pn_controls, variable=self.dry_run_var, command=toggle_dry_run, bg=surf, selectcolor=self.colors["surface_light"],
+                                          activebackground=surf, font=("Roboto", 9, "bold"), indicatoron=False, wraplength=240, pady=4)
+        self.dry_run_btn.pack(fill=tk.X, pady=(0, 6))
+        self.master_ej_btn = tk.Checkbutton(pn_controls, variable=self.master_ejector_var, command=toggle_ejector, bg=surf, fg="white", selectcolor=self.colors["surface_light"],
+                                            activebackground=surf, font=("Roboto", 11, "bold"), indicatoron=False, pady=4)
+        self.master_ej_btn.pack(fill=tk.X, pady=(0, 6))
+        self.master_ej_led = tk.Label(pn_controls, text="", font=("Roboto", 10, "bold"), bg=surf)
         self.master_ej_led.pack(anchor="center")
+        refresh_safety_labels()
+
+        ttk.Separator(pn_controls, orient="horizontal").pack(fill=tk.X, pady=10)
+
+        # ── Single relay test: check that each M coil drives the right valve ──
+        ttk.Label(pn_controls, text="SINGLE RELAY TEST", style="Header.TLabel").pack(anchor="w", pady=(0, 6))
+        test_row = tk.Frame(pn_controls, bg=surf)
+        test_row.pack(fill=tk.X)
+        ttk.Label(test_row, text="Relay", style="Surface.TLabel").pack(side=tk.LEFT)
+        self.test_relay_var = tk.StringVar(value="1")
+        ttk.Combobox(test_row, textvariable=self.test_relay_var, values=[str(r) for r in range(FIRST_EJECTOR, LAST_EJECTOR + 1)],
+                     width=4, state="readonly").pack(side=tk.LEFT, padx=(5, 10))
+        ttk.Label(test_row, text="Pulse ms", style="Surface.TLabel").pack(side=tk.LEFT)
+        self.test_pulse_var = tk.StringVar(value="100")
+        tk.Entry(test_row, textvariable=self.test_pulse_var, width=5, bg=self.colors["surface_light"], fg=self.colors["text"], bd=0, font=("Roboto", 11)).pack(side=tk.LEFT, padx=5)
+        self.lbl_test_relay_addr = tk.Label(pn_controls, text="", bg=surf, fg=self.colors["info"], font=("Roboto", 10, "bold"), anchor="w")
+        self.lbl_test_relay_addr.pack(fill=tk.X, pady=(6, 2))
+        nav_row = tk.Frame(pn_controls, bg=surf)
+        nav_row.pack(fill=tk.X, pady=2)
+        nav_row.columnconfigure(0, weight=1); nav_row.columnconfigure(1, weight=3); nav_row.columnconfigure(2, weight=1)
+
+        def show_test_relay(*_):
+            try:
+                relay = int(self.test_relay_var.get())
+            except ValueError:
+                return
+            roi = 1 if relay <= 20 else 2
+            role = "REJECT relay" if relay in (1, 21) else "class / grade relay"
+            self.lbl_test_relay_addr.config(text=f"{self.relay_output.describe(relay)}\nROI {roi}, {role}", justify="left")
+
+        def step_test_relay(step):
+            relay = min(LAST_EJECTOR, max(FIRST_EJECTOR, int(self.test_relay_var.get()) + step))
+            self.test_relay_var.set(str(relay))
+
+        ttk.Button(nav_row, text="◀", width=3, command=lambda: step_test_relay(-1)).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        ttk.Button(nav_row, text="TEST FIRE THIS RELAY", style="Danger.TButton", command=self._test_fire_selected_relay).grid(row=0, column=1, sticky="ew")
+        ttk.Button(nav_row, text="▶", width=3, command=lambda: step_test_relay(1)).grid(row=0, column=2, sticky="ew", padx=(3, 0))
+        self.lbl_test_relay_result = tk.Label(pn_controls, text="Only when the machine is STOPPED.", bg=surf, fg=self.colors["text_muted"],
+                                              font=("Roboto", 9), anchor="w", justify="left", wraplength=250)
+        self.lbl_test_relay_result.pack(fill=tk.X, pady=(4, 8))
+        self.test_relay_var.trace_add("write", show_test_relay)
+        show_test_relay()
+
+        all_row = tk.Frame(pn_controls, bg=surf)
+        all_row.pack(fill=tk.X)
+        all_row.columnconfigure(0, weight=1); all_row.columnconfigure(1, weight=1)
+        ttk.Button(all_row, text="SEQUENCE 1-40", command=self._sequence_all).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        ttk.Button(all_row, text="FIRE 1-40", command=self._fire_all).grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
         pn_canvas = tk.Canvas(p_pneu, bg=self.colors["surface"], highlightthickness=0)
         pn_scroll = ttk.Scrollbar(p_pneu, orient="vertical", command=pn_canvas.yview)
@@ -3733,36 +3806,43 @@ except Exception as e:
         ttk.Label(p_vis, text="CAMERA", style="Header.TLabel").pack(anchor="w", pady=(20,5))
         cs = self.shared_state.camera_settings
         self.cam_vars = {
-            "source": tk.StringVar(value=cs.source), "index": tk.StringVar(value=str(cs.index)),
-            "width": tk.StringVar(value=str(cs.width)), "height": tk.StringVar(value=str(cs.height)),
-            "fps": tk.StringVar(value=str(cs.fps)), "mjpg": tk.BooleanVar(value=cs.mjpg),
-            "auto_exposure": tk.BooleanVar(value=cs.auto_exposure), "exposure": tk.StringVar(value=f"{cs.exposure:g}"),
+            "source": tk.StringVar(value=cs.source),
+            "exposure_us": tk.StringVar(value="" if cs.exposure_us is None else f"{cs.exposure_us:g}"),
+            "gain": tk.StringVar(value="" if cs.gain is None else f"{cs.gain:g}"),
+            "fps_limit_enabled": tk.BooleanVar(value=cs.fps_limit_enabled),
+            "fps_limit": tk.StringVar(value=f"{cs.fps_limit:g}"),
             "test_path": tk.StringVar(value=cs.test_path), "test_loop": tk.BooleanVar(value=cs.test_loop),
+            "test_fps": tk.StringVar(value=f"{cs.test_fps:g}"),
         }
         src_frm = tk.Frame(p_vis, bg=surf)
         src_frm.pack(fill=tk.X, pady=2)
-        for label, value in (("USB camera", "usb"), ("Test source (video / images)", "test")):
+        for label, value in (("Camera (Aravis)", "aravis"), ("Test source (video / images)", "file")):
             tk.Radiobutton(src_frm, text=label, variable=self.cam_vars["source"], value=value, bg=surf, fg=text, selectcolor=self.colors["bg"],
                            activebackground=surf, activeforeground=text, font=("Roboto", 10, "bold")).pack(side=tk.LEFT, padx=(0, 15))
+        self.lbl_cam_model = tk.Label(p_vis, text="", bg=surf, fg=self.colors["info"], font=("Roboto", 10, "bold"), justify="left", anchor="w", wraplength=430)
+        self.lbl_cam_model.pack(fill=tk.X, pady=(2, 4))
 
-        usb_grid = tk.Frame(p_vis, bg=surf)
-        usb_grid.pack(fill=tk.X, pady=5)
-        for col, (label, key, width) in enumerate((("Index", "index", 4), ("Width", "width", 6), ("Height", "height", 6), ("FPS", "fps", 5))):
-            ttk.Label(usb_grid, text=label, style="Surface.TLabel").grid(row=0, column=col, sticky="w", padx=(0, 12))
-            entry(usb_grid, self.cam_vars[key], width).grid(row=1, column=col, sticky="w", padx=(0, 12), pady=2)
-        exp_frm = tk.Frame(p_vis, bg=surf)
-        exp_frm.pack(fill=tk.X, pady=2)
-        exposure_entry = entry(exp_frm, self.cam_vars["exposure"], 7)
+        cam_set = tk.Frame(p_vis, bg=surf)
+        cam_set.pack(fill=tk.X, pady=2)
+        ttk.Label(cam_set, text="Exposure (µs)", style="Surface.TLabel").grid(row=0, column=0, sticky="w", pady=3)
+        entry(cam_set, self.cam_vars["exposure_us"], 9).grid(row=0, column=1, padx=10, pady=3, sticky="w")
+        self.lbl_exposure_range = ttk.Label(cam_set, text="", style="Surface.TLabel", foreground=muted)
+        self.lbl_exposure_range.grid(row=0, column=2, sticky="w")
+        ttk.Label(cam_set, text="Camera gain", style="Surface.TLabel").grid(row=1, column=0, sticky="w", pady=3)
+        entry(cam_set, self.cam_vars["gain"], 9).grid(row=1, column=1, padx=10, pady=3, sticky="w")
+        self.lbl_gain_range = ttk.Label(cam_set, text="", style="Surface.TLabel", foreground=muted)
+        self.lbl_gain_range.grid(row=1, column=2, sticky="w")
+        fps_entry = entry(cam_set, self.cam_vars["fps_limit"], 9)
 
-        def on_auto_exposure():
-            exposure_entry.config(state=tk.DISABLED if self.cam_vars["auto_exposure"].get() else tk.NORMAL)
+        def on_fps_limit():
+            fps_entry.config(state=tk.NORMAL if self.cam_vars["fps_limit_enabled"].get() else tk.DISABLED)
 
-        check(exp_frm, "Auto exposure", self.cam_vars["auto_exposure"], on_auto_exposure).pack(side=tk.LEFT)
-        ttk.Label(exp_frm, text="  Manual exposure:", style="Surface.TLabel").pack(side=tk.LEFT)
-        exposure_entry.pack(side=tk.LEFT, padx=5)
-        ttk.Label(exp_frm, text="(camera units)", style="Surface.TLabel", foreground=muted).pack(side=tk.LEFT)
-        on_auto_exposure()
-        check(p_vis, "MJPG stream (needed for high resolution / FPS on most USB cameras)", self.cam_vars["mjpg"]).pack(anchor="w")
+        check(cam_set, "Limit FPS to", self.cam_vars["fps_limit_enabled"], on_fps_limit).grid(row=2, column=0, sticky="w", pady=3)
+        fps_entry.grid(row=2, column=1, padx=10, pady=3, sticky="w")
+        ttk.Label(cam_set, text="off = free running", style="Surface.TLabel", foreground=muted).grid(row=2, column=2, sticky="w")
+        on_fps_limit()
+        tk.Label(p_vis, text="An empty exposure or gain field leaves the camera's own value unchanged.",
+                 bg=surf, fg=muted, font=("Roboto", 9), justify="left", anchor="w", wraplength=430).pack(fill=tk.X)
 
         test_frm = tk.Frame(p_vis, bg=surf)
         test_frm.pack(fill=tk.X, pady=(8, 2))
@@ -3775,22 +3855,67 @@ except Exception as e:
             if path: self.cam_vars["test_path"].set(path)
 
         def browse_test_folder():
-            path = filedialog.askdirectory(title="Folder of test images", initialdir=str(app_paths.FULL_FRAME_DIR))
+            start = app_paths.RECORDINGS_DIR if app_paths.RECORDINGS_DIR.exists() else app_paths.BASE_DIR
+            path = filedialog.askdirectory(title="Folder of test images (for example a recording)", initialdir=str(start))
             if path: self.cam_vars["test_path"].set(path)
 
         ttk.Button(test_frm, text="File", width=5, command=browse_test_file).pack(side=tk.LEFT, padx=2)
         ttk.Button(test_frm, text="Folder", width=7, command=browse_test_folder).pack(side=tk.LEFT, padx=2)
-        check(p_vis, "Repeat the test source", self.cam_vars["test_loop"]).pack(anchor="w")
+        test_opt = tk.Frame(p_vis, bg=surf)
+        test_opt.pack(fill=tk.X)
+        check(test_opt, "Repeat", self.cam_vars["test_loop"]).pack(side=tk.LEFT)
+        ttk.Label(test_opt, text="   FPS when the files have no timestamps:", style="Surface.TLabel").pack(side=tk.LEFT)
+        entry(test_opt, self.cam_vars["test_fps"], 5).pack(side=tk.LEFT, padx=5)
 
-        cam_btns = tk.Frame(p_vis, bg=surf)
-        cam_btns.pack(fill=tk.X, pady=(8, 2))
-        cam_btns.columnconfigure(0, weight=1); cam_btns.columnconfigure(1, weight=1)
-        ttk.Button(cam_btns, text="APPLY & RECONNECT", style="Primary.TButton", command=self._apply_camera_settings).grid(row=0, column=0, padx=(0, 5), sticky="ew")
-        ttk.Button(cam_btns, text="DETECT SUPPORTED MODES", command=self._probe_camera).grid(row=0, column=1, padx=(5, 0), sticky="ew")
+        ttk.Button(p_vis, text="APPLY CAMERA SETTINGS", style="Primary.TButton", command=self._apply_camera_settings).pack(fill=tk.X, pady=(8, 2))
         self.lbl_cam_status = tk.Label(p_vis, text="", bg=surf, fg=muted, font=("Roboto", 10), justify="left", anchor="w", wraplength=430)
         self.lbl_cam_status.pack(fill=tk.X, pady=(6, 0))
-        tk.Label(p_vis, text="ROIs and the decision line are in pixels: after changing the resolution, draw them again.",
-                 bg=surf, fg=muted, font=("Roboto", 9), justify="left", anchor="w", wraplength=430).pack(fill=tk.X)
+
+        # ── White calibration (flat-field correction) ──
+        ttk.Label(p_vis, text="WHITE CALIBRATION (FFC)", style="Header.TLabel").pack(anchor="w", pady=(20,5))
+        self.ffc_enabled_var = tk.BooleanVar(value=self.flat_field.enabled)
+
+        def on_ffc_toggle():
+            if self.ffc_enabled_var.get() and not self.flat_field.available:
+                messagebox.showinfo("White calibration", "No calibration yet. Put a plain white sheet under the camera and press TEACH WHITE.")
+                self.ffc_enabled_var.set(False)
+            self.flat_field.enabled = self.ffc_enabled_var.get()
+
+        def teach_white():
+            if self.shared_state.phase == "RUNNING":
+                messagebox.showwarning("Stop first", "Stop the machine before the white calibration.")
+                return
+            if self.camera_thread.state != "ONLINE":
+                messagebox.showwarning("White calibration", "The camera must be ONLINE (not the test source).")
+                return
+            if not messagebox.askyesno("White calibration", "Is a plain white sheet covering the whole camera view now?\n\n"
+                                       "The next frame becomes the white reference and replaces the saved one."):
+                return
+            self.flat_field.enabled = True      # so that the request is picked up with the next frame
+            self.flat_field.request_calibration()
+            self.ffc_enabled_var.set(True)
+
+        check(p_vis, "Use white calibration", self.ffc_enabled_var, on_ffc_toggle).pack(anchor="w")
+        ttk.Button(p_vis, text="TEACH WHITE (white sheet under the camera)", command=teach_white).pack(fill=tk.X, pady=(4, 2))
+        self.lbl_ffc_status = tk.Label(p_vis, text="", bg=surf, fg=muted, font=("Roboto", 9), justify="left", anchor="w", wraplength=430)
+        self.lbl_ffc_status.pack(fill=tk.X)
+
+        # ── Recorder: real camera frames for replay tests ──
+        ttk.Label(p_vis, text="RECORD TEST FRAMES", style="Header.TLabel").pack(anchor="w", pady=(20,5))
+        rec_frm = tk.Frame(p_vis, bg=surf)
+        rec_frm.pack(fill=tk.X)
+        self.rec_seconds_var, self.rec_fps_var = tk.StringVar(value="10"), tk.StringVar(value="25")
+        ttk.Label(rec_frm, text="Seconds", style="Surface.TLabel").pack(side=tk.LEFT)
+        entry(rec_frm, self.rec_seconds_var, 4).pack(side=tk.LEFT, padx=(5, 12))
+        ttk.Label(rec_frm, text="FPS", style="Surface.TLabel").pack(side=tk.LEFT)
+        entry(rec_frm, self.rec_fps_var, 4).pack(side=tk.LEFT, padx=(5, 12))
+        ttk.Button(rec_frm, text="RECORD", command=self._start_recording).pack(side=tk.LEFT, padx=2)
+        ttk.Button(rec_frm, text="STOP", command=lambda: self.camera_thread.recorder.stop()).pack(side=tk.LEFT, padx=2)
+        self.lbl_rec_status = tk.Label(p_vis, text="Saves camera frames (before colour gain) into recordings/. Replay them as a test source.",
+                                       bg=surf, fg=muted, font=("Roboto", 9), justify="left", anchor="w", wraplength=430)
+        self.lbl_rec_status.pack(fill=tk.X, pady=(4, 0))
+        tk.Label(p_vis, text="ROIs and the decision line are in pixels of the full camera image.",
+                 bg=surf, fg=muted, font=("Roboto", 9), justify="left", anchor="w", wraplength=430).pack(fill=tk.X, pady=(8, 0))
 
         # ── Colour gain (software, applied to every frame before the AI and before any image is saved) ──
         ttk.Label(p_vis, text="COLOUR GAIN (SOFTWARE)", style="Header.TLabel").pack(anchor="w", pady=(20,5))
@@ -3818,22 +3943,35 @@ except Exception as e:
 
     def _camera_settings_from_ui(self) -> CameraSettings:
         v = self.cam_vars
+
+        def optional_number(key):
+            raw = v[key].get().strip().replace(",", ".")
+            return float(raw) if raw else None
+
         settings = CameraSettings(
-            source=v["source"].get(), index=int(v["index"].get()), width=int(v["width"].get()), height=int(v["height"].get()),
-            fps=int(v["fps"].get()), mjpg=bool(v["mjpg"].get()), auto_exposure=bool(v["auto_exposure"].get()),
-            exposure=float(v["exposure"].get()), test_path=v["test_path"].get().strip(), test_loop=bool(v["test_loop"].get()))
-        if settings.index < 0 or settings.width < 160 or settings.height < 120 or not (1 <= settings.fps <= 240):
-            raise ValueError("Index must be 0 or more, size at least 160 x 120, FPS 1 to 240.")
+            source=v["source"].get(), device_id=self.shared_state.camera_settings.device_id,
+            exposure_us=optional_number("exposure_us"), gain=optional_number("gain"),
+            fps_limit_enabled=bool(v["fps_limit_enabled"].get()), fps_limit=float(v["fps_limit"].get()),
+            test_path=v["test_path"].get().strip(), test_loop=bool(v["test_loop"].get()), test_fps=float(v["test_fps"].get()))
+        info = self.camera_thread.info if self.camera_thread.state == "ONLINE" else {}
+        for value, bounds, name in ((settings.exposure_us, info.get("exposure_bounds"), "Exposure"), (settings.gain, info.get("gain_bounds"), "Gain")):
+            if value is not None and bounds and not (bounds[0] <= value <= bounds[1]):
+                raise ValueError(f"{name} must be between {bounds[0]:g} and {bounds[1]:g}.")
+        if settings.exposure_us is not None and settings.exposure_us <= 0:
+            raise ValueError("Exposure must be more than 0.")
+        if not (0.1 <= settings.fps_limit <= 1000) or not (1 <= settings.test_fps <= 240):
+            raise ValueError("FPS limit must be 0.1 to 1000, test FPS 1 to 240.")
         return settings
 
     def _apply_camera_settings(self):
-        if self.shared_state.phase == "RUNNING":
-            messagebox.showwarning("Stop first", "Stop the machine before changing the camera.")
-            return False
         try:
             settings = self._camera_settings_from_ui()
         except ValueError as e:
             messagebox.showerror("Camera settings", f"Please check the numbers.\n{e}")
+            return False
+        current = self.shared_state.camera_settings
+        if current.needs_reopen(settings) and self.shared_state.phase == "RUNNING":
+            messagebox.showwarning("Stop first", "Stop the machine before changing the camera source.")
             return False
         with self.shared_state.lock:
             self.shared_state.camera_settings = settings
@@ -3842,52 +3980,58 @@ except Exception as e:
         log.info("Camera settings applied: %s", settings)
         return True
 
-    def _probe_camera(self):
-        """Ask the USB camera which resolutions / frame rates it accepts (the picture stops for a few seconds)."""
-        if self.cam_vars["source"].get() != "usb":
-            messagebox.showinfo("Detect modes", "Select 'USB camera' first.")
+    def _start_recording(self):
+        if not self.camera_thread.is_connected:
+            messagebox.showwarning("Record", "There is no picture to record.")
             return
-        if not self._apply_camera_settings():
+        try:
+            seconds, fps = float(self.rec_seconds_var.get()), float(self.rec_fps_var.get())
+            if not (1 <= seconds <= 120) or not (1 <= fps <= 100):
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Record", "Seconds must be 1 to 120, FPS 1 to 100.")
             return
-        self.lbl_cam_status.config(text="Detecting supported modes...")
-        self._probe_pending = True
-        self.camera_thread.request_probe()
-
-        def poll():
-            result = self.camera_thread.probe_result
-            if result is None:
-                self.after(300, poll)
-                return
-            self._probe_pending = False
-            if isinstance(result, str):
-                messagebox.showwarning("Detect modes", result)
-                return
-            lines = "\n".join(f"{w} x {h}   up to {fps} fps" for w, h, fps in result)
-            w, h, fps = result[0]
-            if messagebox.askyesno("Supported modes", f"The camera accepted these modes (MJPG {'on' if self.cam_vars['mjpg'].get() else 'off'}):\n\n{lines}"
-                                   f"\n\nUse the largest one ({w} x {h} @ {fps} fps)?"):
-                self.cam_vars["width"].set(str(w)); self.cam_vars["height"].set(str(h)); self.cam_vars["fps"].set(str(fps))
-                self._apply_camera_settings()
-
-        self.after(300, poll)
+        folder = app_paths.RECORDINGS_DIR / datetime.now().strftime("%Y%m%d_%H%M%S")
+        ok, message = self.camera_thread.recorder.start(str(folder), seconds, fps)
+        if not ok:
+            messagebox.showwarning("Record", message)
 
     def _refresh_camera_status(self):
         cam = self.camera_thread
         self.cam_indicator.config(text=f"● Camera {cam.state}",
                                   fg=self.colors["success"] if cam.is_connected else (self.colors["warning"] if cam.state in ("CONNECTING", "RECONNECTING") else self.colors["danger"]))
-        if not hasattr(self, 'lbl_cam_status') or getattr(self, '_probe_pending', False):
+        if not hasattr(self, 'lbl_cam_status'):
             return
-        if cam.is_connected:
-            a = cam.actual
-            text = f"{cam.state}: {a.get('width')} x {a.get('height')}, {cam.fps:.1f} fps measured"
-            if cam.state == "ONLINE":
-                text += f" (camera reports {a.get('fps', 0):.0f} fps, exposure {a.get('exposure', 0):g}, auto-exposure flag {a.get('auto_exposure', 0):g})"
-                if cam.reconnect_count:
-                    text += f"\nReconnected {cam.reconnect_count} time(s) since start."
+        info = cam.info or {}
+        if cam.is_connected and cam.state == "ONLINE":
+            model = f"{info.get('vendor', '')} {info.get('model', '')}  |  {info.get('pixel_format', '?')}  |  {info.get('width', '?')} x {info.get('height', '?')}"
+            limit = f"limit {info.get('fps_limit', 0):g} fps" if info.get("fps_limit_enabled") else "free running"
+            text = (f"ONLINE: {cam.fps:.1f} fps measured ({limit}). Exposure {info.get('exposure_us', 0):.0f} µs, gain {info.get('gain', 0):g}."
+                    f" Auto: exposure {info.get('exposure_auto', '?')}, gain {info.get('gain_auto', '?')}, white balance {info.get('white_balance_auto', '?')}.")
+            if cam.reconnect_count:
+                text += f"\nReconnected {cam.reconnect_count} time(s) since start."
+            eb, gb = info.get("exposure_bounds"), info.get("gain_bounds")
+            self.lbl_exposure_range.config(text=f"{eb[0]:g} - {eb[1]:g}" if eb else "")
+            self.lbl_gain_range.config(text=f"{gb[0]:g} - {gb[1]:g}" if gb else "")
+        elif cam.is_connected:
+            model = f"Test source: {info.get('model', '')}  |  {info.get('frames', '?')} frame(s)" + ("  |  recorded timing" if info.get("recorded_timing") else "")
+            text = f"TEST: {cam.fps:.1f} fps"
         else:
-            text = f"{cam.state}: {cam.last_error}"
+            model, text = "", f"{cam.state}: {cam.last_error}"
+        if self.lbl_cam_model.cget("text") != model:
+            self.lbl_cam_model.config(text=model)
         if self.lbl_cam_status.cget("text") != text:
             self.lbl_cam_status.config(text=text, fg=self.colors["text_muted"] if cam.is_connected else self.colors["warning"])
+        ffc = self.flat_field
+        ffc_text = ("White calibration is ON." if ffc.enabled else "White calibration is saved but switched off.") if ffc.available else "No white calibration saved."
+        if self.lbl_ffc_status.cget("text") != ffc_text:
+            self.lbl_ffc_status.config(text=ffc_text)
+            self.ffc_enabled_var.set(ffc.enabled)
+        rec = cam.recorder
+        if rec.active:
+            self.lbl_rec_status.config(text=f"Recording... {rec.saved} frames saved, {rec.dropped} dropped", fg=self.colors["warning"])
+        elif rec.message and self.lbl_rec_status.cget("text") != rec.message:
+            self.lbl_rec_status.config(text=rec.message, fg=self.colors["text_muted"])
 
     def _refresh_line_buttons(self):
         if not hasattr(self, 'btn_line_minus'):
@@ -3932,61 +4076,88 @@ except Exception as e:
             pass        # a field is empty or half typed
         except Exception:
             log.exception("Could not apply the colour gain")
-    def _fire_all(self):
-        try:
-            pulse = int(self.shared_state.common_pulse_ms)
-        except Exception:
-            pulse = 200
+    # ── manual relay tests (operator actions; all through relay_output, relays 1-40 only) ──
+    def _manual_test_allowed(self) -> bool:
+        if self.shared_state.phase == "RUNNING":
+            messagebox.showwarning("Stop first", "Relay tests are only possible when the machine is STOPPED.")
+            return False
+        return True
 
-        if hasattr(self.controller, 'fire_all'):
-            self.controller.fire_all(pulse)
-        else:
-            def fire():
-                for i in range(1, NUM_ACTUATORS+1):
-                    if self.controller and self.controller.connected:
-                        self.controller.pulse_actuator(i, 0, pulse) 
-            threading.Thread(target=fire, daemon=True).start()
+    def _test_pulse_ms(self) -> int:
+        try:
+            pulse = int(self.test_pulse_var.get())
+        except (ValueError, tk.TclError, AttributeError):
+            pulse = int(self.shared_state.common_pulse_ms)
+        return min(1000, max(10, pulse))
+
+    def _result_text(self, relay, result):
+        texts = {"SENT": "pulse sent to the PLC", "DRY_RUN": "DRY-RUN: NOT sent to the PLC",
+                 "PLC_OFFLINE": "PLC OFFLINE: NOT sent", "REFUSED": "refused (not an ejector relay)", "MASTER_OFF": "MASTER EJECTOR off"}
+        return f"{time.strftime('%H:%M:%S')}  {self.relay_output.describe(relay)}: {texts.get(result, result)}"
+
+    def _flash_relay_led(self, relay, pulse):
+        if hasattr(self, 'pn_leds') and relay in self.pn_leds:
+            self.pn_leds[relay].config(fg=self.colors["success"])
+            self.after(max(pulse, 200), lambda r=relay: self.pn_leds[r].config(fg=self.colors["surface_light"]))
+
+    def _test_fire_relay(self, relay):
+        """Fire one relay once, by hand. Returns the result code."""
+        if not self._manual_test_allowed():
+            return None
+        pulse = self._test_pulse_ms()
+        result = self.relay_output.test_fire(relay, pulse)
+        self._flash_relay_led(relay, pulse)
+        if hasattr(self, 'lbl_test_relay_result'):
+            ok = result == "SENT"
+            self.lbl_test_relay_result.config(text=self._result_text(relay, result),
+                                              fg=self.colors["success"] if ok else self.colors["warning"])
+        return result
+
+    def _test_fire_selected_relay(self):
+        try:
+            relay = int(self.test_relay_var.get())
+        except (ValueError, tk.TclError):
+            return
+        self._test_fire_relay(relay)
+
+    def _pulse_and_flash(self, act_idx):
+        if hasattr(self, 'test_relay_var'):
+            self.test_relay_var.set(str(act_idx))
+        self._test_fire_relay(act_idx)
+
+    def _fire_all(self):
+        if not self._manual_test_allowed():
+            return
+        if not self.relay_output.dry_run and not messagebox.askyesno("FIRE 1-40", "Fire ALL 40 ejector valves at once (real valves)?"):
+            return
+        pulse = self._test_pulse_ms()
+        results = self.relay_output.test_all(pulse)
+        for relay in results:
+            self._flash_relay_led(relay, pulse)
+        self.lbl_test_relay_result.config(text=f"{time.strftime('%H:%M:%S')}  Relays 1-40: " + ", ".join(sorted(set(results.values()))))
             
     def _sequence_all(self):
-        def seq():
-            try:
-                pulse = int(self.shared_state.common_pulse_ms)
-            except Exception:
-                pulse = 200
-            for i in range(1, NUM_ACTUATORS+1):
-                if self.controller and self.controller.connected:
-                    self.controller.pulse_actuator(i, 0, pulse)
-                if hasattr(self, 'pn_leds') and i in self.pn_leds:
-                    try:
-                        self.pn_leds[i].config(fg=self.colors["success"])
-                        self.after(pulse, lambda ii=i: self.pn_leds[ii].config(fg=self.colors["surface_light"]))
-                    except (ValueError, tk.TclError): pass
-                time.sleep(0.12)
-        import threading
-        threading.Thread(target=seq, daemon=True).start()
+        """Relays 1-40 one after another. Runs on the UI timer (no extra thread); stops if the machine is started."""
+        if not self._manual_test_allowed() or getattr(self, '_sequence_running', False):
+            return
+        if not self.relay_output.dry_run and not messagebox.askyesno("SEQUENCE 1-40", "Fire the 40 ejector valves one after another (real valves)?"):
+            return
+        pulse = self._test_pulse_ms()
+        interval = max(120, pulse + 40)
+        self._sequence_running = True
 
-        
-    def _pulse_and_flash(self, act_idx):
-        try:
-            pulse = int(self.shared_state.common_pulse_ms)
-        except (ValueError, tk.TclError):
-            pulse = 200
+        def step(relay):
+            if relay > LAST_EJECTOR or self.stop_event.is_set() or self.shared_state.phase == "RUNNING":
+                self._sequence_running = False
+                return
+            result = self.relay_output.test_fire(relay, pulse)
+            self.test_relay_var.set(str(relay))
+            self._flash_relay_led(relay, pulse)
+            self.lbl_test_relay_result.config(text=self._result_text(relay, result),
+                                              fg=self.colors["success"] if result == "SENT" else self.colors["warning"])
+            self.after(interval, lambda: step(relay + 1))
 
-        if self.controller and self.controller.connected:
-            self.controller.pulse_actuator(act_idx, 0, pulse)
-            
-        if hasattr(self, 'pn_leds') and act_idx in self.pn_leds:
-            try:
-                # Turn ON (Green) when firing
-                self.pn_leds[act_idx].config(fg=self.colors["success"]) 
-                
-                default_color = self.colors["surface_light"] # OFF state
-                
-                # Turn OFF after pulse duration (min 200ms for visibility)
-                delay = max(pulse, 200)
-                self.after(delay, lambda a=act_idx, c=default_color: self.pn_leds[a].config(fg=c))
-            except Exception:
-                log.exception("_pulse_and_flash failed for actuator %s", act_idx)
+        step(FIRST_EJECTOR)
 
     def _update_common_pulse(self, *args):
         try:
