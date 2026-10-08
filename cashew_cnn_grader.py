@@ -1,23 +1,21 @@
-from datetime import datetime
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Instant Fire Grader - Final Master Release
 (Stable Zero-Mask Tracking, Multi-Frame Priority Logic, Individual Conf, MM Sizing)
 """
+from datetime import datetime
 import os
 
 import sys
 import shutil
 import time
 import json
-import csv
 import glob
 import threading
 import re
 import queue
 from pathlib import Path
-from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Tuple
 from collections import deque
 
@@ -26,11 +24,19 @@ cv2.setNumThreads(0)
 import numpy as np
 from ultralytics import YOLO
 
-sys.path.append("/home/phoenix/Documents/RaniVision_Latest")
+import app_paths
+import preprocess
+from class_registry import ClassRegistry, normalize_name
+
+log = app_paths.setup_logging("grader")
+
+if app_paths.EXTERNAL_TOOLS_DIR.is_dir():
+    sys.path.append(str(app_paths.EXTERNAL_TOOLS_DIR))
 try:
     import tcm_magic_wand
 except ImportError:
     tcm_magic_wand = None
+    log.warning("tcm_magic_wand not found in %s: magic wand annotation and auto-teach are disabled.", app_paths.EXTERNAL_TOOLS_DIR)
 
 # MindVision capture (used for IP config only)
 try:
@@ -72,42 +78,49 @@ except Exception:
 # CNN dependencies (PyTorch + torchvision)
 _CNN_AVAILABLE = False
 _torch = None
-_tv_models = None
-_tv_transforms = None
 _F = None
 try:
     import torch as _torch
-    import torchvision.models as _tv_models
-    import torchvision.transforms as _tv_transforms
     import torch.nn.functional as _F
+    import torchvision  # noqa: F401  (preprocess.py needs it)
     _CNN_AVAILABLE = True
-    print("[CNN] PyTorch + torchvision loaded OK")
+    log.info("[CNN] PyTorch + torchvision loaded OK")
 except ImportError as e:
-    print(f"[CNN] PyTorch/torchvision not available – CNN disabled: {e}")
+    log.warning("[CNN] PyTorch/torchvision not available - CNN disabled: %s", e)
 
 
 # ---------------- CONFIG ----------------
-CSV_PATH = "cashew_classes.csv" 
-CFG_PATH = str(Path(__file__).resolve().parent / "pneumatic_config.json")
-MODEL_ROOT = Path("saved_models")
-
-# CNN Color Classifier checkpoint
-CNN_MODEL_PATH = Path("saved_models/cashew_color_cnn_new.pth")
-CNN_OVERRIDE_YOLO_BELOW = 0.98   # YOLO conf < 98% → CNN can override
-CNN_CONF_THRESHOLD      = 0.75   # CNN must be >= 75% to override
-
-DATASET_DIR = "dataset" 
-os.makedirs(DATASET_DIR, exist_ok=True) 
-
-GOLDEN_DIR = "cnn_final/golden_crops"
-os.makedirs(GOLDEN_DIR, exist_ok=True)
-
-FULL_FRAME_DIR = "cnn_final/golden_full_frame"
-os.makedirs(FULL_FRAME_DIR, exist_ok=True)
+# Every path comes from app_paths.py (relative to this file, not to the current directory).
+app_paths.ensure_dirs()
+CFG_PATH = str(app_paths.CFG_PATH)
+MODEL_ROOT = app_paths.MODELS_DIR
+CNN_MODEL_PATH = app_paths.CNN_MODEL_PATH
+DATASET_DIR = str(app_paths.DATASET_DIR)
+GOLDEN_DIR = str(app_paths.GOLDEN_DIR)
+FULL_FRAME_DIR = str(app_paths.FULL_FRAME_DIR)
+MODELS_DIR = str(app_paths.MODELS_DIR)
+CLASS_MAPPING_PATH = str(app_paths.CLASS_MAPPING_PATH)
+FFC_GAIN_MAP_PATH = str(app_paths.FFC_GAIN_MAP_PATH)
+DEFAULT_YOLO_CONF = 0.30
 
 
-MODELS_DIR = "saved_models"
-os.makedirs(MODELS_DIR, exist_ok=True) 
+class _Throttle:
+    """Log the same recurring error at most once every few seconds (per key)."""
+
+    def __init__(self, interval_s=5.0):
+        self.interval_s, self._last, self._skipped = interval_s, {}, {}
+
+    def exception(self, key, message):
+        now = time.monotonic()
+        if now - self._last.get(key, -1e9) >= self.interval_s:
+            skipped = self._skipped.pop(key, 0)
+            log.exception("%s%s", message, f" ({skipped} more since the last report)" if skipped else "")
+            self._last[key] = now
+        else:
+            self._skipped[key] = self._skipped.get(key, 0) + 1
+
+
+_throttle = _Throttle()
 
 NUM_ACTUATORS = 40
 DEFAULT_ON_MS = 25
@@ -135,9 +148,6 @@ ARDUINO1_RESPONSE = "Yes!"
 ARDUINO2_RESPONSE = "Yes2!"
 
 # ---------------- utils ----------------
-def normalize_name(s: str) -> str:
-    return re.sub(r'\s+',' ', re.sub(r'[^a-z0-9\s-]',' ', str(s).lower())).strip()
-
 def find_best_weights(model_root: Path) -> Optional[Path]:
     runs = model_root / "runs"
     candidates = []
@@ -158,7 +168,7 @@ def find_best_weights(model_root: Path) -> Optional[Path]:
         p = model_root / n
         if p.exists(): return p
     for n in ("best.pt","yolov8n.pt", "yolo26n.pt"):
-        p = Path(n)
+        p = app_paths.BASE_DIR / n
         if p.exists(): return p
     return None
 
@@ -180,7 +190,8 @@ def bayer_to_bgr(data, w, h):
             return arr.reshape((h,w,3)).copy()
         else:
             return None
-    except Exception as e:
+    except Exception:
+        _throttle.exception("bayer", "[CAM] Bayer conversion failed")
         return None
 
 def resize_letterbox(img, target_w, target_h, bg_color=BG_COLOR):
@@ -443,7 +454,8 @@ class SharedState:
             "max_defect_px": 1200
         }
         
-        self.keras_preprocess = "MobileNet / TM (-1 to 1)"
+        self.yolo_conf = DEFAULT_YOLO_CONF
+        self.master_ejector_enabled = False     # ejectors stay OFF until the operator switches them on
         
         self.phase = "READY"
         self.frame = None
@@ -460,8 +472,8 @@ class SharedState:
         self.ffc_enabled = False
         self.calibrate_ffc_requested = False
         
-        if os.path.exists("ffc_gain_map.png"):
-            self.gain_map_8u = cv2.imread("ffc_gain_map.png", cv2.IMREAD_GRAYSCALE)
+        if os.path.exists(FFC_GAIN_MAP_PATH):
+            self.gain_map_8u = cv2.imread(FFC_GAIN_MAP_PATH, cv2.IMREAD_GRAYSCALE)
             if self.gain_map_8u is not None:
                 self.ffc_enabled = True
                 print("[INIT] FFC Gain Map Loaded.")
@@ -578,7 +590,8 @@ class SharedState:
     def load_from_config(self, cfg_path):
         if not os.path.exists(cfg_path): return
         try:
-            cfg = json.load(open(cfg_path,'r'))
+            with open(cfg_path, 'r') as f:
+                cfg = json.load(f)
             with self.lock:
                 delays = cfg.get("delays_ms", {})
                 for i in range(1, NUM_ACTUATORS + 1):
@@ -607,7 +620,7 @@ class SharedState:
                 if "opencv_filter" in cfg: self.opencv_filter.update(cfg["opencv_filter"])
                 
                 self.yolo_model_path = cfg.get("yolo_model_path", "")
-                self.keras_preprocess = cfg.get("keras_preprocess", "MobileNet / TM (-1 to 1)")
+                self.yolo_conf = float(cfg.get("yolo_conf", DEFAULT_YOLO_CONF))
                 if "roi1" in cfg and cfg["roi1"]: self.roi1 = tuple(cfg["roi1"])
                 if "roi2" in cfg and cfg["roi2"]: self.roi2 = tuple(cfg["roi2"])
                 self.line_x_full = cfg.get("line_x_full")
@@ -628,7 +641,8 @@ class SharedState:
                     self.exposure = c.get("exposure", 10000)
                 
                 self._rebuild_processing_map()
-        except Exception: pass
+        except Exception:
+            log.exception("Could not read the config %s; defaults are used for what was not loaded.", cfg_path)
 
     def save_to_config(self, cfg_path):
         try:
@@ -645,7 +659,7 @@ class SharedState:
                     "class_confs": self.class_confs,
                     "defect_allowances": self.defect_allowances,
                     "yolo_model_path": self.yolo_model_path,
-                    "keras_preprocess": self.keras_preprocess,
+                    "yolo_conf": self.yolo_conf,
                     "roi1": self.roi1,
                     "roi2": self.roi2,
                     "line_x_full": self.line_x_full,
@@ -656,18 +670,12 @@ class SharedState:
                         "a_gain": self.analog_gain, "d_gain": self.digital_gain, "exposure": self.exposure
                     }
                 }
-            with open(cfg_path, 'w') as f: json.dump(cfg, f, indent=2)
-            # Auto-sync saved JSON to parent directory so old JSON files are eliminated
-            for sync_dst in [
-                Path(__file__).resolve().parent.parent / "pneumatic_config.json",
-                Path("/home/phoenix/Documents/CNN_final/CNN/pneumatic_config.json")
-            ]:
-                try:
-                    if sync_dst.parent.exists():
-                        with open(sync_dst, 'w') as f: json.dump(cfg, f, indent=2)
-                except Exception:
-                    pass
-        except Exception: pass
+            # Written to a temporary file first, so a crash while saving cannot leave half a config.
+            tmp_path = f"{cfg_path}.tmp"
+            with open(tmp_path, 'w') as f: json.dump(cfg, f, indent=2)
+            os.replace(tmp_path, cfg_path)
+        except Exception:
+            log.exception("Could not save the config %s", cfg_path)
 
     def _rebuild_processing_map(self):
         self.mapping_t1, self.mapping_t2 = {}, {}
@@ -694,7 +702,8 @@ class SharedState:
                 "size_config": self.size_config.copy(),
                 "class_confs": self.class_confs.copy(),
                 "defect_allowances": self.defect_allowances.copy(),
-                "keras_preprocess": self.keras_preprocess,
+                "opencv_filter": self.opencv_filter.copy(),
+                "target_conf": self.yolo_conf,
                 "is_conveyor_on": self.is_conveyor_on,
                 "gain": self.cam_gain, "r": self.cam_r, "g": self.cam_g, "b": self.cam_b,
                 "a_gain": self.analog_gain, "d_gain": self.digital_gain, "exposure": self.exposure
@@ -847,7 +856,7 @@ class CameraThread(threading.Thread):
                         gain_map = mean_val / (smoothed.astype(np.float32) + 1e-5)
                         self.shared_state.gain_map_8u = np.clip(gain_map * 128, 0, 255).astype(np.uint8)
                         self.shared_state.ffc_enabled = True
-                        cv2.imwrite("ffc_gain_map.png", self.shared_state.gain_map_8u)
+                        cv2.imwrite(FFC_GAIN_MAP_PATH, self.shared_state.gain_map_8u)
                         print("[CAM] FFC Calibration Complete and Saved.")
                         
                     if self.shared_state.ffc_enabled and self.shared_state.gain_map_8u is not None:
@@ -873,12 +882,14 @@ class CameraThread(threading.Thread):
                     try: self.output_queue.get_nowait()
                     except queue.Empty: pass 
                     self.output_queue.put((frame_full, self.max_w, self.max_h))
-                except Exception as e: pass
+                except Exception:
+                    _throttle.exception("camera_frame", "[CAM] Could not convert a camera frame")
                 finally:
                     self.stream.push_buffer(buf) 
                     
         except Exception as e:
             self.is_connected = False
+            log.exception("[CAM] Camera thread stopped")
             try: self.output_queue.put_nowait(("ERROR", str(e)))
             except queue.Full: pass
         finally:
@@ -891,15 +902,15 @@ class CameraThread(threading.Thread):
 
 # ---------------- ProcessingThread ----------------
 class ProcessingThread(threading.Thread):
-    def __init__(self, model_path: Optional[Path], class_names: Dict[int, str],
+    def __init__(self, model_path: Optional[Path], registry: ClassRegistry,
                  camera_queue: queue.Queue, display_queue: queue.Queue, 
                  stop_event: threading.Event, shared_state: SharedState,
                  controller: Any, fire_counts: Dict[int, int],
-                 fire_lock: threading.Lock):
+                 fire_lock: threading.Lock, model: Any = None):
 
         super().__init__(daemon=True, name="ProcessingThread")
         self.model_path = model_path
-        self.class_names = class_names
+        self.registry = registry        # the one list of class names (YOLO IDs from model.names)
         self.camera_queue = camera_queue
         self.display_queue = display_queue
         self.stop_event = stop_event
@@ -907,21 +918,17 @@ class ProcessingThread(threading.Thread):
         self.controller = controller
         self.fire_counts = fire_counts 
         self.fire_lock = fire_lock      
-        self.is_keras_model = False
         self.model = None
         self.model_lock = threading.Lock()
+        self.tracked_objects = []
+        self.next_obj_id = 1
+        self._tracking_reset = threading.Event()
         
-        # Load torch to ensure GPU availability check
-        try:
-            import torch
-            self.device = 0 if torch.cuda.is_available() else 'cpu'
-            print(f"[DEBUG-INIT] PyTorch available. Using device: {self.device}")
-        except ImportError:
-            self.device = 'cpu'
-            print("[DEBUG-INIT] PyTorch not imported. Defaulting to cpu.")
-            
-        print(f"[DEBUG-INIT] ProcessingThread initialized with model_path: {self.model_path}")
-        if self.model_path:
+        self.device = 0 if (_CNN_AVAILABLE and _torch.cuda.is_available()) else 'cpu'
+        log.info("ProcessingThread: device %s, YOLO model %s", self.device, self.model_path)
+        if model is not None:
+            self._install_model(self.model_path, model)
+        elif self.model_path:
             self.reload_model(self.model_path)
 
         # ── CNN Color Classifier ──────────────────────────────────────────────
@@ -931,75 +938,32 @@ class ProcessingThread(threading.Thread):
         self.cnn_transform = None
         if _CNN_AVAILABLE and CNN_MODEL_PATH.exists():
             try:
-                ckpt = _torch.load(str(CNN_MODEL_PATH), map_location="cpu")
-                self.cnn_classes = ckpt["class_names"]
-                _m = _tv_models.mobilenet_v2(weights=None)
-                _m.classifier[1] = _torch.nn.Linear(_m.last_channel, len(self.cnn_classes))
-                _m.load_state_dict(ckpt.get("model_state_dict", ckpt.get("model_state")))
-                _m.eval()
                 self.cnn_device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
-                self.cnn_model = _m.to(self.cnn_device)
-                self.cnn_transform = _tv_transforms.Compose([
-                    _tv_transforms.Resize((224, 224)),
-                    _tv_transforms.ToTensor(),
-                    _tv_transforms.Normalize([0.485, 0.456, 0.406],
-                                             [0.229, 0.224, 0.225]),
-                ])
-                print(f"[CNN] Loaded cashew_color_cnn.pth "
-                      f"({len(self.cnn_classes)} classes)")
-            except Exception as e:
-                print(f"[CNN] Failed to load CNN model: {e}")
+                self.cnn_model, self.cnn_classes = preprocess.load_cnn_checkpoint(CNN_MODEL_PATH, self.cnn_device)
+                self.cnn_transform = preprocess.build_transform(train=False)
+                # CNN classes are looked up by name; names YOLO does not have get an ID after the YOLO IDs.
+                self.registry.add_names(self.cnn_classes)
+                log.info("[CNN] Loaded %s (%d classes: %s)", CNN_MODEL_PATH.name, len(self.cnn_classes), self.cnn_classes)
+            except Exception:
+                self.cnn_model = None
+                log.exception("[CNN] Failed to load %s", CNN_MODEL_PATH)
         else:
-            print("[CNN] CNN model not found – skipping.")
-            
-        # Ensure cashew_class_mapping.json and cnn_classes are populated in self.class_names
-        if os.path.exists("cashew_class_mapping.json"):
-            try:
-                import json
-                with open("cashew_class_mapping.json", "r") as f:
-                    json_map = {int(k): str(v) for k, v in json.load(f).items()}
-                    for k, v in json_map.items():
-                        self.class_names[k] = v
-            except Exception as e:
-                print(f"[WARN] Failed to merge class_mapping JSON: {e}")
+            log.warning("[CNN] %s not found or PyTorch missing - YOLO classes are used.", CNN_MODEL_PATH)
 
-        for cname in self.cnn_classes:
-            if not any(v.lower() == cname.lower() for v in self.class_names.values()):
-                new_id = max(self.class_names.keys(), default=-1) + 1
-                self.class_names[new_id] = cname
-
-        print(f"[DEBUG-INIT] Final self.class_names: {self.class_names}")
-        
-        self.tracked_objects = []
-        self.next_obj_id = 1
-
-    def _get_good_class_id(self) -> int:
-        for k, v in self.class_names.items():
-            if v.lower() in GOOD_CLASSES:
-                return int(k)
-        return 0
+        log.info("Class names in use: %s", self.registry.snapshot())
 
     def _cnn_predict(self, crop_bgr: np.ndarray):
-        """Run CNN on a BGR crop. Returns (class_name, confidence) or (None, 0.0)."""
+        """Run CNN on a BGR crop already cut to the cashew. Returns (class_name, confidence) or (None, 0.0)."""
         if self.cnn_model is None or crop_bgr is None or crop_bgr.size == 0:
             return None, 0.0
         try:
-            from PIL import Image as _PIL_Image
-            # Pad crop to square to preserve cashew aspect ratio
-            h, w = crop_bgr.shape[:2]
-            max_dim = max(h, w)
-            pad_h = (max_dim - h) // 2
-            pad_w = (max_dim - w) // 2
-            square_crop = cv2.copyMakeBorder(crop_bgr, pad_h, pad_h, pad_w, pad_w, cv2.BORDER_REPLICATE)
-            
-            rgb = cv2.cvtColor(square_crop, cv2.COLOR_BGR2RGB)
-            pil = _PIL_Image.fromarray(rgb)
-            tensor = self.cnn_transform(pil).unsqueeze(0).to(self.cnn_device)
+            tensor = preprocess.crop_to_tensor(crop_bgr, self.cnn_transform, tight=False).unsqueeze(0).to(self.cnn_device)
             with _torch.no_grad():
                 probs = _F.softmax(self.cnn_model(tensor), dim=1)[0].cpu().numpy()
             idx = int(np.argmax(probs))
             return self.cnn_classes[idx], float(probs[idx])
         except Exception:
+            _throttle.exception("cnn_predict", "[CNN] Prediction failed")
             return None, 0.0
 
     def _calculate_defect_area(self, crop_bgr: np.ndarray, color_thresh: int = 110) -> int:
@@ -1022,54 +986,41 @@ class ProcessingThread(threading.Thread):
             actual_defects = cv2.bitwise_and(dark_spots, cashew_mask)
             defect_area = cv2.countNonZero(actual_defects)
             return defect_area
-        except Exception as e:
-            print(f"[CV-ERR] Defect area calculation failed: {e}")
+        except Exception:
+            _throttle.exception("defect_area", "[CV] Defect area calculation failed")
             return 999999
 
     def _get_cashew_contour_rect(self, crop_bgr: np.ndarray):
         """Returns (cashew_area, (x, y, w, h)) inside the crop to localize cashew vs empty roller."""
-        if crop_bgr is None or crop_bgr.size == 0:
-            return 0, None
         try:
-            gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-            # Threshold to separate bright cashew from dark blue roller channel
-            _, mask = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY)
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if contours:
-                c = max(contours, key=cv2.contourArea)
-                area = cv2.contourArea(c)
-                if area > 100:
-                    x, y, w, h = cv2.boundingRect(c)
-                    return int(area), (x, y, w, h)
-            return 0, None
+            return preprocess.find_cashew_rect(crop_bgr)
         except Exception:
+            _throttle.exception("cashew_rect", "[CV] Cashew localisation failed")
             return 0, None
         
     def get_color_for_class(self, cid: int):
         return CLASS_COLORS[cid % len(CLASS_COLORS)]
+
+    def _install_model(self, model_path, new_model):
+        with self.model_lock:
+            self.model_path = model_path
+            self.model = new_model
+            # YOLO class IDs come from the model itself; nothing may renumber them.
+            self.registry.set_yolo_names({int(k): str(v) for k, v in new_model.names.items()})
+        self._tracking_reset.set()      # IDs kept by running tracks may belong to the previous model
         
-    def reload_model(self, model_path):
+    def reload_model(self, model_path) -> bool:
+        model_str = str(model_path)
+        if not model_str.endswith(".pt"):
+            log.error("Only .pt YOLO models are supported: %s", model_str)
+            return False
         try:
-            model_str = str(model_path)
-            if model_str.endswith(".pt"):
-                from ultralytics import YOLO
-                new_model = YOLO(model_str)
-                with self.model_lock:
-                    with self.shared_state.lock:
-                        self.model_path = model_path
-                        self.model = new_model
-                        self.is_keras_model = False
-                        model_names = {int(k): str(v) for k, v in new_model.names.items()}
-                        if not hasattr(self, 'class_names') or not self.class_names:
-                            self.class_names = model_names
-                        else:
-                            for k, v in model_names.items():
-                                if k not in self.class_names:
-                                    self.class_names[k] = v
-            else:
-                print(f"[ERROR] Only .pt YOLO models are supported. {model_str} is invalid.")
-        except Exception as e:
-            print(f"[ERROR] Failed to load new model: {e}")
+            self._install_model(model_path, YOLO(str(app_paths.resolve(model_str))))
+            log.info("YOLO model loaded: %s, classes %s", model_str, self.registry.snapshot())
+            return True
+        except Exception:
+            log.exception("Failed to load YOLO model %s", model_str)
+            return False
 
     def run(self):
         while not self.stop_event.is_set():
@@ -1169,6 +1120,7 @@ class ProcessingThread(threading.Thread):
                 else:
                     self.tracked_objects = []
                     self.next_obj_id = 1
+                    self._tracking_reset.clear()
                     frame_drawn = draw_rulers(frame_full.copy())
                     self._draw_setup_overlays(frame_drawn, state)
                     
@@ -1190,7 +1142,8 @@ class ProcessingThread(threading.Thread):
 
                 
             except queue.Empty: pass
-            except Exception as e: pass
+            except Exception:
+                _throttle.exception("processing_loop", "Frame processing failed (this frame was skipped, nothing was fired for it)")
 
     # FIXED: Small arrow in the top corner (approx 25mm length x 5mm height visually)
     def _draw_arrows(self, frame, state):
@@ -1251,7 +1204,7 @@ class ProcessingThread(threading.Thread):
         defects = []
         non_defects = []
         for cid, count in counts.items():
-            cname = self.class_names.get(cid, "UNK").lower()
+            cname = self.registry.name(cid).lower()
             if cname in ["good_cashew", "sw", "white_dw"] or cname.startswith("ww_") or cname.startswith("sw_"):
                 non_defects.append((cid, count))
             else:
@@ -1273,6 +1226,9 @@ class ProcessingThread(threading.Thread):
 
     def _process_frame(self, frame, state):
         current_time_ms = time.time() * 1000.0
+        if self._tracking_reset.is_set():       # a new YOLO model was applied
+            self._tracking_reset.clear()
+            self.tracked_objects = []
         
         # Clean copy for inference and image capturing (no overlay lines/dots!)
         clean_frame = frame.copy()
@@ -1380,17 +1336,8 @@ class ProcessingThread(threading.Thread):
                     if def_px < max_px:
                         cnn_name = "good_cashew"
                     
-                # Map CNN class name back to class ID (auto-register if new)
-                cnn_cid = None
-                for k, v in self.class_names.items():
-                    if v.lower() == cnn_name.lower() or normalize_name(v) == normalize_name(cnn_name):
-                        cnn_cid = k
-                        break
-                        
-                if cnn_cid is None:
-                    new_id = max(self.class_names.keys(), default=-1) + 1
-                    self.class_names[new_id] = cnn_name
-                    cnn_cid = new_id
+                # CNN class name -> class ID, by name (registered behind the YOLO IDs if new)
+                cnn_cid = self.registry.id_for(cnn_name, register=True)
 
                 if cnn_cid is not None:
                     req_conf = state.get("class_confs", {}).get(cnn_name.lower(), 50)
@@ -1398,7 +1345,7 @@ class ProcessingThread(threading.Thread):
                         classes[i] = cnn_cid
                         confs[i] = cnn_conf
 
-        mb, mc, mcf = merge_boxes_area_rule(boxes, classes, confs, self.class_names)
+        mb, mc, mcf = merge_boxes_area_rule(boxes, classes, confs)
 
         # Restore tracking
         new_tracked = []
@@ -1506,10 +1453,10 @@ class ProcessingThread(threading.Thread):
             
             if 'history' in obj and obj['history']:
                 resolved_cid = self._resolve_priority(obj['history'])
-                final_cname = self.class_names.get(resolved_cid, "UNK").lower()
+                final_cname = self.registry.name(resolved_cid).lower()
                 display_cid = resolved_cid
             else:
-                final_cname = self.class_names.get(obj['cid'], "UNK").lower()
+                final_cname = self.registry.name(obj['cid']).lower()
                 display_cid = obj['cid']
 
             # NEW: Only apply OpenCV sizing logic to 'good' and 'sw' classes per user request.
@@ -1555,8 +1502,8 @@ class ProcessingThread(threading.Thread):
                             bx = np.int32(bx)
                             bx[:, 0] += x1
                             bx[:, 1] += y1
-            except Exception as e:
-                pass 
+            except Exception:
+                _throttle.exception("size_measure", "Size measurement failed (bounding-box size is used)")
                 
             mm_length = px_length / px_per_mm
             mm_width = px_width / px_per_mm
@@ -1681,7 +1628,7 @@ class ProcessingThread(threading.Thread):
                 if act_id is not None and 1 <= act_id <= NUM_ACTUATORS:
                     d_ms, p_ms = self.shared_state.get_timing(act_id)
 
-                    if getattr(self.shared_state, 'master_ejector_enabled', True):
+                    if self.shared_state.master_ejector_enabled:
                         self.controller.pulse_actuator(act_id, d_ms, p_ms)
                         print(f"[FIRE] Ejector {act_id} fired for Cashew ID {obj['id']} ({label}) - Delay: {d_ms}ms, Pulse: {p_ms}ms")
                     
@@ -1803,28 +1750,25 @@ class App(tk.Tk):
         
         saved_model = ""
         try:
-            import json
             if os.path.exists(CFG_PATH):
                 with open(CFG_PATH, "r") as f:
-                    cfg = json.load(f)
-                    saved_model = str(cfg.get("yolo_model_path", ""))
-        except: pass
+                    saved_model = str(json.load(f).get("yolo_model_path", ""))
+        except Exception:
+            log.exception("Could not read yolo_model_path from %s", CFG_PATH)
 
-        try:
-            test_path = "/home/phoenix/Documents/1/cashew_gsn/CNN/assets/btn_test.png"
-            gear_path = "/home/phoenix/Documents/1/cashew_gsn/CNN/assets/btn_gear.png"
-            if os.path.exists(test_path) and os.path.exists(gear_path):
-                img_t = Image.open(test_path).resize((22, 22), Image.Resampling.LANCZOS)
-                self.img_test = ImageTk.PhotoImage(img_t)
-                img_g = Image.open(gear_path).resize((22, 22), Image.Resampling.LANCZOS)
-                self.img_gear = ImageTk.PhotoImage(img_g)
-            else:
-                self.img_test, self.img_gear = None, None
-        except Exception as e:
-            print(f"[WARN] Failed to load icon images: {e}")
+        def _load_icon(path, size):
+            try:
+                if path.exists():
+                    return ImageTk.PhotoImage(Image.open(path).resize((size, size), Image.Resampling.LANCZOS))
+            except Exception:
+                log.exception("Could not load icon %s", path)
+            return None
+
+        self.img_test = _load_icon(app_paths.ASSETS_DIR / "btn_test.png", 22)
+        self.img_gear = _load_icon(app_paths.ASSETS_DIR / "btn_gear.png", 22)
+        if self.img_test is None or self.img_gear is None:
             self.img_test, self.img_gear = None, None
             
-        self.nav_icons = {}
         icon_names = {
             "Home": "Production.png",
             "Pneumatic": "Pneumatics.png",
@@ -1837,87 +1781,57 @@ class App(tk.Tk):
             "Test Console": "Test_Console.png",
             "Network": "Network.png"
         }
-        for name, file in icon_names.items():
-            path = f"/home/phoenix/Documents/1/cashew_gsn/CNN/assets/nav_icons/{file}"
-            try:
-                if os.path.exists(path):
-                    img = Image.open(path).resize((32, 32), Image.Resampling.LANCZOS)
-                    self.nav_icons[name] = ImageTk.PhotoImage(img)
-                else:
-                    self.nav_icons[name] = None
-            except:
-                self.nav_icons[name] = None
+        self.nav_icons = {name: _load_icon(app_paths.NAV_ICONS_DIR / file, 32) for name, file in icon_names.items()}
         
+        # YOLO model: the one saved in the config (stored relative to this folder), else the newest in saved_models.
         self.model_path = ""
         if saved_model:
-            fname = os.path.basename(saved_model)
-            p1 = os.path.join(MODEL_ROOT, fname)
-            p2 = os.path.join(os.path.dirname(MODEL_ROOT), saved_model)
-            if os.path.exists(p1):
-                self.model_path = p1
-            elif os.path.exists(p2):
-                self.model_path = p2
-            elif os.path.exists(saved_model):
-                self.model_path = saved_model
+            for candidate in (app_paths.resolve(saved_model), MODEL_ROOT / os.path.basename(saved_model)):
+                if candidate.exists():
+                    self.model_path = str(candidate)
+                    break
+        if not self.model_path:
+            if saved_model:
+                log.warning("YOLO model from the config not found: %s", saved_model)
+            found = find_best_weights(MODEL_ROOT)
+            self.model_path = str(found) if found else ""
+        log.info("YOLO model path: %s", self.model_path or "(none)")
 
-        if not self.model_path or not os.path.exists(self.model_path):
-            best_candidate = MODEL_ROOT / "model_20260913_230121.pt"
-            if not best_candidate.exists():
-                best_candidate = MODEL_ROOT / "best.pt"
-            if best_candidate.exists():
-                self.model_path = str(best_candidate)
-            else:
-                pt_models = list(MODEL_ROOT.glob("*.pt"))
-                if pt_models:
-                    self.model_path = str(pt_models[0])
-                else:
-                    self.model_path = str(find_best_weights(MODEL_ROOT))
-        print(f"[INFO] YOLO model_path resolved to: {self.model_path}")
-        self.class_map = None
-        if os.path.exists("cashew_class_mapping.json"):
+        # Class names: YOLO IDs from model.names. cashew_class_mapping.json only adds names
+        # (classes the user manages); its numbers are never used as YOLO IDs.
+        yolo_model, yolo_names = None, {}
+        if self.model_path:
             try:
-                import json
-                with open("cashew_class_mapping.json", "r") as f:
-                    self.class_map = {int(k): str(v) for k,v in json.load(f).items()}
-            except Exception as e:
-                print(f"[WARN] Failed to load class mapping JSON: {e}")
-                
-        if self.class_map is None and self.model_path:
-            try:
-                from ultralytics import YOLO
-                m = YOLO(str(self.model_path))
-                self.class_map = {int(k): str(v) for k,v in m.names.items()}
-                del m
-            except Exception as e:
-                print(f"[WARN] Failed to load YOLO model: {e}")
-                self.class_map = {0: "Capture_Only_Mode"}
-        elif self.class_map is None:
-            print("[INFO] No Model Found. Starting in Image Capture ONLY mode.")
-            self.class_map = {0: "Capture_Only_Mode"}
-            
-        self.all_class_names = list(self.class_map.values())
-
-        # Merge additional classes from the authoritative JSON mapping.
-        # cashew_class_mapping.json is the single source of truth for
-        # user-managed classes. We do NOT auto-scan dataset folders or CNN
-        # checkpoints, as that causes deleted classes to reappear on restart.
-        _class_mapping_path = Path("cashew_class_mapping.json")
-        if _class_mapping_path.exists():
-            try:
-                with open(_class_mapping_path, "r") as f:
-                    _json_map = json.load(f)
-                for v in _json_map.values():
-                    if v not in self.all_class_names:
-                        self.all_class_names.append(v)
+                yolo_model = YOLO(self.model_path)
+                yolo_names = {int(k): str(v) for k, v in yolo_model.names.items()}
             except Exception:
-                pass
+                log.exception("Failed to load YOLO model %s", self.model_path)
+                yolo_model, self.model_path = None, ""
+        if not yolo_names:
+            log.warning("No YOLO model. Starting in image capture only mode.")
+            yolo_names = {0: "Capture_Only_Mode"}
+        self.registry = ClassRegistry(yolo_names)
+
+        if os.path.exists(CLASS_MAPPING_PATH):
+            try:
+                with open(CLASS_MAPPING_PATH, "r") as f:
+                    json_map = {int(k): str(v) for k, v in json.load(f).items()}
+                moved = {k: v for k, v in json_map.items() if self.registry.id_for(v) not in (None, k)}
+                if moved:
+                    log.warning("cashew_class_mapping.json numbers differ from the YOLO model for %s; the model's IDs are used.", moved)
+                self.registry.add_names(json_map[k] for k in sorted(json_map))
+            except Exception:
+                log.exception("Could not read %s", CLASS_MAPPING_PATH)
+
+        # GUI-side copy of the class list (the processing thread uses self.registry directly).
+        self.class_map = self.registry.snapshot()
+        self.all_class_names = list(self.class_map.values())
 
         # Add hybrid size classes to allow UI mapping for individual valves
         for sz in ["w180", "w210", "w240", "w320", "w450", "budds"]:
             self.all_class_names.extend([f"ww_{sz}", f"sw_{sz}"])
             
         self.shared_state = SharedState(self.all_class_names)
-        self.shared_state.load_from_config(CFG_PATH)
         
         # Sync loaded capture_classes with all_class_names
         for v in self.shared_state.capture_classes.values():
@@ -1926,10 +1840,10 @@ class App(tk.Tk):
                 
         if InovancePLCController is not None:
             self.controller = InovancePLCController()
-            print("[CONTROLLER] Initialized Inovance EC320 PLC Controller as primary pneumatic driver.")
+            log.info("[CONTROLLER] Inovance EC320 PLC controller is the pneumatic driver.")
         else:
             self.controller = ArduinoMegaController()
-            print("[CONTROLLER] Fallback to Arduino Mega Controller.")
+            log.info("[CONTROLLER] Fallback to Arduino Mega controller.")
         
         self.fire_counts = {cid: 0 for cid in self.class_map.keys()}
         self.fire_lock = threading.Lock()
@@ -1940,8 +1854,9 @@ class App(tk.Tk):
         
         self.camera_thread = CameraThread(self.camera_queue, self.stop_event, self.shared_state)
         self.processing_thread = ProcessingThread(
-            self.model_path, self.class_map, self.camera_queue, self.display_queue, 
-            self.stop_event, self.shared_state, self.controller, self.fire_counts, self.fire_lock
+            self.model_path, self.registry, self.camera_queue, self.display_queue, 
+            self.stop_event, self.shared_state, self.controller, self.fire_counts, self.fire_lock,
+            model=yolo_model
         )
         
         self.current_video_geometry = {}
@@ -2100,7 +2015,7 @@ class App(tk.Tk):
             if not self.shared_state.is_golden_capture_active():
                 try:
                     count = int(self.golden_count_var.get())
-                except:
+                except (ValueError, tk.TclError):
                     count = 1000
                 ctype = self.capture_mode_var.get()
                 self.shared_state.trigger_golden_capture(count, capture_type=ctype)
@@ -2207,7 +2122,7 @@ class App(tk.Tk):
                 if not val: val = f"Class_{cid}"
                 with self.shared_state.lock:
                     self.shared_state.capture_classes[str(cid)] = val
-            except: pass
+            except (ValueError, tk.TclError): pass
             
         def on_capture_select():
             with self.shared_state.lock:
@@ -2372,18 +2287,15 @@ class App(tk.Tk):
                     photo = ImageTk.PhotoImage(img)
                     self.insight_img_lbl.config(image=photo)
                     self.insight_img_lbl.image = photo 
-                except:
+                except Exception:
+                    log.exception("Could not show %s", png_path)
                     self.insight_img_lbl.config(image="")
             else:
                 self.insight_img_lbl.config(image="")
 
         def refresh_models():
             try:
-                models = [f for f in os.listdir(MODELS_DIR) if f.endswith(".pt") or f.endswith(".keras")]
-                root_models = [f for f in os.listdir(MODEL_ROOT) if f.endswith(".pt") or f.endswith(".keras")]
-                models.extend([m for m in root_models if m not in models])
-                models.sort()
-                
+                models = sorted(f for f in os.listdir(MODELS_DIR) if f.endswith(".pt"))
                 model_combo['values'] = models
                 active_name = os.path.basename(str(self.shared_state.yolo_model_path))
                 if active_name in models:
@@ -2392,7 +2304,8 @@ class App(tk.Tk):
                 elif models:
                     self.model_combo_var.set(models[-1])
                     load_insights(models[-1])
-            except: pass
+            except Exception:
+                log.exception("Could not list the models in %s", MODELS_DIR)
             
         def on_model_select(event):
             selected = self.model_combo_var.get()
@@ -2402,55 +2315,60 @@ class App(tk.Tk):
         def apply_model():
             selected = self.model_combo_var.get()
             if not selected: return
-            
             full_path = os.path.join(MODELS_DIR, selected)
-            if not os.path.exists(full_path):
-                full_path = os.path.join(MODEL_ROOT, selected)
-            
+            if not self.processing_thread.reload_model(full_path):
+                messagebox.showerror("Model Error", f"Could not load {selected}.\nThe previous model stays active. See logs/grader.log.")
+                return
             with self.shared_state.lock:
-                self.shared_state.yolo_model_path = full_path
-                self.shared_state.save_to_config(CFG_PATH)
-            if hasattr(self, 'processing_thread') and self.processing_thread:
-                self.processing_thread.reload_model(full_path)
-            
-            messagebox.showinfo("Model Integrated", f"Successfully integrated model:\\n{selected}")
+                self.shared_state.yolo_model_path = app_paths.relative(full_path)
+            self.shared_state.save_to_config(CFG_PATH)
+            self._refresh_class_map()
+            messagebox.showinfo("Model Integrated", f"Successfully integrated model:\n{selected}")
             
         model_combo.bind("<<ComboboxSelected>>", on_model_select)
         
         btn_apply = ttk.Button(model_frm, text="Apply Model", command=apply_model, style="Success.TButton")
         btn_apply.pack(side="left", padx=10)
         
+        def _model_report_files(model_filename):
+            base = os.path.splitext(model_filename)[0]
+            return [os.path.join(MODELS_DIR, f"{base}{suffix}") for suffix in ("_results.csv", "_confusion.png")]
+
         def delete_selected_model():
             selected = self.model_combo_var.get()
             if not selected:
                 messagebox.showwarning("Warning", "No model selected.")
                 return
+            if not selected.endswith(".pt"):
+                return
             if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete {selected}?"):
                 try:
-                    full_path = os.path.join(MODELS_DIR, selected)
-                    if os.path.exists(full_path): os.remove(full_path)
-                    
-                    base = os.path.splitext(selected)[0]
-                    for ext in [".csv", ".png", ".keras", "_results.csv", "_confusion.png"]:
-                        p = os.path.join(MODELS_DIR, f"{base}{ext}")
-                        if os.path.exists(p): os.remove(p)
-                        
+                    for path in [os.path.join(MODELS_DIR, selected)] + _model_report_files(selected):
+                        if os.path.exists(path): os.remove(path)
                     refresh_models()
                     self.insight_lbl.config(text="Model deleted.")
                     self.insight_img_lbl.config(image="")
                 except Exception as e:
+                    log.exception("Failed to delete model %s", selected)
                     messagebox.showerror("Error", f"Failed to delete model: {e}")
 
         def clear_all_models():
-            if messagebox.askyesno("Confirm Clear All", "Are you sure you want to delete ALL uploaded models?"):
+            # Only YOLO .pt models and their result files. The CNN checkpoints (.pth) are never deleted here.
+            yolo_models = sorted(f for f in os.listdir(MODELS_DIR) if f.endswith(".pt"))
+            if not yolo_models:
+                messagebox.showinfo("Clear All", "No YOLO (.pt) models to delete.")
+                return
+            if messagebox.askyesno("Confirm Clear All", f"Delete ALL {len(yolo_models)} YOLO (.pt) models?\n\n" + "\n".join(yolo_models)
+                                   + "\n\nCNN models (.pth) are kept."):
                 try:
-                    for f in os.listdir(MODELS_DIR):
-                        p = os.path.join(MODELS_DIR, f)
-                        if os.path.isfile(p): os.remove(p)
+                    for f in yolo_models:
+                        for path in [os.path.join(MODELS_DIR, f)] + _model_report_files(f):
+                            if os.path.isfile(path): os.remove(path)
                     refresh_models()
-                    self.insight_lbl.config(text="All models cleared.")
+                    self.insight_lbl.config(text="All YOLO models cleared. CNN models (.pth) were kept.")
                     self.insight_img_lbl.config(image="")
                 except Exception as e:
+                    log.exception("Failed to clear models")
                     messagebox.showerror("Error", f"Failed to clear models: {e}")
 
         btn_delete = ttk.Button(upload_frm, text="Delete Selected", command=delete_selected_model, style="Danger.TButton")
@@ -2459,54 +2377,36 @@ class App(tk.Tk):
         btn_clear = ttk.Button(upload_frm, text="Clear All", command=clear_all_models, style="Danger.TButton")
         btn_clear.pack(side="left", padx=10)
         
-        prep_lbl = tk.Label(model_frm, text="Keras Preprocessing:", bg=self.colors["bg"], fg=self.colors["text"])
-        prep_lbl.pack(side="left", padx=(20, 5))
-        
-        prep_combo_var = tk.StringVar(value=self.shared_state.keras_preprocess)
-        prep_combo = ttk.Combobox(model_frm, textvariable=prep_combo_var, state="readonly", width=25)
-        prep_combo['values'] = ["MobileNet / TM (-1 to 1)", "Standard (0 to 1)", "None (0 to 255)"]
-        prep_combo.pack(side="left")
-        
-        def on_prep_change(event):
-            with self.shared_state.lock:
-                self.shared_state.keras_preprocess = prep_combo_var.get()
-                self.shared_state.save_to_config(CFG_PATH)
-                
-        prep_combo.bind("<<ComboboxSelected>>", on_prep_change)
-        
         def browse_model():
-            path = filedialog.askopenfilename(title="Select Model file", filetypes=[("Model Files", "*.pt *.pth *.keras"), ("All Files", "*.*")])
+            path = filedialog.askopenfilename(title="Select YOLO model file", filetypes=[("YOLO model", "*.pt"), ("All Files", "*.*")])
             if path:
                 try:
-                    ext = os.path.splitext(path)[1].lower()
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    new_filename = f"model_{ts}{ext}"
-                    dest_path = os.path.join(MODELS_DIR, new_filename)
+                    if not path.lower().endswith(".pt"):
+                        messagebox.showerror("Upload Error", "Only YOLO .pt models can be uploaded here.")
+                        return
+                    base = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    dest_path = os.path.join(MODELS_DIR, f"{base}.pt")
                     shutil.copy2(path, dest_path)
                     
-                    if ext == ".keras":
-                        map_src = os.path.join(os.path.dirname(path), "cashew_class_mapping.json")
-                        if os.path.exists(map_src):
-                            shutil.copy2(map_src, os.path.join(MODELS_DIR, "cashew_class_mapping.json"))
-                    else:
-                        run_dir = os.path.dirname(os.path.dirname(path))
-                        res_csv = os.path.join(run_dir, "results.csv")
-                        conf_png = os.path.join(run_dir, "confusion_matrix.png")
-                        base = f"model_{ts}"
-                        if os.path.exists(res_csv):
-                            shutil.copy2(res_csv, os.path.join(MODELS_DIR, f"{base}_results.csv"))
-                        if os.path.exists(conf_png):
-                            shutil.copy2(conf_png, os.path.join(MODELS_DIR, f"{base}_confusion.png"))
+                    run_dir = os.path.dirname(os.path.dirname(path))
+                    res_csv = os.path.join(run_dir, "results.csv")
+                    conf_png = os.path.join(run_dir, "confusion_matrix.png")
+                    if os.path.exists(res_csv):
+                        shutil.copy2(res_csv, os.path.join(MODELS_DIR, f"{base}_results.csv"))
+                    if os.path.exists(conf_png):
+                        shutil.copy2(conf_png, os.path.join(MODELS_DIR, f"{base}_confusion.png"))
                     
+                    if not self.processing_thread.reload_model(dest_path):
+                        messagebox.showerror("Upload Error", "The file was copied but could not be loaded as a YOLO model.\nThe previous model stays active.")
+                        refresh_models()
+                        return
                     with self.shared_state.lock:
-                        self.shared_state.yolo_model_path = dest_path
-                        self.shared_state.save_to_config(CFG_PATH)
-                        
-                    if hasattr(self, 'processing_thread') and self.processing_thread:
-                        self.processing_thread.reload_model(dest_path)
-                    
+                        self.shared_state.yolo_model_path = app_paths.relative(dest_path)
+                    self.shared_state.save_to_config(CFG_PATH)
+                    self._refresh_class_map()
                     refresh_models()
                 except Exception as e:
+                    log.exception("Model upload failed")
                     messagebox.showerror("Upload Error", f"Failed to upload model: {e}")
                     
         ttk.Button(upload_frm, text="UPLOAD MODEL FILE", style="Primary.TButton", command=browse_model).pack(side="left")
@@ -2746,8 +2646,9 @@ class App(tk.Tk):
         
         ttk.Separator(pn_controls, orient="horizontal").pack(fill=tk.X, pady=20)
         
-        self.master_ejector_var = tk.BooleanVar(value=True)
-        self.shared_state.master_ejector_enabled = True
+        # Safety: the ejectors are OFF at every start; the operator switches them on.
+        self.master_ejector_var = tk.BooleanVar(value=False)
+        self.shared_state.master_ejector_enabled = False
         
         def toggle_ejector():
             state = self.master_ejector_var.get()
@@ -2757,12 +2658,12 @@ class App(tk.Tk):
             self.master_ej_btn.config(text=text)
             self.master_ej_led.config(fg=color, text="● Operating" if state else "● Fire Off")
         
-        self.master_ej_btn = tk.Checkbutton(pn_controls, text="MASTER EJECTOR: ON", variable=self.master_ejector_var, command=toggle_ejector, bg=self.colors["surface"], fg="white", selectcolor=self.colors["surface_light"], font=("Roboto", 11, "bold"), indicatoron=False)
+        self.master_ej_btn = tk.Checkbutton(pn_controls, text="MASTER EJECTOR: OFF", variable=self.master_ejector_var, command=toggle_ejector, bg=self.colors["surface"], fg="white", selectcolor=self.colors["surface_light"], font=("Roboto", 11, "bold"), indicatoron=False)
         self.master_ej_btn.pack(fill=tk.X, pady=(0, 10))
         
         led_frm = tk.Frame(pn_controls, bg=self.colors["surface"])
         led_frm.pack(fill=tk.X, pady=(0, 10))
-        self.master_ej_led = tk.Label(led_frm, text="● Operating", font=("Roboto", 14, "bold"), bg=self.colors["surface"], fg=self.colors["success"])
+        self.master_ej_led = tk.Label(led_frm, text="● Fire Off", font=("Roboto", 14, "bold"), bg=self.colors["surface"], fg=self.colors["danger"])
         self.master_ej_led.pack(anchor="center")
 
         pn_canvas = tk.Canvas(p_pneu, bg=self.colors["surface"], highlightthickness=0)
@@ -2892,6 +2793,8 @@ class App(tk.Tk):
         
         ttk.Label(p_net, text="Static IP Configuration", style="Header.TLabel").pack(anchor="w")
         ttk.Label(p_net, text="New IP Address:", style="Surface.TLabel").pack(anchor="w", pady=(5,2))
+        self.new_ip_var = tk.StringVar()
+        tk.Entry(p_net, textvariable=self.new_ip_var, width=18, bg=self.colors["surface_light"], fg=self.colors["text"], bd=0, font=("Roboto", 11)).pack(anchor="w", pady=(0, 8))
         ttk.Button(p_net, text="Apply Static IP", style="Primary.TButton", command=self._set_camera_ip).pack(anchor="w", pady=(0, 15))
 
         # --- Inovance PLC (Modbus TCP) Configuration ---
@@ -2981,24 +2884,16 @@ class App(tk.Tk):
             subprocess.Popen(["xdg-open", GOLDEN_DIR])
             subprocess.Popen(["xdg-open", DATASET_DIR])
             
-        def launch_tcm_studio():
-            import subprocess
-            from tkinter import messagebox
-            try:
-                subprocess.Popen(["python3", "/home/phoenix/Documents/RaniVision_Latest/tcm_studio_pro.py"])
-            except Exception as e:
-                messagebox.showerror("Launch Error", f"Failed to start TCM Studio Pro: {e}")
-                
         def launch_auto_labeler():
             import subprocess
-            from tkinter import messagebox
             try:
-                subprocess.Popen(["python3", "ai_auto_labeler.py"])
+                subprocess.Popen([sys.executable, str(app_paths.AUTO_LABELER_SCRIPT)], cwd=str(app_paths.BASE_DIR))
             except Exception as e:
+                log.exception("Could not start the AI Auto-Labeler")
                 messagebox.showerror("Launch Error", f"Failed to start AI Auto-Labeler: {e}")
                 
         ttk.Button(row2, text="Open Dataset Folders", style="Primary.TButton", command=open_dataset_folders).pack(side=tk.LEFT, padx=(0,10))
-        ttk.Button(row2, text="Cross Check Labels (TCM)", style="Warning.TButton", command=launch_tcm_studio).pack(side=tk.LEFT, padx=(0,10))
+        ttk.Button(row2, text="Cross Check Labels (TCM)", style="Warning.TButton", command=self._launch_tcm_studio).pack(side=tk.LEFT, padx=(0,10))
         ttk.Button(row2, text="AI Auto-Label (Fast Review)", style="Success.TButton", command=launch_auto_labeler).pack(side=tk.LEFT, padx=(0,10))
         ttk.Label(row2, text="Run AI Auto-Label to sort Golden crops quickly.", style="Surface.TLabel").pack(side=tk.LEFT, padx=(10,0))
         
@@ -3047,16 +2942,33 @@ class App(tk.Tk):
         else:
             self._start_yolo_train(arch)
 
+    def _launch_tcm_studio(self):
+        import subprocess
+        script = app_paths.TCM_STUDIO_SCRIPT
+        if not script.exists():
+            messagebox.showerror("Not available", f"TCM Studio Pro was not found:\n{script}\n\nSet RANIVISION_DIR to the folder that contains it.")
+            return
+        try:
+            subprocess.Popen([sys.executable, str(script)], cwd=str(script.parent))
+        except Exception as e:
+            log.exception("Could not start TCM Studio Pro")
+            messagebox.showerror("Launch Error", f"Failed to start TCM Studio Pro: {e}")
+
     def _start_cnn_train(self):
-        dataset_dir = os.path.abspath("dataset")
-        if not os.path.exists(dataset_dir) or not os.listdir(dataset_dir):
-            dataset_dir = os.path.abspath("../CNN_Experiment/dataset_crops")
-        disabled_dir = os.path.abspath("dataset_disabled")
+        if getattr(self, 'is_training', False):
+            return
+        train_script = app_paths.BASE_DIR / "train_cnn.py"
+        if not train_script.exists():
+            messagebox.showerror("Not available", "CNN training is not available yet:\ntrain_cnn.py is not in the project folder.")
+            return
+        dataset_dir = DATASET_DIR
+        disabled_dir = str(app_paths.DATASET_DISABLED_DIR)
         
         # In case previous run crashed, restore disabled folders first
         if os.path.exists(disabled_dir):
             for d in os.listdir(disabled_dir):
-                shutil.move(os.path.join(disabled_dir, d), os.path.join(dataset_dir, d))
+                if not os.path.exists(os.path.join(dataset_dir, d)):
+                    shutil.move(os.path.join(disabled_dir, d), os.path.join(dataset_dir, d))
                 
         if not os.path.exists(dataset_dir):
             messagebox.showerror("Error", "Dataset folder not found!")
@@ -3119,13 +3031,15 @@ class App(tk.Tk):
                     for cls in unselected:
                         shutil.move(os.path.join(dataset_dir, cls), os.path.join(disabled_dir, cls))
                         
-                    import subprocess, sys
-                    cmd = ["gnome-terminal", "--wait", "--", "bash", "-c", f"cd ../CNN_Experiment && {sys.executable} train_cnn.py; read -p 'Press Enter to exit...'"]
+                    import subprocess
+                    import shlex
+                    cmd = ["gnome-terminal", "--wait", "--", "bash", "-c",
+                           f"cd {shlex.quote(str(app_paths.BASE_DIR))} && {shlex.quote(sys.executable)} {shlex.quote(str(train_script))}; read -p 'Press Enter to exit...'"]
                     process = subprocess.Popen(cmd)
                     process.wait()
                     
-                except Exception as e:
-                    print(f"Error starting CNN training: {e}")
+                except Exception:
+                    log.exception("CNN training could not be started")
                 finally:
                     # Restore unselected classes
                     if os.path.exists(disabled_dir):
@@ -3141,19 +3055,25 @@ class App(tk.Tk):
             
         ttk.Button(popup, text="CONFIRM & TRAIN", style="Success.TButton", command=on_start).pack(pady=20, ipadx=20)
 
-    def _start_yolo_train(self, arch):
+    def _start_yolo_train(self, arch=None):
+        if getattr(self, 'is_training', False):
+            return
+        if arch is None:        # buttons that do not pass an architecture use the selector of the Teaching CNN page
+            arch = self.tcm_arch_var.get() if hasattr(self, 'tcm_arch_var') else ""
+            if "YOLO" not in arch:
+                arch = "YOLO11-Classifier"
         self.is_training = True
         self.tcm_train_btn.config(state=tk.DISABLED)
         
         def train_thread():
             try:
-                import yaml, shutil, glob, sys
+                import shlex
                 
                 # Since we are doing YOLO Classification, the dataset is already in DATASET_DIR (cashew_dataset_images/ClassX/...)
                 # YOLO classify requires a specific folder structure (train, val).
                 # We will copy the dataset to a temp folder and split into train/val.
                 
-                temp_dataset_dir = os.path.abspath(os.path.join("runs", "temp_yolo_cls_dataset"))
+                temp_dataset_dir = str(app_paths.RUNS_DIR / "temp_yolo_cls_dataset")
                 if os.path.exists(temp_dataset_dir):
                     shutil.rmtree(temp_dataset_dir)
                 
@@ -3181,8 +3101,8 @@ class App(tk.Tk):
 
 
                 # 4. Run Subprocess Training
-                train_script = os.path.abspath("temp_train.py")
-                res_file = os.path.abspath("temp_results.json")
+                train_script = str(app_paths.RUNS_DIR / "temp_train.py")
+                res_file = str(app_paths.RUNS_DIR / "temp_results.json")
                 if os.path.exists(res_file): os.remove(res_file)
                 
                 # We determine if they picked YOLO11 or YOLOv8 based on the dropdown
@@ -3195,18 +3115,19 @@ import sys, json, os
 from ultralytics import YOLO
 
 try:
-    model = YOLO('{base_model}')
+    model = YOLO({base_model!r})
     results = model.train(
-        data='{temp_dataset_dir}',
-        epochs={self.tcm_epochs.get()},
+        data={temp_dataset_dir!r},
+        epochs={int(self.tcm_epochs.get())},
         imgsz=224,
+        project={str(app_paths.RUNS_DIR)!r},
         verbose=True, workers=0
     )
     # Classification metrics
     if hasattr(results, 'top1'):
         top1 = getattr(results, 'top1', 0.0)
         top5 = getattr(results, 'top5', 0.0)
-        with open('{res_file}', 'w') as rf:
+        with open({res_file!r}, 'w') as rf:
             json.dump({{'top1': top1, 'top5': top5}}, rf)
             
 except Exception as e:
@@ -3214,7 +3135,8 @@ except Exception as e:
     sys.exit(1)
 """)
                 import subprocess
-                cmd = ["gnome-terminal", "--wait", "--", "bash", "-c", f"{sys.executable} {train_script}; read -p 'Press Enter to exit...'"]
+                cmd = ["gnome-terminal", "--wait", "--", "bash", "-c",
+                       f"cd {shlex.quote(str(app_paths.BASE_DIR))} && {shlex.quote(sys.executable)} {shlex.quote(train_script)}; read -p 'Press Enter to exit...'"]
                 process = subprocess.Popen(cmd)
                 process.wait()
                 
@@ -3224,10 +3146,10 @@ except Exception as e:
                     summary = f"\n\n--- FINAL RESULTS ---\nTop-1 Accuracy: {r.get('top1', 0)*100:.2f}%\nTop-5 Accuracy: {r.get('top5', 0)*100:.2f}%\n---------------------\n"
                     print(summary)
                 else:
-                    print(f"\nTraining Process Exited with Code {process.returncode}!\n")
+                    log.warning("Training terminal closed with code %s and no result file.", process.returncode)
                 
-            except Exception as e:
-                print(f"\nError: {e}\n")
+            except Exception:
+                log.exception("YOLO classifier training failed")
             finally:
                 self.is_training = False
                 self.after(0, lambda: self.tcm_train_btn.config(state=tk.NORMAL))
@@ -3389,14 +3311,7 @@ except Exception as e:
         row3 = tk.Frame(train_frm, bg=self.colors["bg"])
         row3.pack(fill=tk.X, pady=5)
         
-        def launch_tcm_studio():
-            import subprocess
-            try:
-                subprocess.Popen(["python3", "/home/phoenix/Documents/RaniVision_Latest/tcm_studio_pro.py"])
-            except Exception as e:
-                messagebox.showerror("Launch Error", f"Failed to start TCM Studio Pro: {e}")
-                
-        ttk.Button(row3, text="Cross Check Labels", style="Primary.TButton", command=launch_tcm_studio).pack(side=tk.LEFT, padx=(0,10))
+        ttk.Button(row3, text="Cross Check Labels", style="Primary.TButton", command=self._launch_tcm_studio).pack(side=tk.LEFT, padx=(0,10))
         
         self.tcm_train_btn = ttk.Button(row3, text="START TRAINING", style="Success.TButton", command=self._start_yolo_train)
         self.tcm_train_btn.pack(side=tk.LEFT)
@@ -3494,11 +3409,10 @@ except Exception as e:
             oy = int((event.y - (ch-nh)//2) / scale)
             
             if 0 <= ox < w and 0 <= oy < h:
-                import sys
-                if "/home/phoenix/Documents/RaniVision_Latest" not in sys.path:
-                    sys.path.append("/home/phoenix/Documents/RaniVision_Latest")
+                if tcm_magic_wand is None:
+                    messagebox.showerror("Not available", f"The magic wand tool was not found in\n{app_paths.EXTERNAL_TOOLS_DIR}", parent=popup)
+                    return
                 try:
-                    import tcm_magic_wand
                     pts = tcm_magic_wand.get_magic_polygon(frame, ox, oy)
                     if len(pts) > 0:
                         pts_np = np.array(pts, dtype=np.int32)
@@ -3526,9 +3440,7 @@ except Exception as e:
                         print("[AUTO-TEACH] Warning: Could not find cashew boundary.")
                         messagebox.showwarning("Warning", "Could not find cashew boundary.", parent=popup)
                 except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    print(f"[AUTO-TEACH] Error: Magic Wand failed: {e}")
+                    log.exception("[AUTO-TEACH] Magic wand failed")
                     messagebox.showerror("Error", f"Magic Wand failed: {e}", parent=popup)
                     
         canvas.bind("<Button-1>", on_click)
@@ -3555,7 +3467,8 @@ except Exception as e:
                         cname = self.class_map.get(cls_id, str(cls_id)) if hasattr(self, 'class_map') else str(cls_id)
                         poly_str = " ".join(parts[1:])
                         self.ann_current_labels.append({"cid": cls_id, "coords": poly_str, "cname": cname})
-            except: pass
+            except Exception:
+                log.exception("Could not read the label file %s", txt_path)
             
         self.ann_pred_labels = []
         if getattr(self, 'show_mismatch_preds', False) and os.path.exists(self.tcm_base_model.get()):
@@ -3569,7 +3482,8 @@ except Exception as e:
                         cname = self.class_map.get(cid, str(cid)) if hasattr(self, 'class_map') else str(cid)
                         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                         self.ann_pred_labels.append({"cname": f"AI: {cname}", "coords": [int(x1), int(y1), int(x2), int(y2)]})
-            except: pass
+            except Exception:
+                log.exception("Could not run the model on %s", path)
             
         self._ann_update_tree()
         self._ann_draw_image()
@@ -3727,9 +3641,7 @@ except Exception as e:
         t_row = tk.Frame(p_test, bg=self.colors["bg"], padx=10, pady=5)
         t_row.pack(fill=tk.X, pady=(0, 10))
         
-        active_model = getattr(self.shared_state, 'yolo_model_path', "yolo11n.pt")
-        if not active_model: active_model = "yolo11n.pt"
-        self.test_model_path = tk.StringVar(value=active_model)
+        self.test_model_path = tk.StringVar(value=self.shared_state.yolo_model_path or app_paths.relative(self.model_path or MODEL_ROOT / "best.pt"))
         ttk.Label(t_row, text="Model:").pack(side=tk.LEFT, padx=(0,5))
         tk.Entry(t_row, textvariable=self.test_model_path, width=40, bg=self.colors["surface"], fg="white").pack(side=tk.LEFT, padx=5)
         
@@ -3772,61 +3684,28 @@ except Exception as e:
         self.test_folder_images = []
         self.test_idx = 0
 
-    def _test_load_folder(self):
-        from tkinter import filedialog
-        import glob
-        
-        folder = filedialog.askdirectory()
-        if not folder: return
-        
-        model_path = self.test_model_path.get()
-        if not os.path.exists(model_path):
-            self.test_status_lbl.config(text=f"Model not found: {model_path}")
-            return
-            
+    def _test_ensure_model(self) -> bool:
+        """Load the YOLO model named in the Test Console (only when it changed)."""
+        model_path = str(app_paths.resolve(self.test_model_path.get().strip()))
+        if not model_path.endswith(".pt") or not os.path.exists(model_path):
+            self.test_status_lbl.config(text=f"YOLO .pt model not found: {model_path}")
+            return False
         if self.test_model is None or self.test_current_model_path != model_path:
             try:
-                if str(model_path).endswith('.keras'):
-                    import keras
-                    if not hasattr(keras.layers.Dense, "_patched"):
-                        k_original_dense = keras.layers.Dense.from_config
-                        @classmethod
-                        def k_patched_dense(cls, config):
-                            if "quantization_config" in config:
-                                del config["quantization_config"]
-                            return k_original_dense.__func__(cls, config)
-                        keras.layers.Dense.from_config = k_patched_dense
-                        keras.layers.Dense._patched = True
-                        
-                    self.test_model = keras.models.load_model(model_path, compile=False)
-                    import json
-                    map_path = os.path.join(os.path.dirname(model_path), "cashew_class_mapping.json")
-                    if os.path.exists(map_path):
-                        with open(map_path, "r") as f:
-                            mapping = json.load(f)
-                            self.test_class_map = {int(k): str(v) for k, v in mapping.items()}
-                    else:
-                        self.test_class_map = None
-                        
-                    if getattr(self, 'test_yolo_detector', None) is None:
-                        try:
-                            from ultralytics import YOLO
-                            best_yolo = find_best_weights(MODEL_ROOT)
-                            if best_yolo and str(best_yolo).endswith('.pt'):
-                                self.test_yolo_detector = YOLO(str(best_yolo))
-                            else:
-                                self.test_yolo_detector = YOLO("yolo11n.pt")
-                        except:
-                            self.test_yolo_detector = None
-                else:
-                    from ultralytics import YOLO
-                    self.test_model = YOLO(model_path)
-                    self.test_class_map = {int(k): str(v) for k, v in self.test_model.names.items()}
-                    self.test_yolo_detector = None
+                self.test_model = YOLO(model_path)
+                self.test_class_map = {int(k): str(v) for k, v in self.test_model.names.items()}
                 self.test_current_model_path = model_path
             except Exception as e:
+                log.exception("Test Console: could not load %s", model_path)
                 self.test_status_lbl.config(text=f"Model error: {e}")
-                return
+                return False
+        return True
+
+    def _test_load_folder(self):
+        folder = filedialog.askdirectory()
+        if not folder: return
+        if not self._test_ensure_model():
+            return
                 
         # Gather images
         images = []
@@ -3870,69 +3749,10 @@ except Exception as e:
             self._test_run_inference(img)
 
     def _test_load_media(self):
-        from tkinter import filedialog
         path = filedialog.askopenfilename(filetypes=[("Media Files", "*.jpg *.jpeg *.png *.mp4 *.avi")])
         if not path: return
-        
-        model_path = self.test_model_path.get()
-        if not os.path.exists(model_path):
-            self.test_status_lbl.config(text=f"Model not found: {model_path}")
+        if not self._test_ensure_model():
             return
-            
-        if self.test_model is None or self.test_current_model_path != model_path:
-            try:
-                if str(model_path).endswith('.keras'):
-                    import tensorflow as tf
-                    if not hasattr(tf.keras.layers.Dense, "_patched"):
-                        original_dense_from_config = tf.keras.layers.Dense.from_config
-                        @classmethod
-                        def patched_dense_from_config(cls, config):
-                            if "quantization_config" in config:
-                                del config["quantization_config"]
-                            return original_dense_from_config.__func__(cls, config)
-                        tf.keras.layers.Dense.from_config = patched_dense_from_config
-                        tf.keras.layers.Dense._patched = True
-                        
-                    import keras
-                    if not hasattr(keras.layers.Dense, "_patched"):
-                        k_original_dense = keras.layers.Dense.from_config
-                        @classmethod
-                        def k_patched_dense(cls, config):
-                            if "quantization_config" in config:
-                                del config["quantization_config"]
-                            return k_original_dense.__func__(cls, config)
-                        keras.layers.Dense.from_config = k_patched_dense
-                        keras.layers.Dense._patched = True
-                        
-                    self.test_model = tf.keras.models.load_model(model_path, compile=False)
-                    import json
-                    map_path = os.path.join(os.path.dirname(model_path), "cashew_class_mapping.json")
-                    if os.path.exists(map_path):
-                        with open(map_path, "r") as f:
-                            mapping = json.load(f)
-                            self.test_class_map = {int(k): str(v) for k, v in mapping.items()}
-                    else:
-                        self.test_class_map = None
-                        
-                    if getattr(self, 'test_yolo_detector', None) is None:
-                        try:
-                            from ultralytics import YOLO
-                            best_yolo = find_best_weights(MODEL_ROOT)
-                            if best_yolo and str(best_yolo).endswith('.pt'):
-                                self.test_yolo_detector = YOLO(str(best_yolo))
-                            else:
-                                self.test_yolo_detector = YOLO("yolo11n.pt")
-                        except:
-                            self.test_yolo_detector = None
-                else:
-                    from ultralytics import YOLO
-                    self.test_model = YOLO(model_path)
-                    self.test_class_map = {int(k): str(v) for k, v in self.test_model.names.items()}
-                    self.test_yolo_detector = None
-                self.test_current_model_path = model_path
-            except Exception as e:
-                self.test_status_lbl.config(text=f"Model error: {e}")
-                return
                 
         self.test_is_playing = False
         if self.test_cap is not None:
@@ -4061,14 +3881,14 @@ except Exception as e:
         try:
             val = int(self.manual_line_var.get()) + amount
             self.manual_line_var.set(str(val))
-        except: pass
+        except (ValueError, tk.TclError): pass
 
     def _on_manual_line_var_write(self, *args):
         try:
             val = int(self.manual_line_var.get())
             with self.shared_state.lock:
                 self.shared_state.line_x_full = val
-        except: pass
+        except (ValueError, tk.TclError): pass
 
     def _on_line_change_callback(self, txt, val):
         self.lbl_line_pos.config(text=txt)
@@ -4087,8 +3907,10 @@ except Exception as e:
                 self.shared_state.exposure = int(self.vars_cam["exposure"].get())
                 self.shared_state.cam_settings_changed = True
             self.shared_state.save_to_config(CFG_PATH)
-        except Exception as e:
-            print(f"[UI] Error saving camera settings: {e}")
+        except (ValueError, tk.TclError):
+            pass        # a field is empty or half typed
+        except Exception:
+            log.exception("Could not apply the camera settings")
     def _fire_all(self):
         try:
             pulse = int(self.shared_state.common_pulse_ms)
@@ -4117,7 +3939,7 @@ except Exception as e:
                     try:
                         self.pn_leds[i].config(fg=self.colors["success"])
                         self.after(pulse, lambda ii=i: self.pn_leds[ii].config(fg=self.colors["surface_light"]))
-                    except: pass
+                    except (ValueError, tk.TclError): pass
                 time.sleep(0.12)
         import threading
         threading.Thread(target=seq, daemon=True).start()
@@ -4126,7 +3948,7 @@ except Exception as e:
     def _pulse_and_flash(self, act_idx):
         try:
             pulse = int(self.shared_state.common_pulse_ms)
-        except:
+        except (ValueError, tk.TclError):
             pulse = 200
 
         if self.controller and self.controller.connected:
@@ -4142,14 +3964,14 @@ except Exception as e:
                 # Turn OFF after pulse duration (min 200ms for visibility)
                 delay = max(pulse, 200)
                 self.after(delay, lambda a=act_idx, c=default_color: self.pn_leds[a].config(fg=c))
-            except Exception as e:
-                print(f"[DEBUG] _pulse_and_flash error: {e}")
+            except Exception:
+                log.exception("_pulse_and_flash failed for actuator %s", act_idx)
 
     def _update_common_pulse(self, *args):
         try:
             pulse = int(self.common_pulse_var.get())
             self.shared_state.set_common_pulse(pulse)
-        except: pass
+        except (ValueError, tk.TclError): pass
 
     def _update_conveyor_speed(self, *args):
         try:
@@ -4288,15 +4110,14 @@ except Exception as e:
             self.shared_state.save_to_config(CFG_PATH)
             messagebox.showinfo("Saved", "Configuration Saved.")
         except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"Error saving config: {e}")
+            log.exception("Could not save the size configuration")
+            messagebox.showerror("Save Error", f"Configuration NOT saved: {e}")
 
     def _update_class_conf(self, cname, var):
         try:
             val = int(var.get())
             self.shared_state.set_class_conf(cname, val)
-        except: pass
+        except (ValueError, tk.TclError): pass
 
     def _add_priority_logic(self):
         vals = [v.get() for v in self.prio_vars] + [self.final_grade_var.get()]
@@ -4736,7 +4557,7 @@ except Exception as e:
                     self.shared_state.size_config[f"{s}_L"] = float(lv.get())
                     self.shared_state.size_config[f"{s}_W"] = float(wv.get())
                     self.shared_state.save_to_config(CFG_PATH)
-                except: pass
+                except (ValueError, tk.TclError): pass
             
             l_var.trace_add("write", update_sz_cfg)
             w_var.trace_add("write", update_sz_cfg)
@@ -4783,74 +4604,92 @@ except Exception as e:
         if var and var.get():
             self.ann_fast_class_var.set(cname)
 
+    def _refresh_class_map(self):
+        """Take the GUI copy of the class list from the registry again (after a model or class change)."""
+        self.class_map = self.registry.snapshot()
+        with self.fire_lock:
+            for cid in self.class_map:
+                self.fire_counts.setdefault(cid, 0)
+        for name in self.class_map.values():
+            if name not in self.all_class_names:
+                self.all_class_names.append(name)
+            self.shared_state.class_confs.setdefault(name.lower(), 50)
+            self.shared_state.defect_allowances.setdefault(name.lower(), 0.0)
+        if hasattr(self, 'class_btn_grid'):
+            self._refresh_class_grid()
+
+    def _save_class_mapping(self):
+        """cashew_class_mapping.json: the YOLO classes (with the model's own IDs) plus the classes the user manages."""
+        self.class_map = self.registry.snapshot()
+        managed = {str(cid): name for cid, name in sorted(self.class_map.items())
+                   if self.registry.is_yolo_class(name) or name in self.all_class_names}
+        tmp_path = f"{CLASS_MAPPING_PATH}.tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(managed, f, indent=4)
+        os.replace(tmp_path, CLASS_MAPPING_PATH)
+
     def _add_label_class(self):
         import tkinter.simpledialog as sd
         new_cname = sd.askstring("Add Class", "Enter new class name:", parent=self)
-        if new_cname:
-            new_cname = new_cname.strip()
-            if new_cname and new_cname not in self.all_class_names:
-                try:
-                    keys = [int(k) for k in self.shared_state.capture_classes.keys() if str(k).isdigit()]
-                    new_id = str(max(keys + [-1]) + 1)
-                    self.shared_state.capture_classes[new_id] = new_cname
-                    self.shared_state.save_to_config(CFG_PATH)
-                    self.all_class_names.append(new_cname)
-                    
-                    # Update class_map and JSON
-                    c_keys = [int(k) for k in self.class_map.keys()]
-                    new_cid = int(max(c_keys + [-1]) + 1)
-                    self.class_map[new_cid] = new_cname
-                    import json
-                    with open("cashew_class_mapping.json", "w") as f:
-                        json.dump(self.class_map, f, indent=4)
-                        
-                    self._refresh_class_grid()
-                    messagebox.showinfo("Success", f"Added class '{new_cname}'")
-                except Exception as e:
-                    messagebox.showerror("Error", f"Could not add class: {e}")
-            elif new_cname in self.all_class_names:
-                messagebox.showwarning("Warning", f"Class '{new_cname}' already exists!")
+        if not new_cname:
+            return
+        new_cname = new_cname.strip()
+        if not new_cname:
+            return
+        if new_cname in self.all_class_names or self.registry.id_for(new_cname) is not None:
+            messagebox.showwarning("Warning", f"Class '{new_cname}' already exists!")
+            return
+        try:
+            with self.shared_state.lock:
+                keys = [int(k) for k in self.shared_state.capture_classes.keys() if str(k).isdigit()]
+                self.shared_state.capture_classes[str(max(keys + [-1]) + 1)] = new_cname
+            self.shared_state.save_to_config(CFG_PATH)
+            self.all_class_names.append(new_cname)
+            self.registry.id_for(new_cname, register=True)      # gets an ID after the YOLO IDs
+            self._save_class_mapping()
+            self._refresh_class_grid()
+            messagebox.showinfo("Success", f"Added class '{new_cname}'")
+        except Exception as e:
+            log.exception("Could not add class %s", new_cname)
+            messagebox.showerror("Error", f"Could not add class: {e}")
 
     def _rename_label_class(self):
         cname = self.ann_fast_class_var.get()
         if not cname: 
             messagebox.showwarning("Warning", "No class selected!")
             return
+        if self.registry.is_yolo_class(cname):
+            messagebox.showwarning("Not possible", f"'{cname}' is a class of the YOLO model.\nIts name comes from the model and cannot be changed here.")
+            return
         import tkinter.simpledialog as sd
         new_cname = sd.askstring("Rename Class", f"Rename {cname} to:", parent=self)
-        if new_cname:
-            new_cname = new_cname.strip()
-            if new_cname and new_cname not in self.all_class_names:
-                try:
-
-                    # Rename in config mapping
-                    for k, v in self.shared_state.capture_classes.items():
-                        if v == cname:
-                            self.shared_state.capture_classes[k] = new_cname
-                    # If it wasn't in capture_classes (e.g. YOLO class), we should add it so it persists
-                    if new_cname not in self.shared_state.capture_classes.values():
-                        keys = [int(k) for k in self.shared_state.capture_classes.keys() if str(k).isdigit()]
-                        new_id = str(max(keys + [-1]) + 1)
-                        self.shared_state.capture_classes[new_id] = new_cname
-                    
-                    self.shared_state.save_to_config(CFG_PATH)
-                    self.all_class_names = [new_cname if c == cname else c for c in self.all_class_names]
-                    
-                    # Update class_map and JSON
-                    for k, v in self.class_map.items():
-                        if v == cname:
-                            self.class_map[k] = new_cname
-                    import json
-                    with open("cashew_class_mapping.json", "w") as f:
-                        json.dump(self.class_map, f, indent=4)
-                        
-                    self.ann_fast_class_var.set(new_cname)
-                    self._refresh_class_grid()
-                    messagebox.showinfo("Success", f"Renamed to '{new_cname}'")
-                except Exception as e:
-                    messagebox.showerror("Error", f"Could not rename class: {e}")
-            elif new_cname in self.all_class_names:
-                messagebox.showwarning("Warning", f"Class '{new_cname}' already exists!")
+        if not new_cname:
+            return
+        new_cname = new_cname.strip()
+        if not new_cname:
+            return
+        if new_cname in self.all_class_names or self.registry.id_for(new_cname) is not None:
+            messagebox.showwarning("Warning", f"Class '{new_cname}' already exists!")
+            return
+        try:
+            with self.shared_state.lock:
+                for k, v in self.shared_state.capture_classes.items():
+                    if v == cname:
+                        self.shared_state.capture_classes[k] = new_cname
+                if new_cname not in self.shared_state.capture_classes.values():
+                    keys = [int(k) for k in self.shared_state.capture_classes.keys() if str(k).isdigit()]
+                    self.shared_state.capture_classes[str(max(keys + [-1]) + 1)] = new_cname
+            self.shared_state.save_to_config(CFG_PATH)
+            self.all_class_names = [new_cname if c == cname else c for c in self.all_class_names]
+            if not self.registry.rename(cname, new_cname):
+                self.registry.id_for(new_cname, register=True)
+            self._save_class_mapping()
+            self.ann_fast_class_var.set(new_cname)
+            self._refresh_class_grid()
+            messagebox.showinfo("Success", f"Renamed to '{new_cname}'")
+        except Exception as e:
+            log.exception("Could not rename class %s", cname)
+            messagebox.showerror("Error", f"Could not rename class: {e}")
 
     def _delete_label_class(self):
         # Batch-delete all checked classes
@@ -4858,31 +4697,30 @@ except Exception as e:
         if not to_delete:
             messagebox.showwarning("Warning", "No classes selected! Check the boxes first.")
             return
+        yolo_owned = [cn for cn in to_delete if self.registry.is_yolo_class(cn)]
+        if yolo_owned:
+            messagebox.showwarning("Not possible", "These are classes of the YOLO model and cannot be deleted:\n\n" + ", ".join(yolo_owned))
+            to_delete = [cn for cn in to_delete if cn not in yolo_owned]
+            if not to_delete:
+                return
         names_str = ", ".join(to_delete)
-        if not messagebox.askyesno("Confirm", f"Delete {len(to_delete)} class(es)?\n\n{names_str}"):
+        if not messagebox.askyesno("Confirm", f"Delete {len(to_delete)} class(es)?\n\n{names_str}\n\nImages in the dataset folders are not deleted."):
             return
         try:
+            with self.shared_state.lock:
+                for cname in to_delete:
+                    for k in [k for k, v in self.shared_state.capture_classes.items() if v == cname]:
+                        del self.shared_state.capture_classes[k]
             for cname in to_delete:
-                # Remove from capture_classes
-                keys_to_del = [k for k, v in self.shared_state.capture_classes.items() if v == cname]
-                for k in keys_to_del:
-                    del self.shared_state.capture_classes[k]
-                # Remove from all_class_names
                 self.all_class_names = [c for c in self.all_class_names if c != cname]
-                # Remove from class_map
-                del_keys = [k for k, v in self.class_map.items() if v == cname]
-                for k in del_keys:
-                    del self.class_map[k]
-
+                self.registry.remove(cname)
             self.shared_state.save_to_config(CFG_PATH)
-            import json
-            with open("cashew_class_mapping.json", "w") as f:
-                json.dump(self.class_map, f, indent=4)
-
+            self._save_class_mapping()
             self.ann_fast_class_var.set("")
             self._refresh_class_grid()
             messagebox.showinfo("Success", f"Deleted {len(to_delete)} class(es): {names_str}")
         except Exception as e:
+            log.exception("Could not delete classes %s", names_str)
             messagebox.showerror("Error", f"Could not delete classes: {e}")
 
     def _on_close(self):
@@ -4902,7 +4740,6 @@ except Exception as e:
 
 
 def main():
-    import traceback
     app = None
     try:
         app = App()
@@ -4914,9 +4751,8 @@ def main():
     except Exception as e:
         if app:
             try: app._on_close()
-            except: pass
-        traceback.print_exc()
-        print(f"Error: {e}")
+            except (ValueError, tk.TclError): pass
+        log.exception("Fatal error: %s", e)
 
 if __name__ == "__main__":
     main()

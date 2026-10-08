@@ -7,7 +7,12 @@ import cv2
 from PIL import Image, ImageTk
 import torch
 import torch.nn.functional as F
-from torchvision import models, transforms
+
+import app_paths
+import preprocess
+from class_registry import normalize_name
+
+log = app_paths.setup_logging("auto_labeler")
 
 class CashewColorCNN:
     def __init__(self, model_path=None):
@@ -15,56 +20,43 @@ class CashewColorCNN:
         
         candidates = [
             model_path,
-            "saved_models/cashew_color_cnn_new.pth",
-            "saved_models/cashew_color_cnn.pth",
-            "../CNN_Experiment/cashew_color_cnn.pth"
+            app_paths.CNN_MODEL_PATH,
+            app_paths.MODELS_DIR / "cashew_color_cnn.pth",
         ]
-        
-        selected_path = None
-        for path in candidates:
-            if path and os.path.exists(path):
-                selected_path = path
-                break
-                
+        selected_path = next((p for p in candidates if p and os.path.exists(p)), None)
         if not selected_path:
-            raise FileNotFoundError("No trained CNN model found in saved_models/")
+            raise FileNotFoundError(f"No trained CNN model found in {app_paths.MODELS_DIR}")
             
-        print(f"[AUTO-LABELER] Loading CNN Model from: {selected_path}")
-        checkpoint = torch.load(selected_path, map_location=self.device)
-        self.class_names = checkpoint['class_names']
-        
-        # Initialize model architecture
-        self.model = models.mobilenet_v2(pretrained=False)
-        num_ftrs = self.model.classifier[1].in_features
-        self.model.classifier[1] = torch.nn.Linear(num_ftrs, len(self.class_names))
-        
-        # Load weights
-        state_dict = checkpoint.get('model_state_dict') or checkpoint.get('model_state')
-        self.model.load_state_dict(state_dict)
-        self.model = self.model.to(self.device)
-        self.model.eval()
-        
-        # Transforms for inference
-        self.transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ])
-        print(f"CNN Model loaded with classes: {self.class_names}")
+        log.info("[AUTO-LABELER] Loading CNN model from %s", selected_path)
+        self.model, self.class_names = preprocess.load_cnn_checkpoint(selected_path, self.device)
+        # Same crop preparation as live grading and training (preprocess.py).
+        self.transform = preprocess.build_transform(train=False)
+        log.info("[AUTO-LABELER] CNN classes: %s", self.class_names)
 
     def predict_with_confidence(self, bgr_image_crop):
-        rgb_image = cv2.cvtColor(bgr_image_crop, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(rgb_image)
-        input_tensor = self.transform(pil_img).unsqueeze(0).to(self.device)
-        
+        """(class name exactly as the model knows it, confidence)."""
+        input_tensor = preprocess.crop_to_tensor(bgr_image_crop, self.transform, tight=True).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            outputs = self.model(input_tensor)
-            probs = F.softmax(outputs, dim=1)
+            probs = F.softmax(self.model(input_tensor), dim=1)
             conf, preds = torch.max(probs, 1)
-            
-        raw_pred = self.class_names[preds[0]]
-        norm_pred = raw_pred.upper().replace("GOOD_CASHEW", "GOOD").replace(" ", "_")
-        return norm_pred, conf.item()
+        return self.class_names[int(preds[0])], conf.item()
+
+
+# The current CNN calls the good class GOOD_CASHEW while the dataset folder is GOOD. Until the final
+# class list is fixed (before retraining), this is the only place where that difference is bridged.
+DATASET_FOLDER_ALIASES = {"good cashew": "good"}
+
+
+def folder_for_class(class_name, existing_folders):
+    """Dataset folder for a class: an existing folder with the same name (case, spaces and
+    underscores ignored) is reused, so one class never ends up in two folders."""
+    key = normalize_name(class_name)
+    key = DATASET_FOLDER_ALIASES.get(key, key)
+    for folder in existing_folders:
+        if normalize_name(folder) == key:
+            return folder
+    return key.upper().replace(" ", "_")
+
 
 class AIAutoLabeler(tk.Tk):
     def __init__(self):
@@ -84,16 +76,16 @@ class AIAutoLabeler(tk.Tk):
         self.colors = {"bg": "#2b2b2b", "fg": "#ffffff", "accent": "#2196f3"}
         
         # Paths
-        self.golden_dir = "cnn_final/golden_crops"
-        self.dataset_crops_dir = "dataset"
+        self.golden_dir = str(app_paths.GOLDEN_DIR)
+        self.dataset_crops_dir = str(app_paths.DATASET_DIR)
         os.makedirs(self.dataset_crops_dir, exist_ok=True)
         
         # Model (Optional for manual sorting)
         try:
             self.cnn = CashewColorCNN()
-        except Exception as e:
+        except Exception:
             self.cnn = None
-            print(f"[WARN] Failed to load CNN model: {e}. Running without AI model.")
+            log.exception("Failed to load the CNN model. Running without AI suggestions.")
             
         # Discover existing classes strictly from dataset directory (no auto-creation)
         if os.path.exists(self.dataset_crops_dir):
@@ -119,6 +111,10 @@ class AIAutoLabeler(tk.Tk):
         # Bindings
         self.bind("<Return>", lambda e: self.agree_prediction())
 
+    def _is_reviewing(self):
+        """True when the source folder is a class folder of the dataset (not the unlabelled inbox)."""
+        return os.path.abspath(self.dataset_crops_dir) in [os.path.abspath(p) for p in (self.golden_dir, os.path.dirname(self.golden_dir))]
+
     def get_class_counts(self):
         counts = {}
         total_annotated = 0
@@ -138,7 +134,7 @@ class AIAutoLabeler(tk.Tk):
         self.image_files.sort()
         
     def refresh_source_options(self):
-        src_options = ["cnn_final/golden_crops"]
+        src_options = [str(app_paths.GOLDEN_DIR)]
         if os.path.exists(self.dataset_crops_dir):
             for d in sorted(os.listdir(self.dataset_crops_dir)):
                 full_d = os.path.join(self.dataset_crops_dir, d)
@@ -426,7 +422,7 @@ class AIAutoLabeler(tk.Tk):
                 messagebox.showerror("Error", f"Failed to delete: {e}")
                 
     def load_next_image(self):
-        is_reviewing = "dataset" in self.golden_dir
+        is_reviewing = self._is_reviewing()
         folder_base = os.path.basename(self.golden_dir)
 
         if not self.image_files:
@@ -449,11 +445,8 @@ class AIAutoLabeler(tk.Tk):
         # Load and predict
         bgr = cv2.imread(self.current_img_path)
         if bgr is None:
-            # Corrupted image, delete and move to next
-            try:
-                os.remove(self.current_img_path)
-            except:
-                pass
+            # Unreadable image: skip it (nothing is deleted automatically)
+            log.warning("[AUTO-LABELER] Unreadable image skipped: %s", self.current_img_path)
             self.image_files.pop(0)
             self.update_count()
             self.load_next_image()
@@ -466,7 +459,7 @@ class AIAutoLabeler(tk.Tk):
             
         # Display Prediction & Status based on mode
         conf_pct = int(self.current_conf * 100)
-        clean_pred = self.current_pred.upper().replace("GOOD_CASHEW", "GOOD").replace(" ", "_") if self.current_pred else "UNKNOWN"
+        clean_pred = folder_for_class(self.current_pred, self.available_classes) if self.current_pred else "UNKNOWN"
         
         if is_reviewing:
             self.lbl_prediction.config(text=f"Folder: [{folder_base}]  (AI: {clean_pred})", fg="#81C784")
@@ -512,7 +505,7 @@ class AIAutoLabeler(tk.Tk):
             return
 
         # Ensure destination exists
-        target_class_clean = target_class.upper().replace("GOOD_CASHEW", "GOOD").replace(" ", "_")
+        target_class_clean = folder_for_class(target_class, self.available_classes)
         dest_dir = os.path.join(self.dataset_crops_dir, target_class_clean)
         os.makedirs(dest_dir, exist_ok=True)
         
@@ -529,7 +522,7 @@ class AIAutoLabeler(tk.Tk):
             messagebox.showerror("Error", f"Failed to move file: {e}")
             
     def agree_prediction(self):
-        if "dataset" in self.golden_dir:
+        if self._is_reviewing():
             # In review mode, pressing Agree/Enter keeps it in current class and advances
             self.skip_image()
         else:
@@ -538,7 +531,7 @@ class AIAutoLabeler(tk.Tk):
             
     def update_count(self):
         counts, total_annotated = self.get_class_counts()
-        is_reviewing = "dataset" in self.golden_dir
+        is_reviewing = self._is_reviewing()
         folder_base = os.path.basename(self.golden_dir)
 
         if is_reviewing:
@@ -562,9 +555,9 @@ class AIAutoLabeler(tk.Tk):
     def bulk_auto_sort(self):
         try:
             thresh_pct = int(self.thresh_var.get())
-            thresh = thresh_pct / 100.0
-        except:
-            thresh = 0.95
+        except ValueError:
+            thresh_pct = 95
+        thresh = thresh_pct / 100.0
             
         if not self.image_files:
             messagebox.showinfo("Empty", "No images to sort.")
@@ -593,7 +586,7 @@ class AIAutoLabeler(tk.Tk):
                 if self.cnn:
                     pred, conf = self.cnn.predict_with_confidence(bgr)
                     if conf >= thresh:
-                        pred_clean = pred.upper().replace("GOOD_CASHEW", "GOOD").replace(" ", "_")
+                        pred_clean = folder_for_class(pred, self.available_classes)
                         dest_dir = os.path.join(self.dataset_crops_dir, pred_clean)
                         os.makedirs(dest_dir, exist_ok=True)
                         dest_path = os.path.join(dest_dir, os.path.basename(img_path))
@@ -606,7 +599,7 @@ class AIAutoLabeler(tk.Tk):
                         continue
                 remaining_files.append(img_path)
             else:
-                os.remove(img_path)
+                log.warning("[AUTO-LABELER] Unreadable image left in place: %s", img_path)
                 
             prog_bar['value'] = i + 1
             if i % 10 == 0:
