@@ -1,0 +1,8 @@
+--- Camera Settings for this Dataset ---
+Gain: 1.00
+Red (R): 1.00
+Green (G): 1.00
+Blue (B): 1.40
+Exposure: 800.00
+
+Note: Use these exact settings in the GUI when running the AI model to ensure consistent colors.

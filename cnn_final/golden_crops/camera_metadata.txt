@@ -1,0 +1,6 @@
+Capture Date & Time: 2026-09-21 12:59:11
+Exposure: 800
+Gain: 1.0
+R: 1.0
+G: 1.0
+B: 1.4

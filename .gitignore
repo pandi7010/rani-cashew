@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+captures/
+logs/
+runs/
+temp_train.py
+temp_results.json
