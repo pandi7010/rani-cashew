@@ -26,7 +26,9 @@ from ultralytics import YOLO
 
 import app_paths
 import preprocess
+import flow_geometry as fg
 from class_registry import ClassRegistry, normalize_name
+from usb_camera import CameraThread, CameraSettings
 
 log = app_paths.setup_logging("grader")
 
@@ -38,18 +40,17 @@ except ImportError:
     tcm_magic_wand = None
     log.warning("tcm_magic_wand not found in %s: magic wand annotation and auto-teach are disabled.", app_paths.EXTERNAL_TOOLS_DIR)
 
-# MindVision capture (used for IP config only)
-try:
-    import mvsdk
-except Exception as e:
-    mvsdk = None
-    print("[WARN] mvsdk not found! IP Config might not work.")
 
-# Aravis capture (used for streaming)
-import gi
-gi.require_version('Aravis', '0.8')
-from gi.repository import Aravis
-import platform
+def magic_polygon(image_bgr, x, y):
+    """Polygon of the object under (x, y) from the magic wand tool, or None when the tool is missing.
+    The tool looks for FastSAM-s.pt in the current directory, so its model is loaded here from the project folder."""
+    if tcm_magic_wand is None:
+        return None
+    if getattr(tcm_magic_wand, "_fast_sam_model", None) is None and app_paths.FASTSAM_PATH.exists():
+        from ultralytics import FastSAM
+        tcm_magic_wand._fast_sam_model = FastSAM(str(app_paths.FASTSAM_PATH))
+    return tcm_magic_wand.get_magic_polygon(image_bgr, x, y)
+
 
 try:
     import serial
@@ -100,7 +101,6 @@ GOLDEN_DIR = str(app_paths.GOLDEN_DIR)
 FULL_FRAME_DIR = str(app_paths.FULL_FRAME_DIR)
 MODELS_DIR = str(app_paths.MODELS_DIR)
 CLASS_MAPPING_PATH = str(app_paths.CLASS_MAPPING_PATH)
-FFC_GAIN_MAP_PATH = str(app_paths.FFC_GAIN_MAP_PATH)
 DEFAULT_YOLO_CONF = 0.30
 
 
@@ -179,20 +179,6 @@ def centroid_distance(box1, box2):
     cx1, cy1 = get_centroid(box1)
     cx2, cy2 = get_centroid(box2)
     return ((cx1 - cx2) ** 2 + (cy1 - cy2) ** 2) ** 0.5
-
-def bayer_to_bgr(data, w, h):
-    try:
-        arr = np.frombuffer(data, dtype=np.uint8)
-        if arr.size == h*w:
-            img = arr.reshape((h,w))
-            return cv2.cvtColor(img, cv2.COLOR_BAYER_GR2BGR)
-        elif arr.size == h*w*3:
-            return arr.reshape((h,w,3)).copy()
-        else:
-            return None
-    except Exception:
-        _throttle.exception("bayer", "[CAM] Bayer conversion failed")
-        return None
 
 def resize_letterbox(img, target_w, target_h, bg_color=BG_COLOR):
     if img is None:
@@ -444,8 +430,10 @@ class SharedState:
         self.golden_capture_type = "cropped" # Options: "cropped", "full", "both"
 
         self.cam_gain, self.cam_r, self.cam_g, self.cam_b = 1.0, 1.0, 1.0, 1.0
-        self.analog_gain, self.digital_gain, self.exposure = 1.0, 1.0, 10000
-        self.cam_settings_changed = False
+        self.analog_gain, self.digital_gain = 1.0, 1.0
+        self.camera_settings = CameraSettings()             # USB camera / test source (usb_camera.py)
+        self.flow_direction = fg.RIGHT_TO_LEFT              # also fixes the line orientation (vertical / horizontal)
+        self.line_y_full = None                             # position of a horizontal decision line
         self.opencv_filter = {
             "sw_color_thresh": 45,
             "sw_defect_size_px": 20,
@@ -468,16 +456,6 @@ class SharedState:
         self.total_detected_count = 0
         self.line_pixel_callback = None
 
-        self.gain_map_8u = None
-        self.ffc_enabled = False
-        self.calibrate_ffc_requested = False
-        
-        if os.path.exists(FFC_GAIN_MAP_PATH):
-            self.gain_map_8u = cv2.imread(FFC_GAIN_MAP_PATH, cv2.IMREAD_GRAYSCALE)
-            if self.gain_map_8u is not None:
-                self.ffc_enabled = True
-                print("[INIT] FFC Gain Map Loaded.")
-
         self.load_from_config(CFG_PATH)
 
     def get_timing(self, act_id: int) -> Tuple[int, int]:
@@ -492,10 +470,35 @@ class SharedState:
         with self.lock: self.roi1 = None
     def reset_roi2(self):
         with self.lock: self.roi2 = None
+    # ── decision line: x for a vertical line, y for a horizontal one ──
+    @property
+    def line_is_vertical(self) -> bool:
+        return fg.line_orientation(self.flow_direction) == fg.VERTICAL
+
+    @property
+    def line_pos(self):
+        with self.lock:
+            return self.line_x_full if self.line_is_vertical else self.line_y_full
+
+    def set_line_pos(self, value, notify=True):
+        with self.lock:
+            if self.line_is_vertical: self.line_x_full = value
+            else: self.line_y_full = value
+        if notify: self._notify_line()
+
+    def _notify_line(self):
+        if self.line_pixel_callback:
+            axis, pos = ("X" if self.line_is_vertical else "Y"), self.line_pos
+            self.line_pixel_callback(f"Line {axis}: {pos} px" if pos is not None else f"Line {axis}: Not Set", pos)
+
+    def set_flow_direction(self, flow):
+        with self.lock:
+            self.flow_direction = fg.valid_flow(flow)
+        self._notify_line()
+        self.save_to_config(CFG_PATH)
+
     def reset_line(self):
-        with self.lock: 
-            self.line_x_full = None
-            if self.line_pixel_callback: self.line_pixel_callback("Line X: Not Set", None)
+        self.set_line_pos(None)
 
     def set_mapping_for_actuator(self, act_id: int, class_list: List[str]):
         if not (1 <= act_id <= NUM_ACTUATORS): return
@@ -542,10 +545,6 @@ class SharedState:
     def reset_detected_count(self):
         with self.lock:
             self.total_detected_count = 0
-
-    def trigger_ffc_calibration(self):
-        with self.lock:
-            self.calibrate_ffc_requested = True
 
     def trigger_capture(self):
         with self.lock: self.capture_requested = True
@@ -624,6 +623,9 @@ class SharedState:
                 if "roi1" in cfg and cfg["roi1"]: self.roi1 = tuple(cfg["roi1"])
                 if "roi2" in cfg and cfg["roi2"]: self.roi2 = tuple(cfg["roi2"])
                 self.line_x_full = cfg.get("line_x_full")
+                self.line_y_full = cfg.get("line_y_full")
+                self.flow_direction = fg.valid_flow(cfg.get("flow_direction", fg.RIGHT_TO_LEFT))
+                self.camera_settings = CameraSettings.from_dict(cfg.get("usb_camera"))
                 loaded_classes = cfg.get("capture_classes", {})
                 if loaded_classes:
                     for k, v in loaded_classes.items():
@@ -638,7 +640,6 @@ class SharedState:
                     self.cam_b = c.get("b", 1.0)
                     self.analog_gain = c.get("a_gain", 1.0)
                     self.digital_gain = c.get("d_gain", 1.0)
-                    self.exposure = c.get("exposure", 10000)
                 
                 self._rebuild_processing_map()
         except Exception:
@@ -663,11 +664,14 @@ class SharedState:
                     "roi1": self.roi1,
                     "roi2": self.roi2,
                     "line_x_full": self.line_x_full,
+                    "line_y_full": self.line_y_full,
+                    "flow_direction": self.flow_direction,
+                    "usb_camera": self.camera_settings.to_dict(),
                     "capture_classes": self.capture_classes,
                     "active_capture_class_id": self.active_capture_class_id,
                     "camera": {
                         "gain": self.cam_gain, "r": self.cam_r, "g": self.cam_g, "b": self.cam_b,
-                        "a_gain": self.analog_gain, "d_gain": self.digital_gain, "exposure": self.exposure
+                        "a_gain": self.analog_gain, "d_gain": self.digital_gain
                     }
                 }
             # Written to a temporary file first, so a crash while saving cannot leave half a config.
@@ -695,7 +699,8 @@ class SharedState:
                 "phase": self.phase,
                 "roi1": self.roi1, "roi2": self.roi2,
                 "temp_start": self.temp_start_pt, "temp_end": self.temp_end_pt,
-                "line_x": self.line_x_full,
+                "line_pos": self.line_x_full if self.line_is_vertical else self.line_y_full,
+                "flow": self.flow_direction,
                 "mouse_x": self.mouse_x, "mouse_y": self.mouse_y,
                 "mapping_t1": self.mapping_t1.copy(), "mapping_t2": self.mapping_t2.copy(),
                 "priority_rules": list(self.priority_rules),
@@ -706,20 +711,21 @@ class SharedState:
                 "target_conf": self.yolo_conf,
                 "is_conveyor_on": self.is_conveyor_on,
                 "gain": self.cam_gain, "r": self.cam_r, "g": self.cam_g, "b": self.cam_b,
-                "a_gain": self.analog_gain, "d_gain": self.digital_gain, "exposure": self.exposure
+                "a_gain": self.analog_gain, "d_gain": self.digital_gain,
+                "exposure": "auto" if self.camera_settings.auto_exposure else self.camera_settings.exposure
             }
 
     def handle_mouse_down(self, pt: Tuple[int, int]):
         with self.lock:
+            along = pt[0] if self.line_is_vertical else pt[1]       # the coordinate the line is set by
             if self.phase == "ROI1_START" or self.phase == "ROI2_START":
                 self.temp_start_pt = pt; self.temp_end_pt = pt
                 self.phase = "ROI1_DRAW" if self.phase == "ROI1_START" else "ROI2_DRAW"
             elif self.phase == "LINE_SET_MODE":
-                self.line_x_full = pt[0]
+                self.set_line_pos(along)
                 self.phase = "READY"
-                if self.line_pixel_callback: self.line_pixel_callback(f"Line X: {self.line_x_full} px", self.line_x_full)
                 self.save_to_config(CFG_PATH)
-            elif self.line_x_full is not None and abs(pt[0] - self.line_x_full) < 15:
+            elif self.line_pos is not None and abs(along - self.line_pos) < 15:
                 self.dragging_line = True
 
     def handle_mouse_move(self, pt: Tuple[int, int]):
@@ -728,8 +734,7 @@ class SharedState:
             if self.phase in ("ROI1_DRAW", "ROI2_DRAW"): 
                 self.temp_end_pt = pt
             elif self.dragging_line:
-                self.line_x_full = pt[0]
-                if self.line_pixel_callback: self.line_pixel_callback(f"Line X: {self.line_x_full} px", self.line_x_full)
+                self.set_line_pos(pt[0] if self.line_is_vertical else pt[1])
 
     def handle_mouse_up(self, pt: Tuple[int, int]):
         with self.lock:
@@ -748,157 +753,6 @@ class SharedState:
                 self.save_to_config(CFG_PATH)
             elif was_dragging:
                 self.save_to_config(CFG_PATH)
-
-# ---------------- CameraThread ----------------
-class CameraThread(threading.Thread):
-    def __init__(self, output_queue: queue.Queue, stop_event: threading.Event, shared_state: SharedState):
-        super().__init__(daemon=True, name="CameraThread")
-        self.output_queue = output_queue
-        self.stop_event = stop_event
-        self.shared_state = shared_state
-        self.camera = None
-        self.stream = None
-        self.is_connected = False
-        self.reconnect_flag = threading.Event()
-        self.fps = 0.0
-
-    def request_reconnect(self):
-        self.reconnect_flag.set()
-
-    def run(self):
-        frame_count = 0
-        start_time = time.time()
-        self.current_cam_phase = "READY"
-        self.hw_canvas = None
-        self.offset_x = 0
-        self.offset_y = 0
-        self.max_w = 0
-        self.max_h = 0
-        
-        try:
-            Aravis.update_device_list()
-            n = Aravis.get_n_devices()
-            if n == 0:
-                self.output_queue.put(("ERROR", "No cameras found"))
-                return
-            
-            device_id = Aravis.get_device_id(0)
-            self.camera = Aravis.Camera.new(device_id)
-            self.stream = self.camera.create_stream(None, None)
-            payload = self.camera.get_payload()
-            for _ in range(10): 
-                self.stream.push_buffer(Aravis.Buffer.new_allocate(payload))
-            
-            try:
-                device = self.camera.get_device()
-                device.set_string_feature("ExposureAuto", "Off")
-            except Exception as e: print(f"[CAM] ExposureAuto Off failed: {e}")
-            try:
-                device.set_string_feature("ExposureMode", "Timed")
-            except Exception: pass
-            
-            def safe_set_exposure(dev, val):
-                try: dev.set_float_feature_value("ExposureTime", float(val))
-                except Exception:
-                    try: dev.set_integer_feature_value("ExposureTime", int(val))
-                    except Exception:
-                        try: dev.set_float_feature_value("ExposureTimeAbs", float(val))
-                        except Exception as e: 
-                            err_msg = f"Exposure set failed: {e}"
-                            print(f"[CAM] {err_msg}")
-                            import tkinter.messagebox
-                            try: tkinter.messagebox.showerror("Camera Error", err_msg)
-                            except: pass
-                        
-            safe_set_exposure(device, self.shared_state.exposure)
-                
-            try:
-                self.max_w = device.get_integer_feature("WidthMax")
-                self.max_h = device.get_integer_feature("HeightMax")
-            except Exception:
-                self.max_w = 2448
-                self.max_h = 2048
-            
-            self.camera.start_acquisition()
-            self.is_connected = True
-            
-            while not self.stop_event.is_set():
-                target_phase = self.shared_state.phase
-                if target_phase in ["RUNNING", "READY"] and target_phase != self.current_cam_phase:
-                    self.current_cam_phase = target_phase
-
-                if self.shared_state.cam_settings_changed:
-                    try:
-                        device = self.camera.get_device()
-                        device.set_string_feature_value("ExposureAuto", "Off")
-                    except Exception: pass
-                    safe_set_exposure(device, self.shared_state.exposure)
-                    self.shared_state.cam_settings_changed = False
-                    
-                buf = self.stream.pop_buffer()
-                if buf is None:
-                    time.sleep(0.001) 
-                    continue
-                
-                try:
-                    w = buf.get_image_width()
-                    h = buf.get_image_height()
-                    data = buf.get_data()
-                    
-                    if self.shared_state.calibrate_ffc_requested:
-                        self.shared_state.calibrate_ffc_requested = False
-                        bayer_arr = np.frombuffer(data, dtype=np.uint8).reshape((h, w))
-                        # Aggressive downsample to remove noise and texture quickly
-                        small = cv2.resize(bayer_arr, (w//16, h//16))
-                        smoothed = cv2.GaussianBlur(small, (15, 15), 0)
-                        smoothed = cv2.resize(smoothed, (w, h))
-                        mean_val = np.mean(smoothed)
-                        gain_map = mean_val / (smoothed.astype(np.float32) + 1e-5)
-                        self.shared_state.gain_map_8u = np.clip(gain_map * 128, 0, 255).astype(np.uint8)
-                        self.shared_state.ffc_enabled = True
-                        cv2.imwrite(FFC_GAIN_MAP_PATH, self.shared_state.gain_map_8u)
-                        print("[CAM] FFC Calibration Complete and Saved.")
-                        
-                    if self.shared_state.ffc_enabled and self.shared_state.gain_map_8u is not None:
-                        bayer_arr = np.frombuffer(data, dtype=np.uint8).reshape((h, w))
-                        # cv2.multiply with scale applies the float multiplier mapped to 8-bit, running in fast C++
-                        bayer_arr = cv2.multiply(bayer_arr, self.shared_state.gain_map_8u, scale=1/128.0)
-                        frame_full = cv2.cvtColor(bayer_arr, cv2.COLOR_BAYER_GR2BGR)
-                    else:
-                        # Directly convert Bayer to BGR without making a copy of the Bayer buffer.
-                        # cv2.cvtColor will allocate the new BGR array natively.
-                        frame_full = bayer_to_bgr(data, w, h)
-                        
-                    if frame_full is None:
-                        continue
-                        
-                    frame_count += 1
-                    ct = time.time()
-                    if ct - start_time >= 1.0:
-                        self.fps = frame_count / (ct - start_time)
-                        frame_count = 0
-                        start_time = ct
-                    
-                    try: self.output_queue.get_nowait()
-                    except queue.Empty: pass 
-                    self.output_queue.put((frame_full, self.max_w, self.max_h))
-                except Exception:
-                    _throttle.exception("camera_frame", "[CAM] Could not convert a camera frame")
-                finally:
-                    self.stream.push_buffer(buf) 
-                    
-        except Exception as e:
-            self.is_connected = False
-            log.exception("[CAM] Camera thread stopped")
-            try: self.output_queue.put_nowait(("ERROR", str(e)))
-            except queue.Full: pass
-        finally:
-            self.is_connected = False
-            try:
-                if self.camera: self.camera.stop_acquisition()
-            except Exception: pass
-            self.stream = None
-            self.camera = None
 
 # ---------------- ProcessingThread ----------------
 class ProcessingThread(threading.Thread):
@@ -1043,6 +897,18 @@ class ProcessingThread(threading.Thread):
                 
                 state = self.shared_state.get_processing_state()
                 
+                g = max(0.1, state["gain"] * state["a_gain"] * state["d_gain"])
+                r, gr, b = max(0.1, state["r"]), max(0.1, state["g"]), max(0.1, state["b"])
+                if g != 1.0 or r != 1.0 or gr != 1.0 or b != 1.0:
+                    # Ultra-fast color correction using cv2.transform matrix operation
+                    # This avoids slow channel splitting and clipping
+                    m = np.array([
+                        [g * b, 0, 0],
+                        [0, g * gr, 0],
+                        [0, 0, g * r]
+                    ], dtype=np.float32)
+                    frame_full = cv2.transform(frame_full, m)
+                
                 if self.shared_state.check_and_clear_capture():
                     folder_name = self.shared_state.get_active_capture_folder()
                     target_dir = os.path.join(DATASET_DIR, folder_name)
@@ -1058,7 +924,7 @@ class ProcessingThread(threading.Thread):
                             f.write(f"Red (R): {state.get('r', 1.0):.2f}\n")
                             f.write(f"Green (G): {state.get('g', 1.0):.2f}\n")
                             f.write(f"Blue (B): {state.get('b', 1.0):.2f}\n")
-                            f.write(f"Exposure: {state.get('exposure', 5000):.2f}\n")
+                            f.write(f"Exposure: {state.get('exposure', 'N/A')}\n")
                             f.write("\nNote: Use these exact settings in the GUI when running the AI model to ensure consistent colors.\n")
                     
                     # Create a copy for saving so we don't modify the display frame
@@ -1077,18 +943,6 @@ class ProcessingThread(threading.Thread):
                     
                     cv2.imwrite(filename, save_frame)
                 
-                g = max(0.1, state["gain"] * state["a_gain"] * state["d_gain"])
-                r, gr, b = max(0.1, state["r"]), max(0.1, state["g"]), max(0.1, state["b"])
-                if g != 1.0 or r != 1.0 or gr != 1.0 or b != 1.0:
-                    # Ultra-fast color correction using cv2.transform matrix operation
-                    # This avoids slow channel splitting and clipping
-                    m = np.array([
-                        [g * b, 0, 0],
-                        [0, g * gr, 0],
-                        [0, 0, g * r]
-                    ], dtype=np.float32)
-                    frame_full = cv2.transform(frame_full, m)
-                
                 display_frame = None
                 
                 if state["phase"] == "RUNNING" and self.model and (state["roi1"] or state["roi2"]):
@@ -1105,13 +959,7 @@ class ProcessingThread(threading.Thread):
                         crops_to_show.append(frame_drawn[ry1:ry2, rx1:rx2])
                         
                     if len(crops_to_show) > 0:
-                        target_w = max(c.shape[1] for c in crops_to_show)
-                        padded = []
-                        for c in crops_to_show:
-                            if c.shape[1] < target_w:
-                                c = cv2.copyMakeBorder(c, 0, 0, 0, target_w - c.shape[1], cv2.BORDER_CONSTANT, value=(0,0,0))
-                            padded.append(c)
-                        display_img = cv2.vconcat(padded)
+                        display_img, _ = fg.stack_crops(crops_to_show)
                     else:
                         display_img = frame_drawn
                         
@@ -1147,31 +995,27 @@ class ProcessingThread(threading.Thread):
 
     # FIXED: Small arrow in the top corner (approx 25mm length x 5mm height visually)
     def _draw_arrows(self, frame, state):
-        line_x = state.get("line_x")
+        """Small flow arrow in a corner of each ROI, pointing the way the cashews travel."""
+        flow = state["flow"]
+        length = 60
         for idx, roi in enumerate([state["roi1"], state["roi2"]]):
-            if roi:
-                x1, y1, x2, y2 = roi
-                cx_roi = (x1 + x2) // 2
-                
-                # Flow direction logic
-                flow_right = True
-                if line_x and cx_roi > line_x:
-                    flow_right = False
-                
-                # Placed exactly 20 pixels below the top edge of ROI, neatly in the corner
-                arrow_y = y1 + 20 
-                arrow_length = 60 # Approx 25mm visually
-                
-                if flow_right:
-                    start_pt = (x1 + 10, arrow_y)
-                    end_pt = (x1 + 10 + arrow_length, arrow_y)
-                    cv2.arrowedLine(frame, start_pt, end_pt, ARROW_COLOR, 2, tipLength=0.3)
-                    cv2.putText(frame, f"T{idx+1} FLOW", (end_pt[0] + 10, arrow_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, ARROW_COLOR, 2)
-                else:
-                    start_pt = (x2 - 10, arrow_y)
-                    end_pt = (x2 - 10 - arrow_length, arrow_y)
-                    cv2.arrowedLine(frame, start_pt, end_pt, ARROW_COLOR, 2, tipLength=0.3)
-                    cv2.putText(frame, f"FLOW T{idx+1}", (end_pt[0] - 80, arrow_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, ARROW_COLOR, 2)
+            if not roi:
+                continue
+            x1, y1, x2, y2 = roi
+            if flow == fg.LEFT_TO_RIGHT:
+                start_pt, end_pt = (x1 + 10, y1 + 20), (x1 + 10 + length, y1 + 20)
+                text_pt = (end_pt[0] + 10, y1 + 25)
+            elif flow == fg.RIGHT_TO_LEFT:
+                start_pt, end_pt = (x2 - 10, y1 + 20), (x2 - 10 - length, y1 + 20)
+                text_pt = (end_pt[0] - 80, y1 + 25)
+            elif flow == fg.TOP_TO_BOTTOM:
+                start_pt, end_pt = (x1 + 20, y1 + 10), (x1 + 20, y1 + 10 + length)
+                text_pt = (x1 + 30, y1 + 25)
+            else:
+                start_pt, end_pt = (x1 + 20, y2 - 10), (x1 + 20, y2 - 10 - length)
+                text_pt = (x1 + 30, y2 - 15)
+            cv2.arrowedLine(frame, start_pt, end_pt, ARROW_COLOR, 2, tipLength=0.3)
+            cv2.putText(frame, f"T{idx+1} FLOW", text_pt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, ARROW_COLOR, 2)
 
     def _draw_setup_overlays(self, frame, state):
         if state["temp_start"] and state["temp_end"]:
@@ -1184,8 +1028,7 @@ class ProcessingThread(threading.Thread):
             x1,y1,x2,y2 = state["roi2"]
             cv2.rectangle(frame, (x1,y1), (x2,y2), AOI_COLOR2, 3)
             cv2.putText(frame, "ROI 2", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, AOI_COLOR2, 2)
-        if state["line_x"]:
-            cv2.line(frame, (state["line_x"], 0), (state["line_x"], frame.shape[0]), LINE_COLOR, 3)
+        fg.draw_line(frame, state["flow"], state["line_pos"], LINE_COLOR, 3)
         
         ph = state["phase"]
         msg = ""
@@ -1236,8 +1079,12 @@ class ProcessingThread(threading.Thread):
         # Use user-defined YOLO confidence threshold to filter out background noise (empty rollers)
         global_min_conf = state.get("target_conf", 0.30)
         
-        line_x = state["line_x"]
-        if line_x: cv2.line(frame, (line_x, 0), (line_x, frame.shape[0]), LINE_COLOR, 2)
+        flow, line_pos = state["flow"], state["line_pos"]
+        fg.draw_line(frame, flow, line_pos, LINE_COLOR, 2)
+
+        def past_line(cx, cy):
+            """Pixels past the decision line in the direction of flow (negative = not there yet)."""
+            return fg.progress(flow, line_pos, cx, cy)
 
         boxes, classes, confs = [], [], []
         
@@ -1258,39 +1105,20 @@ class ProcessingThread(threading.Thread):
                         offsets.append((rx1, ry1))
                         
                 if crops:
-                    target_w = max(c.shape[1] for c in crops)
-                    padded = []
-                    for c in crops:
-                        if c.shape[1] < target_w:
-                            c = cv2.copyMakeBorder(c, 0, 0, 0, target_w - c.shape[1], cv2.BORDER_CONSTANT, value=(0,0,0))
-                        padded.append(c)
-                    
-                    combined_img = cv2.vconcat(padded)
+                    # One YOLO call for all ROIs: the crops are put into a single image.
+                    combined_img, places = fg.stack_crops(crops)
                     results = self.model.predict(combined_img, conf=global_min_conf, verbose=False, device=self.device)[0]
                     
                     for box in results.boxes:
                         xy = box.xyxy[0].cpu().numpy().tolist()
-                        cy = (xy[1] + xy[3]) / 2.0
-                        
-                        y_accum = 0
-                        for i, (c, (rx1, ry1)) in enumerate(zip(padded, offsets)):
-                            if y_accum <= cy <= y_accum + c.shape[0]:
-                                local_x1, local_y1 = xy[0], xy[1] - y_accum
-                                local_x2, local_y2 = xy[2], xy[3] - y_accum
-                                
-                                c_conf = float(box.conf[0].cpu().numpy())
-                                cls_id = int(box.cls[0].cpu().numpy())
-                                
-                                global_x1 = int(local_x1) + rx1
-                                global_y1 = int(local_y1) + ry1
-                                global_x2 = int(local_x2) + rx1
-                                global_y2 = int(local_y2) + ry1
-                                
-                                boxes.append([global_x1, global_y1, global_x2, global_y2])
-                                classes.append(cls_id)
-                                confs.append(c_conf)
-                                break
-                            y_accum += c.shape[0]
+                        i = fg.place_index(places, (xy[0] + xy[2]) / 2.0, (xy[1] + xy[3]) / 2.0)
+                        if i < 0:
+                            continue
+                        px, py = places[i][0], places[i][1]
+                        rx1, ry1 = offsets[i]
+                        boxes.append([int(xy[0] - px) + rx1, int(xy[1] - py) + ry1, int(xy[2] - px) + rx1, int(xy[3] - py) + ry1])
+                        classes.append(int(box.cls[0].cpu().numpy()))
+                        confs.append(float(box.conf[0].cpu().numpy()))
 
         # Golden Capture logic moved to run after tracker assignment
 
@@ -1364,17 +1192,16 @@ class ProcessingThread(threading.Thread):
             ]
 
             for i in unmatched_new:
-                new_cx = (mb[i][0] + mb[i][2]) / 2.0
+                new_cx, new_cy = get_centroid(mb[i])
                 
                 # CRITICAL IDENTITY THEFT FIX:
                 # If this object was already fired, it MUST NEVER match an incoming cashew that is still behind the line!
-                if line_x and obj.get('fired') and new_cx > (line_x - 10):
+                if line_pos is not None and obj.get('fired') and past_line(new_cx, new_cy) < 10:
                     continue
 
                 dist = centroid_distance(pred_box, mb[i])
-                # Ensure they are vertically aligned (same channel/track)
-                y_overlap = min(pred_box[3], mb[i][3]) - max(pred_box[1], mb[i][1])
-                if dist < 160 and y_overlap > -20: 
+                # Ensure they are in the same roller channel (they overlap across the flow)
+                if dist < 160 and fg.lane_overlap(flow, pred_box, mb[i]) > -20: 
                     if dist < best_dist:
                         best_dist = dist
                         best_idx = i
@@ -1390,10 +1217,10 @@ class ProcessingThread(threading.Thread):
                 obj['vx'] = 0.7 * obj.get('vx', 0.0) + 0.3 * inst_vx
                 obj['vy'] = 0.7 * obj.get('vy', 0.0) + 0.3 * inst_vy
                 
-                # Time-based true velocity calculation
+                # Time-based true velocity calculation (along the flow)
                 dt = current_time_ms - obj.get('last_time_ms', current_time_ms - 13.3)
                 if dt > 0:
-                    inst_v_px_per_ms = inst_vx / dt
+                    inst_v_px_per_ms = (inst_vx if fg.line_orientation(flow) == fg.VERTICAL else inst_vy) / dt
                     obj['v_px_per_ms'] = 0.7 * obj.get('v_px_per_ms', inst_v_px_per_ms) + 0.3 * inst_v_px_per_ms
                 
                 obj['last_time_ms'] = current_time_ms
@@ -1415,10 +1242,8 @@ class ProcessingThread(threading.Thread):
                 if obj['missing_frames'] < max_missing:
                     vx = obj.get('vx', 0)
                     vy = obj.get('vy', 0)
-                    if vx == 0 and vy == 0 and line_x:
-                        cx = (obj['box'][0] + obj['box'][2]) / 2.0
-                        if cx < line_x: vx = 20  
-                        else: vx = -20           
+                    if vx == 0 and vy == 0 and line_pos is not None:
+                        vx, vy = fg.step_toward_line(flow, line_pos, *get_centroid(obj['box']), 20)
                         
                     obj['box'] = [
                         obj['box'][0] + vx, obj['box'][1] + vy,
@@ -1510,8 +1335,7 @@ class ProcessingThread(threading.Thread):
 
             cv2.circle(frame, (int(cx), int(cy)), 5, (255, 255, 255), -1)
             
-            line_x = state.get("line_x")
-            has_crossed = line_x is not None and cx <= line_x
+            has_crossed = line_pos is not None and past_line(cx, cy) >= 0
             
             if self.shared_state.is_golden_capture_active() and obj['missing_frames'] == 0 and not has_crossed:
                 pad = 20
@@ -1560,8 +1384,8 @@ class ProcessingThread(threading.Thread):
             
             crossed_line = False
             # Check line crossing: If cashew is past or reaching the decision line, fire it!
-            if line_x and not obj['fired']:
-                if cx <= line_x and cx >= (line_x - 400):
+            if line_pos is not None and not obj['fired']:
+                if 0 <= past_line(cx, cy) <= 400:
                     crossed_line = True
 
             if crossed_line and not obj['fired']:
@@ -1852,7 +1676,7 @@ class App(tk.Tk):
         self.camera_queue = queue.Queue(maxsize=2)
         self.display_queue = queue.Queue(maxsize=2)
         
-        self.camera_thread = CameraThread(self.camera_queue, self.stop_event, self.shared_state)
+        self.camera_thread = CameraThread(self.camera_queue, self.stop_event, self.shared_state.camera_settings)
         self.processing_thread = ProcessingThread(
             self.model_path, self.registry, self.camera_queue, self.display_queue, 
             self.stop_event, self.shared_state, self.controller, self.fire_counts, self.fire_lock,
@@ -2412,64 +2236,7 @@ class App(tk.Tk):
         ttk.Button(upload_frm, text="UPLOAD MODEL FILE", style="Primary.TButton", command=browse_model).pack(side="left")
         refresh_models()
 
-        p_vis = tk.Frame(self.page_container, bg=self.colors["surface"], padx=15, pady=15)
-        self.pages["Vision ROI"] = p_vis
-        ttk.Label(p_vis, text="VISION & ROI SETUP", style="Title.TLabel").pack(anchor="w", pady=(0,15))
-        
-        roi_grid = tk.Frame(p_vis, bg=self.colors["surface"])
-        roi_grid.pack(fill=tk.X, pady=10)
-        roi_grid.columnconfigure(0, weight=1); roi_grid.columnconfigure(1, weight=1)
-        
-        ttk.Button(roi_grid, text="Draw ROI 1", command=lambda: self._set_phase("ROI1_START")).grid(row=0, column=0, padx=5, pady=5, sticky="ew")
-        ttk.Button(roi_grid, text="Reset ROI 1", command=self.shared_state.reset_roi1).grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-        ttk.Button(roi_grid, text="Draw ROI 2", command=lambda: self._set_phase("ROI2_START")).grid(row=1, column=0, padx=5, pady=5, sticky="ew")
-        ttk.Button(roi_grid, text="Reset ROI 2", command=self.shared_state.reset_roi2).grid(row=1, column=1, padx=5, pady=5, sticky="ew")
-        ttk.Button(roi_grid, text="Set Decision Line", style="Primary.TButton", command=lambda: self._set_phase("LINE_SET_MODE")).grid(row=2, column=0, padx=5, pady=5, sticky="ew")
-        ttk.Button(roi_grid, text="Reset Line", command=self.shared_state.reset_line).grid(row=2, column=1, padx=5, pady=5, sticky="ew")
-        
-        man_frm = tk.Frame(p_vis, bg=self.colors["surface"])
-        man_frm.pack(fill=tk.X, pady=15)
-        self.manual_line_var = tk.StringVar()
-        ttk.Button(man_frm, text="◀ Shift Left", command=lambda: self._shift_line(-5)).pack(side=tk.LEFT, padx=5)
-        tk.Entry(man_frm, textvariable=self.manual_line_var, width=6, bg=self.colors["surface_light"], fg=self.colors["text"], bd=0, font=("Roboto", 12), justify="center").pack(side=tk.LEFT, padx=10, fill=tk.Y)
-        ttk.Button(man_frm, text="Shift Right ▶", command=lambda: self._shift_line(5)).pack(side=tk.LEFT, padx=5)
-        
-        self.lbl_line_pos = ttk.Label(p_vis, text="Line X: Not Set", font=("Roboto", 10, "bold"), foreground=self.colors["warning"])
-        self.lbl_line_pos.pack(pady=5)
-        self.manual_line_var.trace_add("write", self._on_manual_line_var_write)
-        self.shared_state.line_pixel_callback = self._on_line_change_callback
-        
-        ttk.Label(p_vis, text="IMAGE SENSOR CONTROL", style="Header.TLabel").pack(anchor="w", pady=(20,10))
-        self.vars_cam = {
-            "gain": tk.StringVar(value=str(self.shared_state.cam_gain)),
-            "r": tk.StringVar(value=str(self.shared_state.cam_r)),
-            "g": tk.StringVar(value=str(self.shared_state.cam_g)),
-            "b": tk.StringVar(value=str(self.shared_state.cam_b)),
-            "a_gain": tk.StringVar(value=str(self.shared_state.analog_gain)),
-            "d_gain": tk.StringVar(value=str(self.shared_state.digital_gain)),
-            "exposure": tk.StringVar(value=str(self.shared_state.exposure))
-        }
-        cam_grid = tk.Frame(p_vis, bg=self.colors["surface"])
-        cam_grid.pack(fill=tk.X)
-        labels = [("Global Gain", "gain"), ("R Gain", "r"), ("G Gain", "g"), ("B Gain", "b"), ("Exposure (µs)", "exposure")]
-        for idx, (txt, key) in enumerate(labels):
-            ttk.Label(cam_grid, text=txt, style="Surface.TLabel").grid(row=idx, column=0, sticky="w", pady=5)
-            tk.Entry(cam_grid, textvariable=self.vars_cam[key], width=10, bg=self.colors["surface_light"], fg=self.colors["text"], bd=0).grid(row=idx, column=1, padx=20, pady=5)
-            self.vars_cam[key].trace_add("write", self._on_cam_setting_change)
-            
-        def save_cam_settings():
-            self._on_cam_setting_change()
-            messagebox.showinfo("Saved", "Camera settings saved successfully.")
-            
-        ttk.Button(p_vis, text="SAVE CAMERA SETTINGS", style="Primary.TButton", command=save_cam_settings).pack(pady=(15, 0), fill=tk.X)
-        
-        def trigger_ffc():
-            self.shared_state.trigger_ffc_calibration()
-            messagebox.showinfo("FFC Calibration", "Captured White Reference.\\nFlat Field Correction is now active and saved.")
-            
-        ttk.Button(p_vis, text="White Calibration (FFC)", style="Primary.TButton", command=trigger_ffc).pack(pady=(15, 0), fill=tk.X)
-        
-        ttk.Button(p_vis, text="Test Image Capture", command=self.shared_state.trigger_capture).pack(pady=20, fill=tk.X)
+        self._build_vision_page()
 
         p_sort = tk.Frame(self.page_container, bg=self.colors["surface"])
         self.pages["Sorting Logic"] = p_sort
@@ -2784,21 +2551,7 @@ class App(tk.Tk):
         self.pages["Network"] = p_net
         ttk.Label(p_net, text="NETWORK CONFIGURATION", style="Title.TLabel").pack(anchor="w", pady=(0,15))
         
-        ttk.Label(p_net, text="Camera Identification", style="Header.TLabel").pack(anchor="w")
-        self.lbl_cam_name = ttk.Label(p_net, text="Name: Scanning...", style="Surface.TLabel")
-        self.lbl_cam_name.pack(anchor="w", pady=(5,0))
-        self.lbl_cam_ip = ttk.Label(p_net, text="IP Address: Unknown", style="Surface.TLabel", foreground=self.colors["info"])
-        self.lbl_cam_ip.pack(anchor="w", pady=(2,15))
-        ttk.Button(p_net, text="Scan Network", command=self._scan_camera_ip).pack(anchor="w", pady=(0,20))
-        
-        ttk.Label(p_net, text="Static IP Configuration", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(p_net, text="New IP Address:", style="Surface.TLabel").pack(anchor="w", pady=(5,2))
-        self.new_ip_var = tk.StringVar()
-        tk.Entry(p_net, textvariable=self.new_ip_var, width=18, bg=self.colors["surface_light"], fg=self.colors["text"], bd=0, font=("Roboto", 11)).pack(anchor="w", pady=(0, 8))
-        ttk.Button(p_net, text="Apply Static IP", style="Primary.TButton", command=self._set_camera_ip).pack(anchor="w", pady=(0, 15))
-
         # --- Inovance PLC (Modbus TCP) Configuration ---
-        ttk.Separator(p_net, orient="horizontal").pack(fill=tk.X, pady=(10, 15))
         ttk.Label(p_net, text="Inovance EC320 PLC (Modbus TCP)", style="Header.TLabel").pack(anchor="w", pady=(0, 10))
 
         plc_card = tk.Frame(p_net, bg=self.colors["surface_light"], padx=12, pady=12)
@@ -2946,7 +2699,7 @@ class App(tk.Tk):
         import subprocess
         script = app_paths.TCM_STUDIO_SCRIPT
         if not script.exists():
-            messagebox.showerror("Not available", f"TCM Studio Pro was not found:\n{script}\n\nSet RANIVISION_DIR to the folder that contains it.")
+            messagebox.showerror("Not available", f"TCM Studio Pro was not found:\n{script}")
             return
         try:
             subprocess.Popen([sys.executable, str(script)], cwd=str(script.parent))
@@ -3413,7 +3166,7 @@ except Exception as e:
                     messagebox.showerror("Not available", f"The magic wand tool was not found in\n{app_paths.EXTERNAL_TOOLS_DIR}", parent=popup)
                     return
                 try:
-                    pts = tcm_magic_wand.get_magic_polygon(frame, ox, oy)
+                    pts = magic_polygon(frame, ox, oy)
                     if len(pts) > 0:
                         pts_np = np.array(pts, dtype=np.int32)
                         area = cv2.contourArea(pts_np)
@@ -3586,7 +3339,7 @@ except Exception as e:
         orig_x = int(x / scale)
         orig_y = int(y / scale)
         
-        poly = tcm_magic_wand.get_magic_polygon(self.ann_current_img, orig_x, orig_y)
+        poly = magic_polygon(self.ann_current_img, orig_x, orig_y)
         if poly is not None and len(poly) > 2:
             cname = self.ann_fast_class_var.get()
             cid = 0
@@ -3877,6 +3630,272 @@ except Exception as e:
         with self.shared_state.lock:
             self.shared_state.phase = phase
 
+    def _build_vision_page(self):
+        """Vision ROI page: ROIs, decision line (either orientation), USB camera / test source, colour gain."""
+        surf, light, text, muted = self.colors["surface"], self.colors["surface_light"], self.colors["text"], self.colors["text_muted"]
+        page = tk.Frame(self.page_container, bg=surf)
+        self.pages["Vision ROI"] = page
+        canvas = tk.Canvas(page, bg=surf, highlightthickness=0)
+        scroll = ttk.Scrollbar(page, orient="vertical", command=canvas.yview)
+        p_vis = tk.Frame(canvas, bg=surf, padx=15, pady=15)
+        p_vis.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        window_id = canvas.create_window((0, 0), window=p_vis, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(window_id, width=e.width))
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        def entry(parent, var, width=8):
+            return tk.Entry(parent, textvariable=var, width=width, bg=light, fg=text, insertbackground=text,
+                            disabledbackground=self.colors["bg"], bd=0, font=("Roboto", 11))
+
+        def check(parent, label, var, command=None):
+            return tk.Checkbutton(parent, text=label, variable=var, command=command, bg=surf, fg=text, selectcolor=self.colors["bg"],
+                                  activebackground=surf, activeforeground=text, font=("Roboto", 10))
+
+        # ── ROIs ──
+        ttk.Label(p_vis, text="VISION & ROI SETUP", style="Title.TLabel").pack(anchor="w", pady=(0,10))
+        roi_grid = tk.Frame(p_vis, bg=surf)
+        roi_grid.pack(fill=tk.X, pady=5)
+        roi_grid.columnconfigure(0, weight=1); roi_grid.columnconfigure(1, weight=1)
+        ttk.Button(roi_grid, text="Draw ROI 1", command=lambda: self._set_phase("ROI1_START")).grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+        ttk.Button(roi_grid, text="Reset ROI 1", command=self.shared_state.reset_roi1).grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        ttk.Button(roi_grid, text="Draw ROI 2", command=lambda: self._set_phase("ROI2_START")).grid(row=1, column=0, padx=5, pady=5, sticky="ew")
+        ttk.Button(roi_grid, text="Reset ROI 2", command=self.shared_state.reset_roi2).grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+
+        # ── Decision line ──
+        ttk.Label(p_vis, text="DECISION LINE", style="Header.TLabel").pack(anchor="w", pady=(15,5))
+        line_names = {fg.VERTICAL: "Vertical  |", fg.HORIZONTAL: "Horizontal  —"}
+        dir_frm = tk.Frame(p_vis, bg=surf)
+        dir_frm.pack(fill=tk.X, pady=5)
+        ttk.Label(dir_frm, text="Line:", style="Surface.TLabel").pack(side=tk.LEFT)
+        self.line_orient_var = tk.StringVar(value=line_names[fg.line_orientation(self.shared_state.flow_direction)])
+        orient_combo = ttk.Combobox(dir_frm, textvariable=self.line_orient_var, values=list(line_names.values()), state="readonly", width=13)
+        orient_combo.pack(side=tk.LEFT, padx=(5, 15))
+        ttk.Label(dir_frm, text="Cashews move:", style="Surface.TLabel").pack(side=tk.LEFT)
+        self.flow_var = tk.StringVar(value=fg.FLOW_LABELS[self.shared_state.flow_direction])
+        flow_combo = ttk.Combobox(dir_frm, textvariable=self.flow_var, state="readonly", width=14)
+        flow_combo.pack(side=tk.LEFT, padx=5)
+
+        def flows_of_selected_line():
+            orientation = next(k for k, v in line_names.items() if v == self.line_orient_var.get())
+            return fg.FLOWS_FOR_LINE[orientation]
+
+        def show_current_direction():
+            current = self.shared_state.flow_direction
+            self.line_orient_var.set(line_names[fg.line_orientation(current)])
+            flow_combo['values'] = [fg.FLOW_LABELS[f] for f in fg.FLOWS_FOR_LINE[fg.line_orientation(current)]]
+            self.flow_var.set(fg.FLOW_LABELS[current])
+            self._refresh_line_buttons()
+
+        def change_flow(flow):
+            if flow == self.shared_state.flow_direction:
+                return
+            if self.shared_state.phase == "RUNNING":
+                messagebox.showwarning("Stop first", "Stop the machine before changing the decision line or the flow direction.")
+            else:
+                self.shared_state.set_flow_direction(flow)
+            show_current_direction()
+
+        def on_orientation(_event=None):
+            flows = flows_of_selected_line()
+            if self.shared_state.flow_direction not in flows:
+                change_flow(flows[0])
+
+        def on_flow(_event=None):
+            change_flow(next(f for f, label in fg.FLOW_LABELS.items() if label == self.flow_var.get()))
+
+        orient_combo.bind("<<ComboboxSelected>>", on_orientation)
+        flow_combo.bind("<<ComboboxSelected>>", on_flow)
+
+        line_grid = tk.Frame(p_vis, bg=surf)
+        line_grid.pack(fill=tk.X, pady=5)
+        line_grid.columnconfigure(0, weight=1); line_grid.columnconfigure(1, weight=1)
+        ttk.Button(line_grid, text="Set Decision Line", style="Primary.TButton", command=lambda: self._set_phase("LINE_SET_MODE")).grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+        ttk.Button(line_grid, text="Reset Line", command=self.shared_state.reset_line).grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+
+        man_frm = tk.Frame(p_vis, bg=surf)
+        man_frm.pack(fill=tk.X, pady=5)
+        self.manual_line_var = tk.StringVar()
+        self.btn_line_minus = ttk.Button(man_frm, text="", command=lambda: self._shift_line(-5))
+        self.btn_line_minus.pack(side=tk.LEFT, padx=5)
+        entry(man_frm, self.manual_line_var, 6).pack(side=tk.LEFT, padx=10, fill=tk.Y)
+        self.btn_line_plus = ttk.Button(man_frm, text="", command=lambda: self._shift_line(5))
+        self.btn_line_plus.pack(side=tk.LEFT, padx=5)
+        self.lbl_line_pos = ttk.Label(p_vis, text="", font=("Roboto", 10, "bold"), foreground=self.colors["warning"], style="Surface.TLabel")
+        self.lbl_line_pos.pack(pady=5)
+        self.manual_line_var.trace_add("write", self._on_manual_line_var_write)
+        self.shared_state.line_pixel_callback = self._on_line_change_callback
+        show_current_direction()
+        self.shared_state._notify_line()
+
+        # ── Camera ──
+        ttk.Label(p_vis, text="CAMERA", style="Header.TLabel").pack(anchor="w", pady=(20,5))
+        cs = self.shared_state.camera_settings
+        self.cam_vars = {
+            "source": tk.StringVar(value=cs.source), "index": tk.StringVar(value=str(cs.index)),
+            "width": tk.StringVar(value=str(cs.width)), "height": tk.StringVar(value=str(cs.height)),
+            "fps": tk.StringVar(value=str(cs.fps)), "mjpg": tk.BooleanVar(value=cs.mjpg),
+            "auto_exposure": tk.BooleanVar(value=cs.auto_exposure), "exposure": tk.StringVar(value=f"{cs.exposure:g}"),
+            "test_path": tk.StringVar(value=cs.test_path), "test_loop": tk.BooleanVar(value=cs.test_loop),
+        }
+        src_frm = tk.Frame(p_vis, bg=surf)
+        src_frm.pack(fill=tk.X, pady=2)
+        for label, value in (("USB camera", "usb"), ("Test source (video / images)", "test")):
+            tk.Radiobutton(src_frm, text=label, variable=self.cam_vars["source"], value=value, bg=surf, fg=text, selectcolor=self.colors["bg"],
+                           activebackground=surf, activeforeground=text, font=("Roboto", 10, "bold")).pack(side=tk.LEFT, padx=(0, 15))
+
+        usb_grid = tk.Frame(p_vis, bg=surf)
+        usb_grid.pack(fill=tk.X, pady=5)
+        for col, (label, key, width) in enumerate((("Index", "index", 4), ("Width", "width", 6), ("Height", "height", 6), ("FPS", "fps", 5))):
+            ttk.Label(usb_grid, text=label, style="Surface.TLabel").grid(row=0, column=col, sticky="w", padx=(0, 12))
+            entry(usb_grid, self.cam_vars[key], width).grid(row=1, column=col, sticky="w", padx=(0, 12), pady=2)
+        exp_frm = tk.Frame(p_vis, bg=surf)
+        exp_frm.pack(fill=tk.X, pady=2)
+        exposure_entry = entry(exp_frm, self.cam_vars["exposure"], 7)
+
+        def on_auto_exposure():
+            exposure_entry.config(state=tk.DISABLED if self.cam_vars["auto_exposure"].get() else tk.NORMAL)
+
+        check(exp_frm, "Auto exposure", self.cam_vars["auto_exposure"], on_auto_exposure).pack(side=tk.LEFT)
+        ttk.Label(exp_frm, text="  Manual exposure:", style="Surface.TLabel").pack(side=tk.LEFT)
+        exposure_entry.pack(side=tk.LEFT, padx=5)
+        ttk.Label(exp_frm, text="(camera units)", style="Surface.TLabel", foreground=muted).pack(side=tk.LEFT)
+        on_auto_exposure()
+        check(p_vis, "MJPG stream (needed for high resolution / FPS on most USB cameras)", self.cam_vars["mjpg"]).pack(anchor="w")
+
+        test_frm = tk.Frame(p_vis, bg=surf)
+        test_frm.pack(fill=tk.X, pady=(8, 2))
+        ttk.Label(test_frm, text="Test source:", style="Surface.TLabel").pack(side=tk.LEFT)
+        entry(test_frm, self.cam_vars["test_path"], 24).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+
+        def browse_test_file():
+            path = filedialog.askopenfilename(title="Test video or image", initialdir=str(app_paths.BASE_DIR),
+                                              filetypes=[("Video / image", "*.mp4 *.avi *.mov *.mkv *.jpg *.jpeg *.png *.bmp"), ("All files", "*.*")])
+            if path: self.cam_vars["test_path"].set(path)
+
+        def browse_test_folder():
+            path = filedialog.askdirectory(title="Folder of test images", initialdir=str(app_paths.FULL_FRAME_DIR))
+            if path: self.cam_vars["test_path"].set(path)
+
+        ttk.Button(test_frm, text="File", width=5, command=browse_test_file).pack(side=tk.LEFT, padx=2)
+        ttk.Button(test_frm, text="Folder", width=7, command=browse_test_folder).pack(side=tk.LEFT, padx=2)
+        check(p_vis, "Repeat the test source", self.cam_vars["test_loop"]).pack(anchor="w")
+
+        cam_btns = tk.Frame(p_vis, bg=surf)
+        cam_btns.pack(fill=tk.X, pady=(8, 2))
+        cam_btns.columnconfigure(0, weight=1); cam_btns.columnconfigure(1, weight=1)
+        ttk.Button(cam_btns, text="APPLY & RECONNECT", style="Primary.TButton", command=self._apply_camera_settings).grid(row=0, column=0, padx=(0, 5), sticky="ew")
+        ttk.Button(cam_btns, text="DETECT SUPPORTED MODES", command=self._probe_camera).grid(row=0, column=1, padx=(5, 0), sticky="ew")
+        self.lbl_cam_status = tk.Label(p_vis, text="", bg=surf, fg=muted, font=("Roboto", 10), justify="left", anchor="w", wraplength=430)
+        self.lbl_cam_status.pack(fill=tk.X, pady=(6, 0))
+        tk.Label(p_vis, text="ROIs and the decision line are in pixels: after changing the resolution, draw them again.",
+                 bg=surf, fg=muted, font=("Roboto", 9), justify="left", anchor="w", wraplength=430).pack(fill=tk.X)
+
+        # ── Colour gain (software, applied to every frame before the AI and before any image is saved) ──
+        ttk.Label(p_vis, text="COLOUR GAIN (SOFTWARE)", style="Header.TLabel").pack(anchor="w", pady=(20,5))
+        self.vars_cam = {
+            "gain": tk.StringVar(value=str(self.shared_state.cam_gain)),
+            "r": tk.StringVar(value=str(self.shared_state.cam_r)),
+            "g": tk.StringVar(value=str(self.shared_state.cam_g)),
+            "b": tk.StringVar(value=str(self.shared_state.cam_b)),
+            "a_gain": tk.StringVar(value=str(self.shared_state.analog_gain)),
+            "d_gain": tk.StringVar(value=str(self.shared_state.digital_gain)),
+        }
+        cam_grid = tk.Frame(p_vis, bg=surf)
+        cam_grid.pack(fill=tk.X)
+        for idx, (txt, key) in enumerate([("Global Gain", "gain"), ("R Gain", "r"), ("G Gain", "g"), ("B Gain", "b")]):
+            ttk.Label(cam_grid, text=txt, style="Surface.TLabel").grid(row=idx, column=0, sticky="w", pady=3)
+            entry(cam_grid, self.vars_cam[key], 10).grid(row=idx, column=1, padx=20, pady=3)
+            self.vars_cam[key].trace_add("write", self._on_cam_setting_change)
+            
+        def save_cam_settings():
+            self._on_cam_setting_change()
+            messagebox.showinfo("Saved", "Colour gain saved.")
+            
+        ttk.Button(p_vis, text="SAVE COLOUR GAIN", style="Primary.TButton", command=save_cam_settings).pack(pady=(10, 0), fill=tk.X)
+        ttk.Button(p_vis, text="Test Image Capture", command=self.shared_state.trigger_capture).pack(pady=15, fill=tk.X)
+
+    def _camera_settings_from_ui(self) -> CameraSettings:
+        v = self.cam_vars
+        settings = CameraSettings(
+            source=v["source"].get(), index=int(v["index"].get()), width=int(v["width"].get()), height=int(v["height"].get()),
+            fps=int(v["fps"].get()), mjpg=bool(v["mjpg"].get()), auto_exposure=bool(v["auto_exposure"].get()),
+            exposure=float(v["exposure"].get()), test_path=v["test_path"].get().strip(), test_loop=bool(v["test_loop"].get()))
+        if settings.index < 0 or settings.width < 160 or settings.height < 120 or not (1 <= settings.fps <= 240):
+            raise ValueError("Index must be 0 or more, size at least 160 x 120, FPS 1 to 240.")
+        return settings
+
+    def _apply_camera_settings(self):
+        if self.shared_state.phase == "RUNNING":
+            messagebox.showwarning("Stop first", "Stop the machine before changing the camera.")
+            return False
+        try:
+            settings = self._camera_settings_from_ui()
+        except ValueError as e:
+            messagebox.showerror("Camera settings", f"Please check the numbers.\n{e}")
+            return False
+        with self.shared_state.lock:
+            self.shared_state.camera_settings = settings
+        self.shared_state.save_to_config(CFG_PATH)
+        self.camera_thread.apply_settings(settings)
+        log.info("Camera settings applied: %s", settings)
+        return True
+
+    def _probe_camera(self):
+        """Ask the USB camera which resolutions / frame rates it accepts (the picture stops for a few seconds)."""
+        if self.cam_vars["source"].get() != "usb":
+            messagebox.showinfo("Detect modes", "Select 'USB camera' first.")
+            return
+        if not self._apply_camera_settings():
+            return
+        self.lbl_cam_status.config(text="Detecting supported modes...")
+        self._probe_pending = True
+        self.camera_thread.request_probe()
+
+        def poll():
+            result = self.camera_thread.probe_result
+            if result is None:
+                self.after(300, poll)
+                return
+            self._probe_pending = False
+            if isinstance(result, str):
+                messagebox.showwarning("Detect modes", result)
+                return
+            lines = "\n".join(f"{w} x {h}   up to {fps} fps" for w, h, fps in result)
+            w, h, fps = result[0]
+            if messagebox.askyesno("Supported modes", f"The camera accepted these modes (MJPG {'on' if self.cam_vars['mjpg'].get() else 'off'}):\n\n{lines}"
+                                   f"\n\nUse the largest one ({w} x {h} @ {fps} fps)?"):
+                self.cam_vars["width"].set(str(w)); self.cam_vars["height"].set(str(h)); self.cam_vars["fps"].set(str(fps))
+                self._apply_camera_settings()
+
+        self.after(300, poll)
+
+    def _refresh_camera_status(self):
+        cam = self.camera_thread
+        self.cam_indicator.config(text=f"● Camera {cam.state}",
+                                  fg=self.colors["success"] if cam.is_connected else (self.colors["warning"] if cam.state in ("CONNECTING", "RECONNECTING") else self.colors["danger"]))
+        if not hasattr(self, 'lbl_cam_status') or getattr(self, '_probe_pending', False):
+            return
+        if cam.is_connected:
+            a = cam.actual
+            text = f"{cam.state}: {a.get('width')} x {a.get('height')}, {cam.fps:.1f} fps measured"
+            if cam.state == "ONLINE":
+                text += f" (camera reports {a.get('fps', 0):.0f} fps, exposure {a.get('exposure', 0):g}, auto-exposure flag {a.get('auto_exposure', 0):g})"
+                if cam.reconnect_count:
+                    text += f"\nReconnected {cam.reconnect_count} time(s) since start."
+        else:
+            text = f"{cam.state}: {cam.last_error}"
+        if self.lbl_cam_status.cget("text") != text:
+            self.lbl_cam_status.config(text=text, fg=self.colors["text_muted"] if cam.is_connected else self.colors["warning"])
+
+    def _refresh_line_buttons(self):
+        if not hasattr(self, 'btn_line_minus'):
+            return
+        vertical = self.shared_state.line_is_vertical
+        self.btn_line_minus.config(text="◀ Shift Left" if vertical else "▲ Shift Up")
+        self.btn_line_plus.config(text="Shift Right ▶" if vertical else "Shift Down ▼")
+
     def _shift_line(self, amount):
         try:
             val = int(self.manual_line_var.get()) + amount
@@ -3886,14 +3905,18 @@ except Exception as e:
     def _on_manual_line_var_write(self, *args):
         try:
             val = int(self.manual_line_var.get())
-            with self.shared_state.lock:
-                self.shared_state.line_x_full = val
-        except (ValueError, tk.TclError): pass
+        except (ValueError, tk.TclError):
+            return
+        if val != self.shared_state.line_pos:
+            self.shared_state.set_line_pos(val, notify=False)
+            axis = "X" if self.shared_state.line_is_vertical else "Y"
+            self.lbl_line_pos.config(text=f"Line {axis}: {val} px")
 
     def _on_line_change_callback(self, txt, val):
         self.lbl_line_pos.config(text=txt)
-        if val is not None and str(val) != self.manual_line_var.get():
-            self.manual_line_var.set(str(val))
+        shown = "" if val is None else str(val)
+        if shown != self.manual_line_var.get():
+            self.manual_line_var.set(shown)
             
     def _on_cam_setting_change(self, *args):
         try:
@@ -3904,13 +3927,11 @@ except Exception as e:
                 self.shared_state.cam_b = float(self.vars_cam["b"].get())
                 self.shared_state.analog_gain = float(self.vars_cam["a_gain"].get())
                 self.shared_state.digital_gain = float(self.vars_cam["d_gain"].get())
-                self.shared_state.exposure = int(self.vars_cam["exposure"].get())
-                self.shared_state.cam_settings_changed = True
             self.shared_state.save_to_config(CFG_PATH)
         except (ValueError, tk.TclError):
             pass        # a field is empty or half typed
         except Exception:
-            log.exception("Could not apply the camera settings")
+            log.exception("Could not apply the colour gain")
     def _fire_all(self):
         try:
             pulse = int(self.shared_state.common_pulse_ms)
@@ -4305,41 +4326,10 @@ except Exception as e:
             self.shared_state.phase = "READY"
         elif ph == "READY":
             st = self.shared_state.get_processing_state()
-            if st["roi1"] and st["roi2"] and st["line_x"]:
+            if st["roi1"] and st["roi2"] and st["line_pos"] is not None:
                 self.shared_state.phase = "RUNNING"
             else:
                 messagebox.showwarning("Incomplete", "Please draw ROI1, ROI2 and set Decision Line in Vision Setup.")
-
-    def _scan_camera_ip(self):
-        if mvsdk is None: return
-        devs = mvsdk.CameraEnumerateDevice()
-        if devs:
-            dev = devs[0]
-            try:
-                ip_info = mvsdk.CameraGigeGetIp(dev)
-                self.lbl_cam_name.config(text=f"Name: {dev.GetFriendlyName()} (SN: {dev.GetSn()})")
-                self.lbl_cam_ip.config(text=f"IP Address: {ip_info[0]}")
-            except Exception as e:
-                self.lbl_cam_ip.config(text=f"Error reading IP: {e}")
-        else:
-            self.lbl_cam_name.config(text="Name: NOT FOUND")
-            self.lbl_cam_ip.config(text="IP Address: ---")
-            messagebox.showwarning("Not Found", "No camera detected.")
-
-    def _set_camera_ip(self):
-        if mvsdk is None: return
-        new_ip = self.new_ip_var.get().strip()
-        devs = mvsdk.CameraEnumerateDevice()
-        if devs:
-            try:
-                err = mvsdk.CameraGigeSetIp(devs[0], new_ip, "255.255.255.0", "192.168.3.1", 1)
-                if err == 0:
-                    messagebox.showinfo("Success", f"IP changed to {new_ip}! REPLUG the camera.")
-                    self._scan_camera_ip()
-                else:
-                    messagebox.showerror("Error", f"Failed. Code: {err}")
-            except Exception as e:
-                messagebox.showerror("Error", str(e))
 
     def _on_mouse(self, event):
         if not self.current_video_geometry: return 
@@ -4368,9 +4358,8 @@ except Exception as e:
             self.video_label.image = img_tk 
         except queue.Empty: pass
         
-        c_conn = self.camera_thread.is_connected
         a_conn = self.controller.is_connected()
-        self.cam_indicator.config(fg=self.colors["success"] if c_conn else self.colors["danger"])
+        self._refresh_camera_status()
         self.ard_indicator.config(fg=self.colors["success"] if a_conn else self.colors["danger"])
         if hasattr(self, 'net_plc_status'):
             plc_ip = getattr(self.controller, 'plc_ip', 'PLC')
@@ -4392,7 +4381,7 @@ except Exception as e:
                 self.start_btn.config(text="START RUNNING", style="Success.TButton")
                 self.lbl_state_badge.config(text="● READY", fg=self.colors["warning"])
         
-        self.fps_lbl.config(text=f"FPS: {self.camera_thread.fps:.1f}")
+        self.fps_lbl.config(text=f"CAM {self.camera_thread.fps:.1f} fps")
 
         self.lbl_clock.config(text=datetime.now().strftime("%H:%M:%S"))
         
@@ -4729,7 +4718,7 @@ except Exception as e:
         self.controller.stop()
         self.shared_state.save_to_config(CFG_PATH)
         
-        # Give daemon threads a chance to gracefully release hardware (Aravis/TF)
+        # Give daemon threads a chance to gracefully release hardware (camera)
         if hasattr(self, 'camera_thread') and self.camera_thread.is_alive():
             self.camera_thread.join(timeout=1.0)
         if hasattr(self, 'processing_thread') and self.processing_thread.is_alive():

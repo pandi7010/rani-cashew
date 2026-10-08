@@ -1,7 +1,6 @@
 """All file locations of the grader, relative to this folder (never to the current directory)."""
 import logging
 import logging.handlers
-import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -18,13 +17,12 @@ ASSETS_DIR = BASE_DIR / "assets"
 NAV_ICONS_DIR = ASSETS_DIR / "nav_icons"
 RUNS_DIR = BASE_DIR / "runs"
 LOGS_DIR = BASE_DIR / "logs"
-FFC_GAIN_MAP_PATH = BASE_DIR / "ffc_gain_map.png"
 AUTO_LABELER_SCRIPT = BASE_DIR / "ai_auto_labeler.py"
 
-# The magic wand and TCM Studio tools live in another project, outside this folder.
-# Set RANIVISION_DIR to point somewhere else; features that need them are skipped when it is missing.
-EXTERNAL_TOOLS_DIR = Path(os.environ.get("RANIVISION_DIR", "/home/phoenix/Documents/RaniVision_Latest"))
+# Copies of the magic wand and TCM Studio tools (see external_tools/README.md).
+EXTERNAL_TOOLS_DIR = BASE_DIR / "external_tools"
 TCM_STUDIO_SCRIPT = EXTERNAL_TOOLS_DIR / "tcm_studio_pro.py"
+FASTSAM_PATH = BASE_DIR / "FastSAM-s.pt"
 
 
 def ensure_dirs():
