@@ -1330,6 +1330,13 @@ class ProcessingThread(threading.Thread):
                     self._decide_track(trk, rid, line, state, t_ms)
                 self._draw_track(frame, trk, grading)
 
+        # ROI boxes while RUNNING. The Home view shows only the ROI crops, so the frame is drawn just inside the ROI
+        # (a box on the ROI edge itself would be cut away) and the name sits inside it.
+        for (rid, roi), colour in zip(((1, state.get("roi1")), (2, state.get("roi2"))), (AOI_COLOR1, AOI_COLOR2)):
+            if roi:
+                x1, y1, x2, y2 = roi
+                cv2.rectangle(frame, (x1 + 2, y1 + 2), (x2 - 3, y2 - 3), colour, 3)
+                cv2.putText(frame, f"ROI {rid}", (x1 + 12, y1 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, colour, 2)
         self._draw_arrows(frame, state)
         return frame
 
@@ -1535,8 +1542,20 @@ class ProcessingThread(threading.Thread):
         else:
             reason = decision.LEFT_ROI_UNDECIDED if trk.info.get("left_roi") else decision.LOST_BEFORE_LINE
         self.shared_state.count_result(decision.LOST)
+        # Where it was seen and what was next to it, so the cause can be read from the log afterwards:
+        # a second box on the same cashew (nearest track very close), a cashew that really vanished, or a broken ID.
+        note = ""
+        try:
+            (t0, x0, y0), (t1, x1, y1) = trk.path[0], trk.path[-1]
+            others = [o for o in self.trackers[rid].tracks if o is not trk]
+            near = min(others, key=lambda o: abs(o.cx - trk.cx) + abs(o.cy - trk.cy)) if others else None
+            note = (f"seen {trk.hits}x in {t1 - t0:.0f} ms from ({x0:.0f},{y0:.0f}) to ({x1:.0f},{y1:.0f}); "
+                    f"box {abs(trk.box[2] - trk.box[0]):.0f}x{abs(trk.box[3] - trk.box[1]):.0f} px; speed {trk.v:.2f} px/ms; "
+                    + (f"nearest other cashew {near.id} at {abs(near.cx - trk.cx):.0f},{abs(near.cy - trk.cy):.0f} px" if near else "no other cashew in the ROI"))
+        except Exception:
+            pass
         self.cashew_log.write({"id": trk.id, "roi": rid, "frames": len(trk.frames), "result": decision.LOST, "reason": reason,
-                               "fire": "NOT_FIRED"})
+                               "fire": "NOT_FIRED", "shadow": note})
 
     def _draw_track(self, frame, trk, grading):
         x1, y1, x2, y2 = [int(v) for v in trk.box]
