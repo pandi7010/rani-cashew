@@ -15,13 +15,16 @@ from typing import Dict, List, Optional
 
 import dataset_ops as ops
 
+# Owner, 2026-10-09: no SW class (SW / WW is decided by colour measurement; old SW images are GOOD_CASHEW);
+# DOUBLE is a CNN class (two cashews stuck together -> reject ejector), in addition to the size rule.
 FINAL_CLASSES = ["GOOD_CASHEW", "UPW", "PKW1", "PKW2", "OIL", "BROWN", "DW1", "DW2", "TESTA", "TESTA SMALL",
-                 "WHITE_DW", "SW", "REJECTION", "EDGECUT"]
+                 "WHITE_DW", "REJECTION", "EDGECUT", "DOUBLE"]
 TARGET = 1000
 MAX_CROP_SIDE = 900         # larger than this is a full camera frame, not a cashew crop
 # Older folder names -> final class (owner, 2026-10-09: BACK_CUT_OIL / OIL_BACKCUT are OIL).
-ALIASES = {"good": "GOOD_CASHEW", "good cashew": "GOOD_CASHEW", "testa small": "TESTA SMALL", "back cut oil": "OIL",
-           "oil backcut": "OIL", "backcut oil": "OIL", "oil back cut": "OIL", "edge cut": "EDGECUT", "white dw": "WHITE_DW"}
+ALIASES = {"good": "GOOD_CASHEW", "good cashew": "GOOD_CASHEW", "sw": "GOOD_CASHEW", "testa small": "TESTA SMALL", "back cut oil": "OIL",
+           "oil backcut": "OIL", "backcut oil": "OIL", "oil back cut": "OIL", "edge cut": "EDGECUT", "white dw": "WHITE_DW",
+           "double kernels": "DOUBLE", "double kernel": "DOUBLE", "double cashews": "DOUBLE"}
 
 
 def _key(name: str) -> str:
@@ -54,7 +57,8 @@ def counts(dataset_dir, testset_dir) -> Dict[str, tuple]:
 
 
 def build(sources: List[tuple], dataset_dir, testset_dir, dry_run=False, read_image=None) -> dict:
-    """sources: [(tag, folder with class sub-folders)]. Returns a report dict; see the keys below."""
+    """sources: [(tag, folder with class sub-folders)] or [(tag, folder, {sub-folders to take})].
+    Returns a report dict; see the keys below."""
     import cv2
     read_image = read_image or cv2.imread
     dataset_dir, testset_dir = str(dataset_dir), str(testset_dir)
@@ -68,13 +72,14 @@ def build(sources: List[tuple], dataset_dir, testset_dir, dry_run=False, read_im
         for folder, _, files in os.walk(root):
             seen.update(_md5(os.path.join(folder, f)) for f in files if f.lower().endswith(ops.IMAGE_TYPES))
     state = ops.read_state(dataset_dir)
-    for tag, source in sources:
+    for entry in sources:
+        tag, source, only = entry[0], entry[1], (entry[2] if len(entry) > 2 else None)
         per = report["per_source"].setdefault(tag, {})
         if not os.path.isdir(source):
             continue
         for folder in sorted(os.listdir(source)):
             path = os.path.join(source, folder)
-            if not os.path.isdir(path):
+            if not os.path.isdir(path) or (only is not None and folder not in only):
                 continue
             images = [os.path.join(path, f) for f in sorted(os.listdir(path)) if f.lower().endswith(ops.IMAGE_TYPES)]
             target_class = final_class(folder)
@@ -129,7 +134,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    SOURCES = [("old", "/home/phoenix/Documents/CNN_final/CNN/dataset"), ("proj", str(app_paths.DATASET_DIR))]
+    SOURCES = [("old", "/home/phoenix/Documents/CNN_final/CNN/dataset"), ("proj", str(app_paths.DATASET_DIR)),
+               ("oldsw", "/home/phoenix/Documents/CNN_final/CNN/dataset_disabled", {"SW"})]       # SW images -> GOOD_CASHEW
     result = build(SOURCES, app_paths.CLEAN_DATASET_DIR, app_paths.TESTSET_DIR, dry_run=args.dry_run)
     print(table(result))
     for tag, rows in result["per_source"].items():

@@ -142,6 +142,15 @@ class DecisionTest(unittest.TestCase):
         d = decide(frames(("EDGECUT", 0.9), ("EDGECUT", 0.9), ("GOOD_CASHEW", 0.9)))
         self.assertEqual((d.result, d.reject), (dc.UNDEFINED, True))
 
+    def test_cnn_class_double_goes_to_the_reject_ejector(self):
+        for name in ("DOUBLE", "DOUBLE_KERNELS", "double cashews"):
+            d = decide(frames(*GOOD3_NECK, (name, 0.8), (name, 0.7)))
+            self.assertEqual((d.result, d.reason, d.reject), (dc.DOUBLE, "double_class_seen", True), name)
+        d = decide(frames(*GOOD3_NECK, ("DOUBLE", 0.8)), {"single_defect_blocks_good": False})      # one frame is not enough
+        self.assertEqual(d.result, dc.GOOD)
+        d = decide(frames(("DOUBLE", 0.8), ("DOUBLE", 0.8), ("UPW", 0.9), ("UPW", 0.9)))
+        self.assertEqual(d.result, dc.DOUBLE)                   # before the priority list
+
     def test_owner_combination_rule(self):
         rules = [{"conditions": ["PKW1", "BROWN", "", ""], "final": "DW2"}]
         d = decide(frames(("PKW1", 0.9), ("PKW1", 0.9), ("BROWN", 0.9), ("BROWN", 0.9)), combination_rules=rules)

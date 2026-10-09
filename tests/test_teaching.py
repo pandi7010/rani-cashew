@@ -31,7 +31,7 @@ class DatasetImportTest(unittest.TestCase):
         self.assertEqual(len(di.FINAL_CLASSES), 14)
         for folder, expected in (("GOOD", "GOOD_CASHEW"), ("GOOD_CASHEW", "GOOD_CASHEW"), ("TESTA_SMALL", "TESTA SMALL"), ("TESTA SMALL", "TESTA SMALL"),
                                  ("BACK_CUT_OIL", "OIL"), ("OIL_BACKCUT", "OIL"), ("OIL", "OIL"), ("EDGECUT", "EDGECUT"), ("EDGE_CUT", "EDGECUT"),
-                                 ("white_dw", "WHITE_DW"), ("DOUBLE_KERNELS", None), ("Class_1", None), ("golden_images", None)):
+                                 ("white_dw", "WHITE_DW"), ("DOUBLE_KERNELS", "DOUBLE"), ("SW", "GOOD_CASHEW"), ("Class_1", None), ("golden_images", None)):
             self.assertEqual(di.final_class(folder), expected, folder)
 
     def test_copies_merges_and_never_touches_the_source(self):
@@ -43,6 +43,8 @@ class DatasetImportTest(unittest.TestCase):
                 cashew(os.path.join(src, "BACK_CUT_OIL", f"b{n}.jpg"), colour=(60, 180, 200), seed=100 + n)
             cashew(os.path.join(src, "OIL", "o0.jpg"), colour=(60, 180, 200), seed=200)
             cashew(os.path.join(src, "DOUBLE_KERNELS", "d0.jpg"), seed=300)
+            cashew(os.path.join(src, "SW", "s0.jpg"), seed=301)
+            cashew(os.path.join(src, "golden_images", "x0.jpg"), seed=302)
             cashew(os.path.join(src, "TESTA", "frame.jpg"), size=(1200, 1400), seed=400)      # a full frame, not a crop
             with open(os.path.join(src, "TESTA", "broken.jpg"), "wb") as f:
                 f.write(b"not an image")
@@ -52,16 +54,20 @@ class DatasetImportTest(unittest.TestCase):
 
             report = di.build([("old", src)], data, test)
             self.assertEqual(sorted(os.listdir(data))[:3], ["BROWN", "DW1", "DW2"])           # every final class has a folder
-            self.assertEqual(report["after"]["GOOD_CASHEW"], (11, 1))                        # the 10th went to the test set
+            self.assertEqual(report["after"]["GOOD_CASHEW"], (12, 1))                        # 12 GOOD + 1 SW; the 10th went to the test set
+            self.assertEqual(report["after"]["DOUBLE"], (1, 0))                              # DOUBLE_KERNELS is the class DOUBLE
+            self.assertNotIn("SW", report["after"])
             self.assertEqual(report["after"]["OIL"], (4, 0))                                 # BACK_CUT_OIL merged into OIL
-            self.assertEqual(report["skipped_folders"], {"old/DOUBLE_KERNELS": 1})
+            self.assertEqual(report["skipped_folders"], {"old/golden_images": 1})
             self.assertEqual((report["duplicates"], len(report["unreadable"]), len(report["full_frames"])), (1, 1, 1))
             self.assertEqual(sorted(os.listdir(os.path.join(src, "GOOD"))), before)           # the source is untouched
-            self.assertIn("| GOOD_CASHEW | 0 | 12 | 11 | 1 | 989 |", di.table(report))
+            self.assertIn("| GOOD_CASHEW | 0 | 13 | 12 | 1 | 988 |", di.table(report))
 
             again = di.build([("old", src)], data, test)                                     # running it twice copies nothing twice
             self.assertEqual(sum(again["copied"].values()) + sum(again["to_testset"].values()), 0)
-            self.assertEqual(again["after"]["GOOD_CASHEW"], (11, 1))
+            self.assertEqual(again["after"]["GOOD_CASHEW"], (12, 1))
+            only = di.build([("x", src, {"TESTA"})], data, test)                             # a source limited to some folders
+            self.assertEqual(only["skipped_folders"], {})
 
     def test_dry_run_writes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:

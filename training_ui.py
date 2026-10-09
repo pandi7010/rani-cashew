@@ -11,6 +11,7 @@ import ui_theme as hu
 
 SMALL, SMALL_BOLD, BODY, BODY_BOLD = (hu.FONT, hu.F_SMALL), (hu.FONT, hu.F_SMALL, "bold"), (hu.FONT, hu.F_BODY), (hu.FONT, hu.F_BODY, "bold")
 MIN_GOOD_IMAGES = 100          # below this a class is marked as too small to train well
+MIN_TRAIN_IMAGES = 15       # owner, 2026-10-09: a class is offered for training from 15 images
 
 
 def _window(app, title, width, height, modal=False):
@@ -41,7 +42,7 @@ def choose_classes(app, images_by_class, epochs, on_start):
         count = len(paths)
         row = tk.Frame(top, bg=hu.BG)
         row.pack(fill=tk.X, padx=16, pady=2)
-        var = tk.BooleanVar(value=count >= 3)
+        var = tk.BooleanVar(value=count >= MIN_TRAIN_IMAGES)     # GSN_V21: classes with fewer images start unticked
         variables[name] = var
         tk.Checkbutton(row, text=f"  {name}", variable=var, font=BODY_BOLD, fg=hu.TEXT, bg=hu.BG, selectcolor=hu.FIELD,
                        activebackground=hu.BG, activeforeground=hu.TEXT, state=tk.NORMAL if count >= 3 else tk.DISABLED,

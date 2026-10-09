@@ -46,7 +46,9 @@ GOOD_CLASSES_DEFAULT = ["GOOD_CASHEW", "GOOD", "SW"]       # "no defect" votes; 
 SKIN_CLASSES_DEFAULT = ["TESTA", "TESTA SMALL"]
 # Owner, 2026-10-09: BACK_CUT_OIL / OIL_BACKCUT are graded (and trained) as OIL. EDGECUT stays its own class;
 # it is not in the priority list, so it goes to the reject relay until a relay is given for it.
-CLASS_ALIASES = {"back cut oil": "OIL", "oil backcut": "OIL", "backcut oil": "OIL", "oil back cut": "OIL"}
+CLASS_ALIASES = {"back cut oil": "OIL", "oil backcut": "OIL", "backcut oil": "OIL", "oil back cut": "OIL",
+                 "double kernels": "DOUBLE", "double kernel": "DOUBLE", "double cashews": "DOUBLE"}
+DOUBLE_CLASS = "DOUBLE"         # CNN class "two cashews stuck together": always the reject ejector (besides the size rule)
 
 
 def canonical(name):
@@ -146,6 +148,8 @@ def decide(votes: List[FrameVote], voting: Optional[dict] = None, priority: Opti
         return done(REJECTION, "rejection_seen", True)
 
     seen = {k for k, n in weighted.items() if n >= v["defect_min_frames"]}
+    if normalize_name(DOUBLE_CLASS) in seen:
+        return done(DOUBLE, "double_class_seen", True)
 
     for rule in combination_rules or []:        # owner's "these classes together -> that class" table
         wanted = [normalize_name(c) for c in rule.get("conditions", []) if not _blank(c)]
