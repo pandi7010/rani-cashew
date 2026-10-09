@@ -151,7 +151,7 @@ A class is "seen" when it has enough qualifying frames. Then, in this order:
 | # | Condition | Result | Relay |
 |---|---|---|---|
 | 1 | Double kernel (step d, default OFF) | DOUBLE KERNEL | reject |
-| 2 | REJECTION seen | REJECTION | reject |
+| 2 | REJECTION seen (from the YOLO REJECTION class, see below) | REJECTION | reject |
 | 3 | UPW seen, or skin (TESTA / TESTA SMALL) seen together with any other defect | UPW | mapped |
 | 4 | PKW2 seen | PKW2 | mapped |
 | 5 | PKW1 seen | PKW1 | mapped |
@@ -162,6 +162,13 @@ A class is "seen" when it has enough qualifying frames. Then, in this order:
 | 10 | No defect, GOOD votes enough, NECK not seen | Undefined (`not_rolled`) | reject |
 | 11 | Anything else: too few frames, low confidence, class not mapped, no clear vote, size outside every grade | Undefined | reject |
 
+- **REJECTION comes from YOLO until the CNN is retrained (owner's decision, 2026-10-09).** The CNN in use has
+  no REJECTION class; the YOLO model has. Every frame keeps both results: the YOLO class and the CNN class.
+  A frame in which YOLO says REJECTION is a REJECTION vote whatever the CNN says for that frame (today the
+  CNN result overwrites the YOLO class; that stops). REJECTION is "seen" with the defect rule (>= 0.50 in at
+  least 2 frames), as its own pair of values in the UI. It is checked before every other class, so no other
+  vote can override it. The measured dark area % is logged beside it but does not decide yet. When a
+  retrained CNN has REJECTION, its votes are added to the same rule.
 - The order of rows 3-8 is the priority list, editable in the UI and stored in `priority_rules` (#22).
 - NECK weight: a TESTA / TESTA SMALL vote from a NECK frame counts as W frames (UI). Start value: question 6.
 - Skin %, dark % and spot count come from CNN votes for now (TESTA SMALL / TESTA / UPW, REJECTION, PKW1 / PKW2).
@@ -219,7 +226,11 @@ File: `colour_size.py`.
 
 Files: `fire_timing.py`, `speed_sources.py`; `relay_output.py` stays the only path to a relay.
 
-- Class -> relay mapping page: ROI1 relays 2-20, ROI2 relays 22-40; relays 1 and 21 fixed as reject.
+- **Relays 1 and 21 are reject only** (owner's decision, 2026-10-09): Double, Undefined, not rolled and
+  REJECTION, nothing else. UPW was removed from relays 1 and 21 in `pneumatic_config.json`. The mapping page
+  shows them as "REJECT - FIXED" and no class can be assigned to them.
+- Class -> relay mapping page: ROI1 relays 2-20, ROI2 relays 22-40. The owner gives the full list later.
+  Until then UPW has no relay; a class without a relay is Undefined -> reject relay (rule 11 in 3.4).
 - Relay distance from its Decision line per relay (mm), "fill from first distance + spacing" button.
 - **Three speed sources, shown side by side:**
   1. ENCODER: interface `ConveyorClock` -> `EncoderClock` (position counter from the PLC, mm/pulse). Designed
@@ -290,14 +301,14 @@ SW/WW by colour with teach helper, double kernel OFF with live values.
 
 | # | Question | Needed before |
 |---|---|---|
-| 1 | **Class -> relay mapping.** The config now has relay 1 = UPW, 2 = REJECTION, 3 = TESTA, 4 = TESTA SMALL, 5 = PKW2, 6 = PKW1, 7 = OIL, 8 = BROWN, 9 = WHITE_DW, 10 = DW1 + DW2, 11 = SW, 12-16 = size grades, 17 = BUDDS (ROI2 the same + 20). Relay 1 / 21 must be reject, so this must change. Please give the mapping for relays 2-20. | c3 |
+| 1 | **Class -> relay mapping** for relays 2-20 (relays 1 / 21 are now reject only, UPW removed, REJECTION goes to 1 / 21). The config still has 2 = REJECTION, 3 = TESTA, 4 = TESTA SMALL, 5 = PKW2, 6 = PKW1, 7 = OIL, 8 = BROWN, 9 = WHITE_DW, 10 = DW1 + DW2, 11 = SW, 12-16 = size grades, 17 = BUDDS (ROI2 the same + 20). The owner will give the full list later. | c3 |
 | 2 | **Grade tables** for SW and for WW: grade names, min / max, relay. Limits in length, width or area? The config has length limits W180 30, W210 28, W240 26, W320 24.5, W450 18, BUDDS 16 mm: is that the starting table, and are SW and WW limits the same? | c2 |
 | 3 | **Relay distances.** Distance from the Decision line to relay 1 and to relay 21? Spacing 220 mm for all? The config has 393.7 mm then about 195 mm each: from which machine? | c3 |
 | 4 | `px_per_mm` in the config is 10.0. Real or placeholder? (It will be calibrated in c2 either way.) | c2 |
 | 5 | **Encoder:** pulses per revolution, mm per pulse, which PLC input / which register holds the count, counter size and reset behaviour. | when available |
 | 6 | NECK weight for TESTA / TESTA SMALL: start value W (my proposal: a NECK frame counts as 2 frames)? | c1 |
 | 7 | CNN says `SW` with no defect: treat it as a "no defect" vote like GOOD (my proposal), so colour alone decides SW/WW? | c1 |
-| 8 | REJECTION: the CNN in use cannot output it. Until retraining, use YOLO's REJECTION class plus the measured dark area above 30 % (my proposal)? | c1 |
+| 8 | **Answered 2026-10-09:** REJECTION is triggered by the YOLO REJECTION class until the CNN is retrained (section 3.4). Still open: should the measured dark area above 30 % also trigger it later, after you have seen the logged values? | later |
 | 9 | BACK_CUT_OIL / OIL_BACKCUT (69 images) and EDGECUT: which of your classes do they belong to (OIL? their own class? drop)? Also: does WHITE_DW count as "another defect" for the "skin + any other defect = UPW" rule? | c1 / f |
 | 10 | "GOOD >= 3 views at >= 0.80": 3 frames, or 3 different view types? I assume 3 frames. | c1 |
 | 11 | One Decision line per ROI: independent positions, or an option to link them (my proposal: both, linked by default as now)? | c1 |
