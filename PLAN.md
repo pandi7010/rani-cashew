@@ -320,6 +320,18 @@ SW/WW by colour with teach helper, double kernel OFF with live values.
 
 ---
 
+### Answers received 2026-10-09
+
+| # | Answer |
+|---|---|
+| 6 | NECK weight 2 (a TESTA / TESTA SMALL vote from a NECK frame counts as 2 frames). |
+| 7 | CNN `SW` with no defect is a "no defect" vote like GOOD; colour alone decides SW / WW. |
+| 8 | REJECTION from the YOLO class, confidence >= 0.50 in at least 2 frames. Dark area % is only logged. |
+| 9a | **Still open:** BACK_CUT_OIL = ? (OIL / own class BACK_CUT / other), EDGECUT = ? Until answered they are left out. |
+| 9b | WHITE_DW counts as "another defect": skin + WHITE_DW = UPW. |
+| 10 | GOOD needs 3 frames at >= 0.80 (frames, not view types). |
+| 11 | One Decision line per ROI with a "one line for both" switch, ON at start. |
+
 ## 11. Approval
 
 On "approved, start (c1)" I do step (c1) only, commit, report, and stop.

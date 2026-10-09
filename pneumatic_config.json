@@ -248,10 +248,10 @@
     "sw": 50,
     "brown": 50,
     "rejection": 50,
-    "oil": 50,
     "pkw1": 50,
     "pkw2": 50,
     "testa small": 50,
+    "oil": 50,
     "ww_w180": 50,
     "sw_w180": 50,
     "ww_w210": 50,
@@ -275,10 +275,10 @@
     "sw": 0.0,
     "brown": 0.0,
     "rejection": 0.0,
-    "oil": 0.0,
     "pkw1": 0.0,
     "pkw2": 0.0,
     "testa small": 0.0,
+    "oil": 0.0,
     "ww_w180": 0.0,
     "sw_w180": 0.0,
     "ww_w210": 0.0,
@@ -301,7 +301,7 @@
     "capture_only_mode": 0.0
   },
   "yolo_model_path": "saved_models/model_20260913_230121.pt",
-  "keras_preprocess": "MobileNet / TM (-1 to 1)",
+  "yolo_conf": 0.3,
   "roi1": [
     25,
     15,
@@ -315,6 +315,19 @@
     2047
   ],
   "line_x_full": 250,
+  "line_y_full": null,
+  "flow_direction": "right_to_left",
+  "camera_source": {
+    "source": "aravis",
+    "device_id": "",
+    "exposure_us": 800.0,
+    "gain": null,
+    "fps_limit_enabled": false,
+    "fps_limit": 20.0,
+    "test_path": "",
+    "test_loop": true,
+    "test_fps": 25.0
+  },
   "capture_classes": {
     "1": "Class_1",
     "2": "Class_2",
@@ -344,7 +357,6 @@
     "g": 1.0,
     "b": 1.4,
     "a_gain": 1.0,
-    "d_gain": 1.0,
-    "exposure": 800
+    "d_gain": 1.0
   }
 }

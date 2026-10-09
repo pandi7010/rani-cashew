@@ -29,7 +29,15 @@ import preprocess
 import flow_geometry as fg
 from class_registry import ClassRegistry, normalize_name
 from camera_backends import CameraThread, CameraSettings, FlatField
-from relay_output import RelayOutput, FIRST_EJECTOR, LAST_EJECTOR
+from relay_output import RelayOutput, FIRST_EJECTOR, LAST_EJECTOR, REJECT_RELAY
+import copy
+from collections import OrderedDict
+import segmentation
+import view_features
+import decision
+import grading_config
+from lane_tracker import LaneTracker, Detection, crossing_time, track_speed
+from cashew_log import CashewLog
 
 log = app_paths.setup_logging("grader")
 
@@ -435,6 +443,18 @@ class SharedState:
         self.camera_settings = CameraSettings()             # camera / test source (camera_backends.py)
         self.flow_direction = fg.RIGHT_TO_LEFT              # also fixes the line orientation (vertical / horizontal)
         self.line_y_full = None                             # position of a horizontal decision line
+        # ROI 2 may have its own line. While link_lines is on (default) both ROIs use the ROI 1 line.
+        self.link_lines = True
+        self.line2_x_full, self.line2_y_full = None, None
+        self.dragging_roi = 1
+        # Tracking / views / voting settings (grading_config.py), counters and details of recent decisions
+        self.grading = grading_config.defaults()
+        self.result_counts: Dict[str, int] = {}
+        self.recent_decisions = OrderedDict()               # cashew ID -> text with its frame-by-frame votes
+        self.view_live = {1: "", 2: ""}                     # latest measured values per ROI (view tuning)
+        self.lane_speed = {1: 0.0, 2: 0.0}                  # px/ms, from the tracker
+        self.teach_belt_requested = False
+        self.teach_belt_message = ""
         self.opencv_filter = {
             "sw_color_thresh": 45,
             "sw_defect_size_px": 20,
@@ -480,16 +500,71 @@ class SharedState:
         with self.lock:
             return self.line_x_full if self.line_is_vertical else self.line_y_full
 
-    def set_line_pos(self, value, notify=True):
+    def line_pos_for(self, roi: int):
+        """Decision line of a ROI. ROI 2 uses the ROI 1 line while the lines are linked."""
         with self.lock:
-            if self.line_is_vertical: self.line_x_full = value
+            if roi == 2 and not self.link_lines:
+                return self.line2_x_full if self.line_is_vertical else self.line2_y_full
+            return self.line_x_full if self.line_is_vertical else self.line_y_full
+
+    def set_line_pos(self, value, notify=True, roi=1):
+        with self.lock:
+            if roi == 2 and not self.link_lines:
+                if self.line_is_vertical: self.line2_x_full = value
+                else: self.line2_y_full = value
+            elif self.line_is_vertical: self.line_x_full = value
             else: self.line_y_full = value
         if notify: self._notify_line()
+
+    def set_link_lines(self, linked: bool):
+        with self.lock:
+            self.link_lines = bool(linked)
+            if not self.link_lines and self.line_pos_for(2) is None:    # start the ROI 2 line where the shared one is
+                self.line2_x_full, self.line2_y_full = self.line_x_full, self.line_y_full
+        self._notify_line()
+        self.save_to_config(CFG_PATH)
+
+    def _line_roi(self, pt) -> int:
+        """Which ROI's line a click belongs to (always 1 while the lines are linked)."""
+        with self.lock:
+            r2 = self.roi2
+            if self.link_lines or not r2:
+                return 1
+            return 2 if (r2[0] <= pt[0] <= r2[2] and r2[1] <= pt[1] <= r2[3]) else 1
 
     def _notify_line(self):
         if self.line_pixel_callback:
             axis, pos = ("X" if self.line_is_vertical else "Y"), self.line_pos
-            self.line_pixel_callback(f"Line {axis}: {pos} px" if pos is not None else f"Line {axis}: Not Set", pos)
+            txt = f"Line {axis}: {pos} px" if pos is not None else f"Line {axis}: Not Set"
+            if not self.link_lines:
+                pos2 = self.line_pos_for(2)
+                txt = f"ROI 1 {txt}   |   ROI 2 line {axis}: " + (f"{pos2} px" if pos2 is not None else "Not Set")
+            self.line_pixel_callback(txt, pos)
+
+    # ── grading: counters, decision details, belt colour teach ──
+    def add_decision(self, track_id: str, label: str, frames_txt: str, relay: int, count_keys, detail: str):
+        with self.lock:
+            self.recent_fires.appendleft((time.strftime("%H:%M:%S"), track_id, label, frames_txt, f"R{relay}" if relay else "-"))
+            for key in count_keys:
+                self.result_counts[key] = self.result_counts.get(key, 0) + 1
+            self.recent_decisions[track_id] = detail
+            while len(self.recent_decisions) > 300:
+                self.recent_decisions.popitem(last=False)
+
+    def get_result_counts(self) -> Dict[str, int]:
+        with self.lock: return dict(self.result_counts)
+
+    def reset_result_counts(self):
+        with self.lock: self.result_counts = {}
+
+    def set_grading(self, grading: dict):
+        with self.lock: self.grading = grading_config.merged(grading)
+        self.save_to_config(CFG_PATH)
+
+    def take_teach_belt_request(self) -> bool:
+        with self.lock:
+            wanted, self.teach_belt_requested = self.teach_belt_requested, False
+            return wanted
 
     def set_flow_direction(self, flow):
         with self.lock:
@@ -498,6 +573,8 @@ class SharedState:
         self.save_to_config(CFG_PATH)
 
     def reset_line(self):
+        with self.lock:
+            self.line2_x_full, self.line2_y_full = None, None
         self.set_line_pos(None)
 
     def set_mapping_for_actuator(self, act_id: int, class_list: List[str]):
@@ -624,6 +701,9 @@ class SharedState:
                 if "roi2" in cfg and cfg["roi2"]: self.roi2 = tuple(cfg["roi2"])
                 self.line_x_full = cfg.get("line_x_full")
                 self.line_y_full = cfg.get("line_y_full")
+                self.link_lines = bool(cfg.get("link_lines", True))
+                self.line2_x_full, self.line2_y_full = cfg.get("line2_x_full"), cfg.get("line2_y_full")
+                self.grading = grading_config.merged(cfg.get("grading"))
                 self.flow_direction = fg.valid_flow(cfg.get("flow_direction", fg.RIGHT_TO_LEFT))
                 if "camera_source" in cfg:
                     self.camera_settings = CameraSettings.from_dict(cfg["camera_source"])
@@ -669,6 +749,10 @@ class SharedState:
                     "roi2": self.roi2,
                     "line_x_full": self.line_x_full,
                     "line_y_full": self.line_y_full,
+                    "link_lines": self.link_lines,
+                    "line2_x_full": self.line2_x_full,
+                    "line2_y_full": self.line2_y_full,
+                    "grading": self.grading,
                     "flow_direction": self.flow_direction,
                     "camera_source": self.camera_settings.to_dict(),
                     "capture_classes": self.capture_classes,
@@ -704,6 +788,9 @@ class SharedState:
                 "roi1": self.roi1, "roi2": self.roi2,
                 "temp_start": self.temp_start_pt, "temp_end": self.temp_end_pt,
                 "line_pos": self.line_x_full if self.line_is_vertical else self.line_y_full,
+                "line_pos2": self.line_pos_for(2),
+                "link_lines": self.link_lines,
+                "grading": copy.deepcopy(self.grading),
                 "flow": self.flow_direction,
                 "mouse_x": self.mouse_x, "mouse_y": self.mouse_y,
                 "mapping_t1": self.mapping_t1.copy(), "mapping_t2": self.mapping_t2.copy(),
@@ -726,11 +813,14 @@ class SharedState:
                 self.temp_start_pt = pt; self.temp_end_pt = pt
                 self.phase = "ROI1_DRAW" if self.phase == "ROI1_START" else "ROI2_DRAW"
             elif self.phase == "LINE_SET_MODE":
-                self.set_line_pos(along)
+                self.set_line_pos(along, roi=self._line_roi(pt))
                 self.phase = "READY"
                 self.save_to_config(CFG_PATH)
-            elif self.line_pos is not None and abs(along - self.line_pos) < 15:
-                self.dragging_line = True
+            else:
+                roi = self._line_roi(pt)
+                pos = self.line_pos_for(roi)
+                if pos is not None and abs(along - pos) < 15:
+                    self.dragging_line, self.dragging_roi = True, roi
 
     def handle_mouse_move(self, pt: Tuple[int, int]):
         with self.lock:
@@ -738,7 +828,7 @@ class SharedState:
             if self.phase in ("ROI1_DRAW", "ROI2_DRAW"): 
                 self.temp_end_pt = pt
             elif self.dragging_line:
-                self.set_line_pos(pt[0] if self.line_is_vertical else pt[1])
+                self.set_line_pos(pt[0] if self.line_is_vertical else pt[1], roi=self.dragging_roi)
 
     def handle_mouse_up(self, pt: Tuple[int, int]):
         with self.lock:
@@ -778,8 +868,11 @@ class ProcessingThread(threading.Thread):
         self.fire_lock = fire_lock      
         self.model = None
         self.model_lock = threading.Lock()
-        self.tracked_objects = []
-        self.next_obj_id = 1
+        self.trackers = {1: LaneTracker(1), 2: LaneTracker(2)}    # one tracker and one ID series per ROI
+        self.frame_time = time.time()
+        frame_log = shared_state.grading.get("frame_log", {})
+        self.cashew_log = CashewLog(app_paths.LOGS_DIR, keep_days=int(frame_log.get("keep_days", 7)),
+                                    frames_enabled=bool(frame_log.get("enabled", True))).start()
         self._tracking_reset = threading.Event()
         
         self.device = 0 if (_CNN_AVAILABLE and _torch.cuda.is_available()) else 'cpu'
@@ -914,6 +1007,9 @@ class ProcessingThread(threading.Thread):
                     ], dtype=np.float32)
                     frame_full = cv2.transform(frame_full, m)
                 
+                if self.shared_state.take_teach_belt_request():
+                    self._teach_belt(frame_full, state)
+
                 if self.shared_state.check_and_clear_capture():
                     folder_name = self.shared_state.get_active_capture_folder()
                     target_dir = os.path.join(DATASET_DIR, folder_name)
@@ -971,8 +1067,8 @@ class ProcessingThread(threading.Thread):
                     display_frame, scale, x_off, y_off = resize_letterbox(display_img, VIDEO_PANE_W, VIDEO_PANE_H, bg_color=BG_COLOR)
                     geometry = {"scale": scale, "x_off": x_off, "y_off": y_off, "orig_w": w, "orig_h": h}
                 else:
-                    self.tracked_objects = []
-                    self.next_obj_id = 1
+                    for tracker in self.trackers.values():
+                        tracker.clear()
                     self._tracking_reset.clear()
                     frame_drawn = draw_rulers(frame_full.copy())
                     self._draw_setup_overlays(frame_drawn, state)
@@ -1033,7 +1129,7 @@ class ProcessingThread(threading.Thread):
             x1,y1,x2,y2 = state["roi2"]
             cv2.rectangle(frame, (x1,y1), (x2,y2), AOI_COLOR2, 3)
             cv2.putText(frame, "ROI 2", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, AOI_COLOR2, 2)
-        fg.draw_line(frame, state["flow"], state["line_pos"], LINE_COLOR, 3)
+        self._draw_lines(frame, state, 3)
         
         ph = state["phase"]
         msg = ""
@@ -1044,444 +1140,295 @@ class ProcessingThread(threading.Thread):
         
         self._draw_arrows(frame, state)
 
-    def _resolve_priority(self, history):
-        if not history: return 0
-        from collections import Counter
-        counts = Counter(history)
-        
-        defects = []
-        non_defects = []
-        for cid, count in counts.items():
-            cname = self.registry.name(cid).lower()
-            if cname in ["good_cashew", "sw", "white_dw"] or cname.startswith("ww_") or cname.startswith("sw_"):
-                non_defects.append((cid, count))
-            else:
-                defects.append((cid, count))
-                
-        if defects:
-            defects.sort(key=lambda x: x[1], reverse=True)
-            best_defect, def_count = defects[0]
-            
-            # REMOVED NOISE FILTER: 
-            # If the cashew is rolling 360 degrees and shows a defect for even 1 frame, 
-            # we MUST reject it. We do NOT ignore single-frame defect blips anymore.
-            return best_defect
+    def _teach_belt(self, frame, state):
+        """TEACH BELT COLOUR: blue band from the ROIs of an empty belt (frame already has the colour gain)."""
+        parts = [frame[r[1]:r[3]:4, r[0]:r[2]:4].reshape(-1, 1, 3) for r in (state["roi1"], state["roi2"]) if r]
+        pixels = np.concatenate(parts) if parts else frame[::8, ::8].reshape(-1, 1, 3)
+        current = state["grading"]["segmentation"]
+        new = segmentation.teach_belt(pixels, current)
+        if new is None:
+            message = "Belt colour NOT taught: the picture is not an evenly coloured, lit, empty belt."
         else:
-            if non_defects:
-                non_defects.sort(key=lambda x: x[1], reverse=True)
-                return non_defects[0][0]
-            return history[-1]
+            grading = state["grading"]
+            grading["segmentation"] = new
+            self.shared_state.set_grading(grading)
+            message = (f"Belt colour taught: hue {new['blue_h_min']}-{new['blue_h_max']}, saturation from {new['blue_s_min']} "
+                       f"(was {current['blue_h_min']}-{current['blue_h_max']}, {current['blue_s_min']}).")
+        log.info(message)
+        with self.shared_state.lock:
+            self.shared_state.teach_belt_message = message
+
+    def _draw_lines(self, frame, state, thickness):
+        """Decision line(s): one across the picture when linked, otherwise one inside each ROI."""
+        flow = state["flow"]
+        if state.get("link_lines", True):
+            fg.draw_line(frame, flow, state["line_pos"], LINE_COLOR, thickness)
+            return
+        for roi, pos in ((state["roi1"], state["line_pos"]), (state["roi2"], state.get("line_pos2"))):
+            if pos is None:
+                continue
+            if not roi:
+                fg.draw_line(frame, flow, pos, LINE_COLOR, thickness)
+            elif fg.line_orientation(flow) == fg.VERTICAL:
+                cv2.line(frame, (int(pos), roi[1]), (int(pos), roi[3]), LINE_COLOR, thickness)
+            else:
+                cv2.line(frame, (roi[0], int(pos)), (roi[2], int(pos)), LINE_COLOR, thickness)
 
     def _process_frame(self, frame, state):
-        current_time_ms = time.time() * 1000.0
-        if self._tracking_reset.is_set():       # a new YOLO model was applied
+        """One frame: YOLO finds the cashews, the CNN classifies every crop, each ROI's tracker gives the
+        cashew its ID, every frame adds a vote, and ONE decision is made when the centroid crosses the line."""
+        t_ms = float(self.frame_time) * 1000.0          # when the camera took the frame
+        if self._tracking_reset.is_set():               # a new YOLO model was applied
             self._tracking_reset.clear()
-            self.tracked_objects = []
-        
-        # Clean copy for inference and image capturing (no overlay lines/dots!)
-        clean_frame = frame.copy()
-        
-        # Use user-defined YOLO confidence threshold to filter out background noise (empty rollers)
-        global_min_conf = state.get("target_conf", 0.30)
-        
-        flow, line_pos = state["flow"], state["line_pos"]
-        fg.draw_line(frame, flow, line_pos, LINE_COLOR, 2)
+            for tracker in self.trackers.values():
+                tracker.clear()
 
-        def past_line(cx, cy):
-            """Pixels past the decision line in the direction of flow (negative = not there yet)."""
-            return fg.progress(flow, line_pos, cx, cy)
+        clean_frame = frame.copy()                      # for inference and saved images (no overlay)
+        flow, grading = state["flow"], state["grading"]
+        lines = {1: state["line_pos"], 2: state.get("line_pos2")}
+        self._draw_lines(frame, state, 2)
 
-        boxes, classes, confs = [], [], []
-        
+        rois = [(rid, roi) for rid, roi in ((1, state.get("roi1")), (2, state.get("roi2"))) if roi]
+        found = {rid: ([], [], []) for rid, _ in rois}  # ROI -> boxes, YOLO class IDs, YOLO confidences
+
         with self.model_lock:
-            rois = []
-            if state.get("roi1"): rois.append(state["roi1"])
-            if state.get("roi2"): rois.append(state["roi2"])
-            if not rois:
-                rois = [(0, 0, frame.shape[1], frame.shape[0])]
-
             if self.model is not None:
-                crops = []
-                offsets = []
-                for rx1, ry1, rx2, ry2 in rois:
+                crops, owners = [], []
+                for rid, (rx1, ry1, rx2, ry2) in rois:
                     roi_crop = clean_frame[ry1:ry2, rx1:rx2]
                     if roi_crop.size > 0:
                         crops.append(roi_crop)
-                        offsets.append((rx1, ry1))
-                        
+                        owners.append((rid, rx1, ry1))
                 if crops:
                     # One YOLO call for all ROIs: the crops are put into a single image.
                     combined_img, places = fg.stack_crops(crops)
-                    results = self.model.predict(combined_img, conf=global_min_conf, verbose=False, device=self.device)[0]
-                    
+                    results = self.model.predict(combined_img, conf=state.get("target_conf", 0.30), verbose=False, device=self.device)[0]
                     for box in results.boxes:
                         xy = box.xyxy[0].cpu().numpy().tolist()
                         i = fg.place_index(places, (xy[0] + xy[2]) / 2.0, (xy[1] + xy[3]) / 2.0)
                         if i < 0:
                             continue
                         px, py = places[i][0], places[i][1]
-                        rx1, ry1 = offsets[i]
-                        boxes.append([int(xy[0] - px) + rx1, int(xy[1] - py) + ry1, int(xy[2] - px) + rx1, int(xy[3] - py) + ry1])
-                        classes.append(int(box.cls[0].cpu().numpy()))
-                        confs.append(float(box.conf[0].cpu().numpy()))
+                        rid, rx1, ry1 = owners[i]
+                        found[rid][0].append([int(xy[0] - px) + rx1, int(xy[1] - py) + ry1, int(xy[2] - px) + rx1, int(xy[3] - py) + ry1])
+                        found[rid][1].append(int(box.cls[0].cpu().numpy()))
+                        found[rid][2].append(float(box.conf[0].cpu().numpy()))
 
-        # Golden Capture logic moved to run after tracker assignment
+        for rid, roi in rois:
+            boxes, classes, confs = merge_boxes_area_rule(*found[rid])
+            detections = [self._measure_detection(clean_frame, box, cid, conf, roi, state, t_ms)
+                          for box, cid, conf in zip(boxes, classes, confs)]
+            tracker = self.trackers[rid]
+            tracker.params = {**tracker.params, **grading.get("tracker", {})}
+            tracks = tracker.update(detections, t_ms, flow, roi)
+            for det in detections:
+                if not det.track.decided:
+                    det.track.frames.append(det.data)
+                det.track.info["last"] = det.data
+            live = next((d.data for d in detections if d.data.get("feat")), None)
+            with self.shared_state.lock:
+                self.shared_state.lane_speed[rid] = tracker.lane_speed
+                if live is not None:
+                    self.shared_state.view_live[rid] = f"{live['view']}  {view_features.short_text(live['feat'])}"
 
-
-        # ── CNN as Primary Classifier ──────────────
-        if self.cnn_model is not None and boxes:
-            for i in range(len(boxes)):
-                bx1, by1, bx2, by2 = boxes[i]
-                
-                crop = clean_frame[max(0,by1):min(clean_frame.shape[0],by2),
-                             max(0,bx1):min(clean_frame.shape[1],bx2)]
-                if crop.size == 0:
-                    continue
-                    
-                cashew_area, cashew_rect = self._get_cashew_contour_rect(crop)
-                # Localize tight bounding box around the cashew inside the roller slot if contour is present
-                if cashew_rect is not None and cashew_area >= 150:
-                    rx, ry, rw, rh = cashew_rect
-                    margin = 4
-                    nbx1 = max(0, bx1 + rx - margin)
-                    nby1 = max(0, by1 + ry - margin)
-                    nbx2 = min(clean_frame.shape[1], bx1 + rx + rw + margin)
-                    nby2 = min(clean_frame.shape[0], by1 + ry + rh + margin)
-                    boxes[i] = [nbx1, nby1, nbx2, nby2]
-                    crop = clean_frame[nby1:nby2, nbx1:nbx2]
-
-                cnn_name, cnn_conf = self._cnn_predict(crop)
-                if cnn_name is None:
-                    continue
-                    
-                # ── CNN Primary Class Preserved ──────────────────────────────
-                cname_lower = cnn_name.lower().replace("_", " ")
-                cv_cfg = state.get("opencv_filter", {})
-
-                # Only apply noise filter for SW / WHITE DW if defect is below noise threshold
-                if cname_lower in ["sw", "white dw"]:
-                    if cname_lower == "sw":
-                        def_px = self._calculate_defect_area(crop, color_thresh=cv_cfg.get("sw_color_thresh", 45))
-                        max_px = cv_cfg.get("sw_defect_size_px", 20)
-                    else:
-                        def_px = self._calculate_defect_area(crop, color_thresh=cv_cfg.get("ww_color_thresh", 85))
-                        max_px = cv_cfg.get("ww_defect_size_px", 16)
-                    if def_px < max_px:
-                        cnn_name = "good_cashew"
-                    
-                # CNN class name -> class ID, by name (registered behind the YOLO IDs if new)
-                cnn_cid = self.registry.id_for(cnn_name, register=True)
-
-                if cnn_cid is not None:
-                    req_conf = state.get("class_confs", {}).get(cnn_name.lower(), 50)
-                    if (cnn_conf * 100) >= req_conf:
-                        classes[i] = cnn_cid
-                        confs[i] = cnn_conf
-
-        mb, mc, mcf = merge_boxes_area_rule(boxes, classes, confs)
-
-        # Restore tracking
-        new_tracked = []
-        unmatched_new = list(range(len(mb)))
-        
-        for obj in self.tracked_objects:
-            best_dist = 100000
-            best_idx = -1
-            
-            # Predict position using current velocity
-            vx = obj.get('vx', 0.0)
-            vy = obj.get('vy', 0.0)
-            pred_box = [
-                obj['box'][0] + vx, obj['box'][1] + vy,
-                obj['box'][2] + vx, obj['box'][3] + vy
-            ]
-
-            for i in unmatched_new:
-                new_cx, new_cy = get_centroid(mb[i])
-                
-                # CRITICAL IDENTITY THEFT FIX:
-                # If this object was already fired, it MUST NEVER match an incoming cashew that is still behind the line!
-                if line_pos is not None and obj.get('fired') and past_line(new_cx, new_cy) < 10:
-                    continue
-
-                dist = centroid_distance(pred_box, mb[i])
-                # Ensure they are in the same roller channel (they overlap across the flow)
-                if dist < 160 and fg.lane_overlap(flow, pred_box, mb[i]) > -20: 
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_idx = i
-            
-            if best_idx != -1:
-                old_cx = (obj['box'][0] + obj['box'][2]) / 2.0
-                old_cy = (obj['box'][1] + obj['box'][3]) / 2.0
-                new_cx = (mb[best_idx][0] + mb[best_idx][2]) / 2.0
-                new_cy = (mb[best_idx][1] + mb[best_idx][3]) / 2.0
-                inst_vx = new_cx - old_cx
-                inst_vy = new_cy - old_cy
-                
-                obj['vx'] = 0.7 * obj.get('vx', 0.0) + 0.3 * inst_vx
-                obj['vy'] = 0.7 * obj.get('vy', 0.0) + 0.3 * inst_vy
-                
-                # Time-based true velocity calculation (along the flow)
-                dt = current_time_ms - obj.get('last_time_ms', current_time_ms - 13.3)
-                if dt > 0:
-                    inst_v_px_per_ms = (inst_vx if fg.line_orientation(flow) == fg.VERTICAL else inst_vy) / dt
-                    obj['v_px_per_ms'] = 0.7 * obj.get('v_px_per_ms', inst_v_px_per_ms) + 0.3 * inst_v_px_per_ms
-                
-                obj['last_time_ms'] = current_time_ms
-                
-                obj['box'] = mb[best_idx]
-                obj['cid'] = mc[best_idx]
-                obj['conf'] = mcf[best_idx]
-                obj['missing_frames'] = 0
-                if 'history' not in obj: obj['history'] = []
-                obj['history'].append(mc[best_idx])
-                new_tracked.append(obj)
-                unmatched_new.remove(best_idx)
-            else:
-                obj['missing_frames'] += 1
-                # Drop max_missing from 15 to 3. If a cashew is missing for >3 frames (~40ms), 
-                # drop it to prevent the ghost from merging with the next incoming cashew.
-                max_missing = 3 if len(obj.get('history', [])) > 2 else 0
-                
-                if obj['missing_frames'] < max_missing:
-                    vx = obj.get('vx', 0)
-                    vy = obj.get('vy', 0)
-                    if vx == 0 and vy == 0 and line_pos is not None:
-                        vx, vy = fg.step_toward_line(flow, line_pos, *get_centroid(obj['box']), 20)
-                        
-                    obj['box'] = [
-                        obj['box'][0] + vx, obj['box'][1] + vy,
-                        obj['box'][2] + vx, obj['box'][3] + vy
-                    ]
-                    new_tracked.append(obj)
-                    
-        for i in unmatched_new:
-            cx_init = (mb[i][0] + mb[i][2]) / 2.0
-            new_tracked.append({
-                'id': getattr(self, 'next_obj_id', 0), 'box': mb[i], 'cid': mc[i], 'conf': mcf[i],
-                'fired': False, 'counted': False, 'missing_frames': 0, 'history': [mc[i]],
-                'start_x': cx_init,
-                'vx': 0.0, 'vy': 0.0, 'track_id': None,
-                'last_time_ms': current_time_ms, 'v_px_per_ms': 0.0,
-                'cached_label': None, 'cached_act_id': None
-            })
-            self.next_obj_id = getattr(self, 'next_obj_id', 0) + 1
-            
-        self.tracked_objects = new_tracked
-
-        px_per_mm = state["size_config"].get("px_per_mm", 10.0)
-
-        for obj in self.tracked_objects:
-            x1, y1, x2, y2 = int(obj['box'][0]), int(obj['box'][1]), int(obj['box'][2]), int(obj['box'][3])
-            cx, cy = (x1+x2)//2, (y1+y2)//2 
-            
-            # Count cashew once tracked across at least 2 frames (avoids noise)
-            if not obj.get('counted') and len(obj.get('history', [])) >= 2:
-                obj['counted'] = True
-                self.shared_state.increment_detected_count() 
-            
-            if 'history' in obj and obj['history']:
-                resolved_cid = self._resolve_priority(obj['history'])
-                final_cname = self.registry.name(resolved_cid).lower()
-                display_cid = resolved_cid
-            else:
-                final_cname = self.registry.name(obj['cid']).lower()
-                display_cid = obj['cid']
-
-            # NEW: Only apply OpenCV sizing logic to 'good' and 'sw' classes per user request.
-            # All other defects will directly trigger a valve without OpenCV size operations.
-            is_size_class = final_cname in ["good", "good_cashew", "good cashew", "sw", "sw cashew"]
-            
-            if not is_size_class:
-                allowance_mm = state["defect_allowances"].get(final_cname, 0.0)
-                if allowance_mm > 0.0:
-                    defect_mm_len = max(x2-x1, y2-y1) / px_per_mm
-                    if defect_mm_len <= allowance_mm:
-                        continue 
-            
-            c = obj['conf']
-            px_length = max(x2 - x1, y2 - y1)
-            px_width = min(x2 - x1, y2 - y1)
-            color_prefix = "ww" 
-            
-            try:
-                if y2 > y1 and x2 > x1 and obj['missing_frames'] == 0:
-                    crop = frame[y1:y2, x1:x2]
-                    
-                    if is_size_class:
-                        # Use CNN classification for WW/SW prefix
-                        if "sw" in final_cname:
-                            color_prefix = "sw"
-                        else:
-                            color_prefix = "ww"
-                            
-                    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    
-                    if contours:
-                        largest_contour = max(contours, key=cv2.contourArea)
-                        rect = cv2.minAreaRect(largest_contour)
-                        (w, h) = rect[1]
-                        
-                        if w > 0 and h > 0:
-                            px_length = max(w, h)
-                            px_width = min(w, h)
-                            bx = cv2.boxPoints(rect)
-                            bx = np.int32(bx)
-                            bx[:, 0] += x1
-                            bx[:, 1] += y1
-            except Exception:
-                _throttle.exception("size_measure", "Size measurement failed (bounding-box size is used)")
-                
-            mm_length = px_length / px_per_mm
-            mm_width = px_width / px_per_mm
-
-            cv2.circle(frame, (int(cx), int(cy)), 5, (255, 255, 255), -1)
-            
-            has_crossed = line_pos is not None and past_line(cx, cy) >= 0
-            
-            if self.shared_state.is_golden_capture_active() and obj['missing_frames'] == 0 and not has_crossed:
-                pad = 20
-                gy1 = max(0, y1 - pad)
-                gy2 = min(clean_frame.shape[0], y2 + pad)
-                gx1 = max(0, x1 - pad)
-                gx2 = min(clean_frame.shape[1], x2 + pad)
-                g_crop = clean_frame[gy1:gy2, gx1:gx2]
-                if g_crop.size > 0:
-                    if self.shared_state.increment_golden_capture():
-                        timestamp_ms = int(time.time()*1000)
-                        c_type = self.shared_state.golden_capture_type
-                        
-                        if c_type in ("cropped", "both"):
-                            g_filename = os.path.join(GOLDEN_DIR, f"crop_{timestamp_ms}_{obj['id']}.jpg")
-                            cv2.imwrite(g_filename, g_crop)
-                            
-                        if c_type in ("full", "both"):
-                            f_filename = os.path.join(FULL_FRAME_DIR, f"full_{timestamp_ms}_{obj['id']}.jpg")
-                            cv2.imwrite(f_filename, clean_frame)
-                        
-                        # Save camera metadata to a text file
-                        meta_file = os.path.join(GOLDEN_DIR, "camera_metadata.txt")
-                        if not os.path.exists(meta_file):
-                            import datetime
-                            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            with open(meta_file, "w") as f:
-                                f.write(f"Capture Date & Time: {now_str}\n")
-                                f.write(f"Exposure: {state.get('exposure', 'N/A')}\n")
-                                f.write(f"Gain: {state.get('gain', 'N/A')}\n")
-                                f.write(f"R: {state.get('r', 'N/A')}\n")
-                                f.write(f"G: {state.get('g', 'N/A')}\n")
-                                f.write(f"B: {state.get('b', 'N/A')}\n")
-
-            if obj.get('track_id') is None:
-                in_roi1 = (state["roi1"][0] <= cx <= state["roi1"][2]) and (state["roi1"][1] <= cy <= state["roi1"][3]) if state["roi1"] else False
-                in_roi2 = (state["roi2"][0] <= cx <= state["roi2"][2]) and (state["roi2"][1] <= cy <= state["roi2"][3]) if state["roi2"] else False
-                if in_roi1: obj['track_id'] = 1
-                elif in_roi2: obj['track_id'] = 2
-                else:
-                    mid_y = (state["roi1"][3] + state["roi2"][1]) / 2.0 if state.get("roi1") and state.get("roi2") else frame.shape[0] / 2.0
-                    obj['track_id'] = 1 if cy < mid_y else 2
-                
-            track_id = obj['track_id']
-            cls_color = self.get_color_for_class(display_cid)
-            
-            crossed_line = False
-            # Check line crossing: If cashew is past or reaching the decision line, fire it!
-            if line_pos is not None and not obj['fired']:
-                if 0 <= past_line(cx, cy) <= 400:
-                    crossed_line = True
-
-            if crossed_line and not obj['fired']:
-                # Check if another cashew in the same roller was already fired and is virtually identical (duplicate tracker bounding box)
-                too_close = False
-                for other_obj in self.tracked_objects:
-                    if other_obj['id'] != obj['id'] and other_obj.get('fired'):
-                        other_cx = (other_obj['box'][0] + other_obj['box'][2]) / 2.0
-                        other_cy = (other_obj['box'][1] + other_obj['box'][3]) / 2.0
-                        if abs(cy - other_cy) < 20 and abs(cx - other_cx) < 15:
-                            too_close = True
-                            break
-                            
-                if too_close:
-                    obj['fired'] = True
-                    obj['cached_label'] = "SKIPPED (TOO CLOSE)"
-                    obj['cached_act_id'] = None
-                    self.shared_state.add_fire_event(track_id, "SKIPPED", c, 0)
-                    continue
-
-                act_id = None
-                label = ""
-                if not is_size_class:
-                    map_dict = state["mapping_t1"] if track_id == 1 else state["mapping_t2"]
-                    act_id = map_dict.get(normalize_name(final_cname))
-                    label = f"DEF: {final_cname.upper()}"
-                else:
-                    cfg_act_id, s_lbl = self._get_size_data(mm_length, mm_width, state["size_config"], track_id)
-                    combined_cname = f"{color_prefix}_{s_lbl}".lower()
-                    
-                    # Check if user explicitly mapped this size class in the Pneumatics UI
-                    map_dict = state["mapping_t1"] if track_id == 1 else state["mapping_t2"]
-                    mapped_act = None
-                    
-                    # 1. Check direct SW size name if scorched (e.g. "SW180")
-                    if color_prefix == "sw":
-                        sw_name = f"sw{s_lbl[1:]}" if s_lbl.startswith("W") else f"sw_{s_lbl}"
-                        mapped_act = map_dict.get(normalize_name(sw_name))
-                    
-                    # 2. Check general size label (e.g. "W180", "W210", "W240", "W320", "W450", "BUDDS")
-                    if mapped_act is None:
-                        mapped_act = map_dict.get(normalize_name(s_lbl))
-                        
-                    # 3. Check combined name (e.g. "ww_w180" or "sw_w180")
-                    if mapped_act is None:
-                        mapped_act = map_dict.get(normalize_name(combined_cname))
-                        
-                    # 4. Check color prefix (e.g. "ww" or "sw")
-                    if mapped_act is None:
-                        mapped_act = map_dict.get(normalize_name(color_prefix))
-                    
-                    # 5. Check general good cashew class (e.g. "good_cashew" or "good")
-                    if mapped_act is None:
-                        mapped_act = map_dict.get(normalize_name(final_cname))
-                    
-                    # Strictly only fire if explicitly mapped in Pneumatics UI (no fallback to default Actuator 1)
-                    act_id = mapped_act
-                    label = f"{combined_cname.upper()}"
-                
-                obj['fired'] = True
-                obj['cached_label'] = label
-                obj['cached_act_id'] = act_id
-                
-                if act_id is not None and 1 <= act_id <= NUM_ACTUATORS:
-                    d_ms, p_ms = self.shared_state.get_timing(act_id)
-
-                    self.controller.fire(act_id, d_ms, p_ms, source=f"ID {obj['id']} {label}")
-                    
-                    with self.fire_lock:
-                        self.fire_counts[int(display_cid)] = self.fire_counts.get(int(display_cid),0) + 1
-                    
-                self.shared_state.add_fire_event(track_id, label, c, act_id if act_id else 0)
-                
-            # Draw persistent ID and status
-            if obj['fired']:
-                lbl = obj.get('cached_label', final_cname.upper())
-                act = obj.get('cached_act_id')
-                act_str = f"(A{act})" if act else "(NO ACT)"
-                cv2.rectangle(frame, (x1, y1), (x2, y2), FIRE_COLOR, 3)
-                cv2.putText(frame, f"ID:{obj['id']} FIRED {lbl[:12]} {act_str}", (x1, max(12, y1-5)), cv2.FONT_HERSHEY_SIMPLEX, 1.2, FIRE_COLOR, 3)
-            else:
-                draw_color = cls_color
-                thickness = 1 if obj['missing_frames'] > 0 else 2
-                cv2.rectangle(frame, (x1, y1), (x2, y2), draw_color, thickness)
-                disp = final_cname.upper()
-                if obj['missing_frames'] > 0:
-                    disp += " (EXTRAP)"
-                cv2.putText(frame, f"ID:{obj['id']} {disp[:12]} {c:.2f}", (x1, max(12, y1-5)), cv2.FONT_HERSHEY_SIMPLEX, 1.2, draw_color, 3)
+            line = lines[rid]
+            for trk in tracks:
+                if not trk.counted and trk.hits >= 2:   # seen in two frames: a cashew, not noise
+                    trk.counted = True
+                    self.shared_state.increment_detected_count()
+                progress = fg.progress(flow, line, trk.cx, trk.cy) if line is not None else None
+                if progress is not None and progress < 0 and not trk.missed:
+                    self._golden_capture(clean_frame, trk, state)
+                if progress is not None and progress >= 0 and not trk.decided:
+                    self._decide_track(trk, rid, line, state, t_ms)
+                self._draw_track(frame, trk, grading)
 
         self._draw_arrows(frame, state)
         return frame
+
+    def _measure_detection(self, clean_frame, box, yolo_cid, yolo_conf, roi, state, t_ms):
+        """Everything known about one detection in one frame: YOLO class, CNN class, mask, view, features."""
+        grading = state["grading"]
+        seg_params = grading.get("segmentation", {})
+        H, W = clean_frame.shape[:2]
+        bx1, by1, bx2, by2 = max(0, int(box[0])), max(0, int(box[1])), min(W, int(box[2])), min(H, int(box[3]))
+        edge_cut = segmentation.touches_edge(box, roi, float(seg_params.get("edge_margin_px", 2)))
+        data = {"t": t_ms, "yolo": self.registry.name(yolo_cid), "yolo_conf": float(yolo_conf), "cnn": None, "cnn_conf": 0.0,
+                "view": view_features.OTHER, "edge_cut": edge_cut, "feat": None, "box": [bx1, by1, bx2, by2]}
+        cx, cy = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
+        if bx2 <= bx1 or by2 <= by1:
+            return Detection(cx, cy, [bx1, by1, bx2, by2], data)
+
+        # Mask by blue-background removal, on the YOLO box plus a small border.
+        pad = 6
+        sx1, sy1, sx2, sy2 = max(0, bx1 - pad), max(0, by1 - pad), min(W, bx2 + pad), min(H, by2 + pad)
+        seg_crop = clean_frame[sy1:sy2, sx1:sx2]
+        seg = None
+        try:
+            seg = segmentation.segment(seg_crop, seg_params)
+        except Exception:
+            _throttle.exception("segment", "[CV] Cashew mask failed (box centre is used)")
+        if seg is not None:
+            cx, cy = sx1 + seg.cx, sy1 + seg.cy     # the mask centroid does not jump when the cashew rolls
+            if not edge_cut:
+                try:
+                    data["feat"] = view_features.measure(seg_crop, seg)
+                    data["view"] = view_features.classify(data["feat"], grading.get("views", {}).get("rules"))
+                except Exception:
+                    _throttle.exception("view_features", "[CV] View measurement failed for a cashew")
+
+        # CNN crop: made exactly as before (preprocess.py), so the model sees what it was trained on.
+        crop = clean_frame[by1:by2, bx1:bx2]
+        if self.cnn_model is not None:
+            cashew_area, cashew_rect = self._get_cashew_contour_rect(crop)
+            if cashew_rect is not None and cashew_area >= 150:
+                rx, ry, rw, rh = cashew_rect
+                margin = 4
+                tx1, ty1 = max(0, bx1 + rx - margin), max(0, by1 + ry - margin)
+                tx2, ty2 = min(W, bx1 + rx + rw + margin), min(H, by1 + ry + rh + margin)
+                data["box"] = [tx1, ty1, tx2, ty2]
+                crop = clean_frame[ty1:ty2, tx1:tx2]
+            cnn_name, cnn_conf = self._cnn_predict(crop)
+            if cnn_name is not None:
+                cv_cfg = state.get("opencv_filter", {})
+                low = cnn_name.lower().replace("_", " ")
+                if cv_cfg.get("enabled", False) and low in ("sw", "white dw"):     # old dark-spot filter, default OFF
+                    if low == "sw":
+                        def_px, max_px = self._calculate_defect_area(crop, color_thresh=cv_cfg.get("sw_color_thresh", 45)), cv_cfg.get("sw_defect_size_px", 20)
+                    else:
+                        def_px, max_px = self._calculate_defect_area(crop, color_thresh=cv_cfg.get("ww_color_thresh", 85)), cv_cfg.get("ww_defect_size_px", 16)
+                    if def_px < max_px:
+                        cnn_name = "GOOD_CASHEW"
+                self.registry.id_for(cnn_name, register=True)
+                data["cnn"], data["cnn_conf"] = cnn_name, float(cnn_conf)
+        return Detection(cx, cy, data["box"], data)
+
+    def _golden_capture(self, clean_frame, trk, state):
+        """Dataset auto capture (Teaching pages): crop and / or full frame of a cashew before the line."""
+        if not self.shared_state.is_golden_capture_active():
+            return
+        x1, y1, x2, y2 = [int(v) for v in trk.box]
+        pad = 20
+        g_crop = clean_frame[max(0, y1 - pad):min(clean_frame.shape[0], y2 + pad), max(0, x1 - pad):min(clean_frame.shape[1], x2 + pad)]
+        if g_crop.size == 0 or not self.shared_state.increment_golden_capture():
+            return
+        timestamp_ms = int(time.time() * 1000)
+        c_type = self.shared_state.golden_capture_type
+        if c_type in ("cropped", "both"):
+            cv2.imwrite(os.path.join(GOLDEN_DIR, f"crop_{timestamp_ms}_{trk.id}.jpg"), g_crop)
+        if c_type in ("full", "both"):
+            cv2.imwrite(os.path.join(FULL_FRAME_DIR, f"full_{timestamp_ms}_{trk.id}.jpg"), clean_frame)
+        meta_file = os.path.join(GOLDEN_DIR, "camera_metadata.txt")
+        if not os.path.exists(meta_file):
+            with open(meta_file, "w") as f:
+                f.write(f"Capture Date & Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                for key, label in (("exposure", "Exposure"), ("gain", "Gain"), ("r", "R"), ("g", "G"), ("b", "B")):
+                    f.write(f"{label}: {state.get(key, 'N/A')}\n")
+
+    def _decide_track(self, trk, rid, line, state, t_ms):
+        """The ONE decision of a cashew, at its Decision line, and the ONE fire that follows from it."""
+        trk.decided = True
+        grading, flow = state["grading"], state["flow"]
+        map_dict = state["mapping_t1"] if rid == 1 else state["mapping_t2"]
+
+        first = trk.path[0]
+        if fg.progress(flow, line, first[1], first[2]) >= 0:
+            # First seen when already past the line: there is nothing to vote on and no crossing time.
+            d = decision.Decision(decision.UNDEFINED, decision.MISSED_LINE, True, frames_total=len(trk.frames))
+            fire_allowed = False
+        else:
+            votes = [decision.FrameVote(f["t"], f["cnn"], f["cnn_conf"], f["yolo"], f["yolo_conf"], f["view"], not f["edge_cut"])
+                     for f in trk.frames]
+            d = decision.decide(votes, grading.get("voting"), grading.get("priority"), grading.get("good_classes"),
+                                grading.get("skin_classes"), state.get("priority_rules"))
+            fire_allowed = True
+
+        feats = [f["feat"] for f in trk.frames if f["feat"]]
+        med = lambda key: float(np.median([x[key] for x in feats])) if feats else None
+        top = lambda key: float(max(x[key] for x in feats)) if feats else None
+        px_per_mm = float(state["size_config"].get("px_per_mm", 10.0)) or 10.0
+        length_px, width_px = med("length_px"), top("width_px")
+        sw_votes = sum(n for name, n in d.votes.items() if normalize_name(name) == "sw")
+
+        relay, grade = None, ""
+        if d.reject:
+            relay = REJECT_RELAY[rid]
+            label = d.result if d.result != decision.UNDEFINED else f"UNDEF {d.reason}"
+        elif d.result == decision.GOOD:
+            # Until step (c2): the old size table and mapping decide the relay of a GOOD cashew.
+            mm_length = (length_px or 0.0) / px_per_mm
+            mm_width = (width_px or 0.0) / px_per_mm
+            _, s_lbl = self._get_size_data(mm_length, mm_width, state["size_config"], rid)
+            prefix = "sw" if sw_votes * 2 > d.good_frames else "ww"
+            names = ([f"sw{s_lbl[1:]}" if s_lbl.startswith("W") else f"sw_{s_lbl}"] if prefix == "sw" else []) + \
+                    [s_lbl, f"{prefix}_{s_lbl}", prefix, "good_cashew", "good"]
+            relay = next((map_dict[normalize_name(n)] for n in names if normalize_name(n) in map_dict), None)
+            grade = f"{prefix.upper()}_{s_lbl}"
+            label = f"GOOD {grade}"
+        else:
+            relay = map_dict.get(normalize_name(d.result))
+            label = d.result
+            if relay is None:       # a class without a relay cannot be sorted: reject it
+                d.reason, d.reject = f"{decision.NOT_MAPPED}:{d.result}", True
+                relay, label = REJECT_RELAY[rid], f"UNDEF no relay ({d.result})"
+                d.result = decision.UNDEFINED
+
+        fire_result = ""
+        if relay is not None and fire_allowed and 1 <= relay <= NUM_ACTUATORS:
+            d_ms, p_ms = self.shared_state.get_timing(relay)
+            fire_result = self.controller.fire(relay, d_ms, p_ms, source=f"{trk.id} {label}")
+            cid = self.registry.id_for(d.result)
+            if cid is not None:
+                with self.fire_lock:
+                    self.fire_counts[int(cid)] = self.fire_counts.get(int(cid), 0) + 1
+        elif not fire_allowed:
+            relay, fire_result = None, "NOT_FIRED"
+
+        speed = track_speed(trk.path, flow)
+        t_cross = crossing_time(trk.path, flow, line)
+        trk.info.update(label=label, relay=relay, result=d.result)
+        count_keys = [d.result] + ([f"UNDEFINED: {d.reason.split(':')[0]}"] if d.result == decision.UNDEFINED else [])
+        frame_rows = [{"t": round(f["t"] - trk.born_ms, 1), "cnn": f["cnn"], "cnn_conf": round(f["cnn_conf"], 3),
+                       "yolo": f["yolo"], "yolo_conf": round(f["yolo_conf"], 3), "view": f["view"], "edge_cut": f["edge_cut"],
+                       "feat": {k: round(v, 3) for k, v in f["feat"].items()} if f["feat"] else None} for f in trk.frames]
+        detail = [f"{trk.id}   {label}   relay {relay if relay else '-'}   {fire_result}",
+                  f"result {d.result}, reason {d.reason}; frames {d.frames_used} used of {d.frames_total}; "
+                  f"GOOD frames {d.good_frames}, NECK frames {d.neck_frames}",
+                  f"seen (weighted frames): {d.seen or '-'}", f"views: {d.views or '-'}", ""]
+        for r in frame_rows:
+            feat_txt = view_features.short_text(r["feat"]) + f" dark%{r['feat']['dark_pct']:.1f} red%{r['feat']['red_pct']:.1f}" if r["feat"] else "(no mask)"
+            detail.append(f"+{r['t']:6.0f} ms  CNN {str(r['cnn']):<12} {r['cnn_conf']:.2f}  YOLO {str(r['yolo']):<12} {r['yolo_conf']:.2f}  "
+                          f"{r['view']:<5}{' EDGE' if r['edge_cut'] else ''}  {feat_txt}")
+        self.shared_state.add_decision(trk.id, label, f"{d.frames_used}f", relay or 0, count_keys, "\n".join(detail))
+        self.cashew_log.write({
+            "id": trk.id, "roi": rid, "frames": d.frames_total, "frames_used": d.frames_used, "result": d.result, "reason": d.reason,
+            "reject": int(d.reject), "good_frames": d.good_frames, "neck_frames": d.neck_frames, "seen": d.seen, "votes": d.votes,
+            "views": d.views, "cnn_sw_votes": sw_votes, "length_px": length_px, "width_px": width_px, "area_px": top("area_px"),
+            "length_mm": (length_px / px_per_mm) if length_px else "", "width_mm": (width_px / px_per_mm) if width_px else "",
+            "L": med("L"), "a": med("a"), "b": med("b"), "dark_pct_max": top("dark_pct"), "red_pct_max": top("red_pct"),
+            "spots_max": top("spots"), "speed_px_ms": speed if speed is not None else "", "t_cross_ms": t_cross if t_cross is not None else "",
+            "grade": grade, "relay": relay or "", "fire": fire_result, "late": "",
+        }, frames=frame_rows)
+
+    def _draw_track(self, frame, trk, grading):
+        x1, y1, x2, y2 = [int(v) for v in trk.box]
+        cv2.circle(frame, (int(trk.cx), int(trk.cy)), 5, (255, 255, 255), -1)
+        if trk.decided:
+            relay = trk.info.get("relay")
+            cv2.rectangle(frame, (x1, y1), (x2, y2), FIRE_COLOR, 3)
+            cv2.putText(frame, f"{trk.id} {str(trk.info.get('label', ''))[:24]} {'R%d' % relay if relay else '(NO RELAY)'}",
+                        (x1, max(12, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, FIRE_COLOR, 2)
+            return
+        last = trk.info.get("last") or {}
+        name = last.get("cnn") or last.get("yolo") or "?"
+        conf = last.get("cnn_conf") if last.get("cnn") else last.get("yolo_conf", 0.0)
+        cid = self.registry.id_for(name)
+        colour = self.get_color_for_class(cid if cid is not None else 0)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 1 if trk.missed else 2)
+        text = f"{trk.id} {str(name).upper()[:12]} {conf:.2f} {last.get('view', '')}" + (" (PRED)" if trk.missed else "")
+        cv2.putText(frame, text, (x1, max(12, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, colour, 2)
+        if last.get("feat") and not trk.missed and grading.get("views", {}).get("show_values", True):
+            cv2.putText(frame, view_features.short_text(last["feat"]), (x1, y2 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
     def _get_size_data(self, length: float, width: float, cfg: dict, track_id: int) -> Tuple[Optional[int], str]:
         prefix = "T1_" if track_id == 1 else "T2_"
@@ -1764,7 +1711,7 @@ class App(tk.Tk):
         nav_frm.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 15))
         nav_frm.pack_propagate(False)
         
-        nav_items = ["Home", "Pneumatic", "Colour Size", "Vision ROI", "Teaching CNN", "Dataset Capture", "Teaching YOLO", "AI Model Select", "Test Console", "Network"]
+        nav_items = ["Home", "Pneumatic", "Sorting Logic", "Colour Size", "Vision ROI", "Teaching CNN", "Dataset Capture", "Teaching YOLO", "AI Model Select", "Test Console", "Network"]
         self.nav_buttons = {}
         for item in nav_items:
             icon_img = self.nav_icons.get(item)
@@ -1898,10 +1845,11 @@ class App(tk.Tk):
         cols = ("time", "track", "label", "conf", "act")
         self.fire_tree = ttk.Treeview(tree_frame, columns=cols, show='headings', height=18)
         self.fire_tree.heading("time", text="TIME"); self.fire_tree.column("time", width=70, anchor='center')
-        self.fire_tree.heading("track", text="TRK"); self.fire_tree.column("track", width=50, anchor='center')
-        self.fire_tree.heading("label", text="CLASS"); self.fire_tree.column("label", width=120, anchor='center')
-        self.fire_tree.heading("conf", text="CONF"); self.fire_tree.column("conf", width=60, anchor='center')
-        self.fire_tree.heading("act", text="ACT"); self.fire_tree.column("act", width=50, anchor='center')
+        self.fire_tree.heading("track", text="ID"); self.fire_tree.column("track", width=90, anchor='center')
+        self.fire_tree.heading("label", text="RESULT"); self.fire_tree.column("label", width=170, anchor='w')
+        self.fire_tree.heading("conf", text="FRAMES"); self.fire_tree.column("conf", width=55, anchor='center')
+        self.fire_tree.heading("act", text="RELAY"); self.fire_tree.column("act", width=50, anchor='center')
+        self.fire_tree.bind("<Double-1>", self._show_decision_detail)     # frame-by-frame votes of that cashew
 
         tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.fire_tree.yview)
         self.fire_tree.configure(yscrollcommand=tree_scroll.set)
@@ -2255,7 +2203,9 @@ class App(tk.Tk):
         sort_canvas.pack(side="left", fill="both", expand=True)
         sort_scroll.pack(side="right", fill="y")
         
-        ttk.Label(sort_inner, text="MULTI-FRAME PRIORITY", style="Title.TLabel").pack(anchor="w", pady=(0,10))
+        self._build_grading_section(sort_inner)
+
+        ttk.Label(sort_inner, text="COMBINATION RULES (classes seen together -> final)", style="Title.TLabel").pack(anchor="w", pady=(0,10))
         classes = ["Any", "Good", "UPW", "PKW", "White", "Defect_Skin"] + self.all_class_names
         classes = list(set(classes))
         
@@ -3786,6 +3736,11 @@ except Exception as e:
         line_grid.columnconfigure(0, weight=1); line_grid.columnconfigure(1, weight=1)
         ttk.Button(line_grid, text="Set Decision Line", style="Primary.TButton", command=lambda: self._set_phase("LINE_SET_MODE")).grid(row=0, column=0, padx=5, pady=5, sticky="ew")
         ttk.Button(line_grid, text="Reset Line", command=self.shared_state.reset_line).grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        self.link_lines_var = tk.BooleanVar(value=self.shared_state.link_lines)
+        tk.Checkbutton(p_vis, text="One line for both ROIs (untick to set a line per ROI: click or drag inside that ROI)",
+                       variable=self.link_lines_var, command=lambda: self.shared_state.set_link_lines(self.link_lines_var.get()),
+                       bg=surf, fg=text, selectcolor=light, activebackground=surf, activeforeground=text, font=("Roboto", 9),
+                       anchor="w", wraplength=430, justify="left").pack(fill=tk.X)
 
         man_frm = tk.Frame(p_vis, bg=surf)
         man_frm.pack(fill=tk.X, pady=5)
@@ -4497,10 +4452,10 @@ except Exception as e:
             self.shared_state.phase = "READY"
         elif ph == "READY":
             st = self.shared_state.get_processing_state()
-            if st["roi1"] and st["roi2"] and st["line_pos"] is not None:
+            if st["roi1"] and st["roi2"] and st["line_pos"] is not None and st["line_pos2"] is not None:
                 self.shared_state.phase = "RUNNING"
             else:
-                messagebox.showwarning("Incomplete", "Please draw ROI1, ROI2 and set Decision Line in Vision Setup.")
+                messagebox.showwarning("Incomplete", "Please draw ROI1, ROI2 and set the Decision Line (of both ROIs when they are not linked) in Vision Setup.")
 
     def _on_mouse(self, event):
         if not self.current_video_geometry: return 
@@ -4562,6 +4517,10 @@ except Exception as e:
             for row in current_fires:
                 self.fire_tree.insert("", "end", values=row)
             self._last_fires_state = list(current_fires)
+
+        self._grading_tick = getattr(self, "_grading_tick", 0) + 1
+        if self._grading_tick % 10 == 0 and hasattr(self, "lbl_view_live"):
+            self._refresh_grading_live()
 
         if hasattr(self, 'lbl_prod_count'):
             det_cnt = self.shared_state.get_detected_count()
@@ -4640,6 +4599,200 @@ except Exception as e:
         ttk.Button(edit_row, text="Delete Selected", command=self._ann_delete, style="Danger.TButton").pack(side=tk.LEFT)
         ttk.Button(edit_row, text="START TRAINING", style="Success.TButton", command=self._start_yolo_train).pack(side=tk.RIGHT, padx=10)
         
+
+    # ------------------------------------------------------------------ grading rules (step c1)
+    def _build_grading_section(self, parent):
+        """Voting limits, priority order, view limits, belt colour, tracker and live values."""
+        surf, light, text, muted = self.colors["surface"], self.colors["surface_light"], self.colors["text"], self.colors["text_muted"]
+        g = self.shared_state.grading
+        self.grading_vars = {}
+
+        def entry_row(frame, section, key, label, row, col=0):
+            tk.Label(frame, text=label, bg=surf, fg=text, font=("Roboto", 9), anchor="w").grid(row=row, column=col, sticky="w", padx=(0, 6), pady=2)
+            var = tk.StringVar(value=f"{g[section].get(key, ''):g}")
+            tk.Entry(frame, textvariable=var, width=7, bg=light, fg=text, insertbackground=text, bd=0, font=("Roboto", 10)).grid(row=row, column=col + 1, sticky="w", pady=2)
+            self.grading_vars[(section, key)] = var
+
+        def check(label, var):
+            tk.Checkbutton(parent, text=label, variable=var, bg=surf, fg=text, selectcolor=light, activebackground=surf,
+                           activeforeground=text, font=("Roboto", 9), anchor="w", wraplength=400, justify="left").pack(fill=tk.X)
+
+        ttk.Label(parent, text="GRADING RULES", style="Title.TLabel").pack(anchor="w", pady=(0, 4))
+        tk.Label(parent, text="One decision per cashew at its Decision line. A class is \"seen\" with enough frames at or above its confidence.",
+                 bg=surf, fg=muted, font=("Roboto", 9), wraplength=410, justify="left").pack(anchor="w")
+
+        vote = tk.Frame(parent, bg=surf); vote.pack(fill=tk.X, pady=6)
+        for row, (key, label) in enumerate((
+                ("defect_conf", "Defect: confidence at least (0-1)"), ("defect_min_frames", "Defect: in at least N frames"),
+                ("good_conf", "GOOD: confidence at least (0-1)"), ("good_min_frames", "GOOD: in at least N frames"),
+                ("neck_min_frames", "GOOD: NECK view in at least M frames (0 = off)"),
+                ("neck_weight", "TESTA vote from a NECK frame counts as"),
+                ("rejection_conf", "REJECTION (YOLO): confidence at least"), ("rejection_min_frames", "REJECTION (YOLO): in at least N frames"))):
+            entry_row(vote, "voting", key, label, row)
+        self.single_defect_var = tk.BooleanVar(value=bool(g["voting"].get("single_defect_blocks_good", True)))
+        check("One defect frame (below N) blocks GOOD -> Undefined", self.single_defect_var)
+
+        ttk.Label(parent, text="PRIORITY (highest first)", style="Header.TLabel").pack(anchor="w", pady=(12, 4))
+        prio = tk.Frame(parent, bg=surf); prio.pack(fill=tk.X)
+        self.priority_list = tk.Listbox(prio, height=10, width=22, bg=light, fg=text, selectbackground=self.colors["info"], bd=0,
+                                        highlightthickness=0, font=("Roboto", 10), exportselection=False)
+        for name in g["priority"]:
+            self.priority_list.insert(tk.END, name)
+        self.priority_list.pack(side=tk.LEFT)
+
+        def move(step):
+            sel = self.priority_list.curselection()
+            if not sel or not (0 <= sel[0] + step < self.priority_list.size()):
+                return
+            i = sel[0]
+            name = self.priority_list.get(i)
+            self.priority_list.delete(i)
+            self.priority_list.insert(i + step, name)
+            self.priority_list.selection_set(i + step)
+        side = tk.Frame(prio, bg=surf); side.pack(side=tk.LEFT, padx=8, anchor="n")
+        ttk.Button(side, text="UP", command=lambda: move(-1)).pack(fill=tk.X, pady=2)
+        ttk.Button(side, text="DOWN", command=lambda: move(1)).pack(fill=tk.X, pady=2)
+        tk.Label(side, text="Before this list:\nDOUBLE, REJECTION\n-> reject relay.\nSkin + other defect\n-> UPW.", bg=surf, fg=muted,
+                 font=("Roboto", 8), justify="left").pack(anchor="w", pady=(6, 0))
+
+        ttk.Label(parent, text="VIEW LIMITS (empty = not used)", style="Header.TLabel").pack(anchor="w", pady=(12, 2))
+        tk.Label(parent, text="A frame is NECK, BACK or TOP when all filled limits of that view hold (checked in this order), otherwise OTHER. "
+                              "The letters are the values drawn under each cashew.",
+                 bg=surf, fg=muted, font=("Roboto", 9), wraplength=410, justify="left").pack(anchor="w")
+        grid = tk.Frame(parent, bg=surf); grid.pack(fill=tk.X, pady=4)
+        tk.Label(grid, text="", bg=surf).grid(row=0, column=0)
+        for c, view in enumerate(view_features.VIEWS):
+            tk.Label(grid, text=f"{view} min / max", bg=surf, fg=self.colors["info"], font=("Roboto", 8, "bold")).grid(row=0, column=1 + 2 * c, columnspan=2)
+        self.view_vars = {}
+        for r, (name, (letter, description)) in enumerate(view_features.FEATURES.items(), start=1):
+            tk.Label(grid, text=f"{letter} {name}", bg=surf, fg=text, font=("Roboto", 9), anchor="w").grid(row=r, column=0, sticky="w", padx=(0, 4))
+            for c, view in enumerate(view_features.VIEWS):
+                limits = (g["views"]["rules"].get(view) or {}).get(name) or [None, None]
+                for k in (0, 1):
+                    var = tk.StringVar(value="" if limits[k] is None else f"{limits[k]:g}")
+                    tk.Entry(grid, textvariable=var, width=5, bg=light, fg=text, insertbackground=text, bd=0, font=("Roboto", 9)).grid(row=r, column=1 + 2 * c + k, padx=1, pady=1)
+                    self.view_vars[(view, name, k)] = var
+        self.show_values_var = tk.BooleanVar(value=bool(g["views"].get("show_values", True)))
+        check("Draw the values under each cashew", self.show_values_var)
+
+        ttk.Label(parent, text="LIVE VALUES", style="Header.TLabel").pack(anchor="w", pady=(12, 2))
+        self.lbl_view_live = tk.Label(parent, text="", bg=surf, fg=self.colors["warning"], font=("Roboto Mono", 9), justify="left", anchor="w", wraplength=410)
+        self.lbl_view_live.pack(fill=tk.X)
+        self.lbl_result_counts = tk.Label(parent, text="", bg=surf, fg=text, font=("Roboto", 9), justify="left", anchor="w", wraplength=410)
+        self.lbl_result_counts.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(parent, text="RESET COUNTERS", command=self.shared_state.reset_result_counts).pack(anchor="w", pady=4)
+
+        ttk.Label(parent, text="BELT COLOUR (cashew mask)", style="Header.TLabel").pack(anchor="w", pady=(12, 2))
+        seg = tk.Frame(parent, bg=surf); seg.pack(fill=tk.X)
+        for row, (key, label) in enumerate((("blue_h_min", "Belt hue from (0-179)"), ("blue_h_max", "Belt hue to"),
+                                            ("blue_s_min", "Belt saturation at least"), ("dark_v_max", "Dark (gap) brightness up to"),
+                                            ("min_area_px", "Smallest cashew area (px)"), ("edge_margin_px", "Cut-off: box within px of ROI edge"))):
+            entry_row(seg, "segmentation", key, label, row)
+
+        def teach():
+            if messagebox.askyesno("Teach belt colour", "The belt must be EMPTY and lit as in production.\n\nTeach the belt colour from the picture now?"):
+                with self.shared_state.lock:
+                    self.shared_state.teach_belt_requested = True
+                    self.shared_state.teach_belt_message = "Teaching..."
+        ttk.Button(parent, text="TEACH BELT COLOUR (empty belt)", command=teach).pack(anchor="w", pady=4)
+        self.lbl_teach_belt = tk.Label(parent, text="", bg=surf, fg=muted, font=("Roboto", 9), justify="left", anchor="w", wraplength=410)
+        self.lbl_teach_belt.pack(fill=tk.X)
+
+        ttk.Label(parent, text="TRACKER", style="Header.TLabel").pack(anchor="w", pady=(12, 2))
+        trk = tk.Frame(parent, bg=surf); trk.pack(fill=tk.X)
+        for row, (key, label) in enumerate((("max_step_px", "Largest step per frame, speed unknown (px)"), ("gate_extra_px", "Allowed error around prediction (px)"),
+                                            ("speed_factor", "... plus this x predicted step"), ("back_tol_px", "Backward tolerance (px)"),
+                                            ("max_lateral_px", "Sideways limit (px)"), ("hold_ms", "Keep a missed cashew's ID for (ms)"))):
+            entry_row(trk, "tracker", key, label, row)
+
+        self.old_filter_var = tk.BooleanVar(value=bool(self.shared_state.opencv_filter.get("enabled", False)))
+        check("Old dark-spot filter for CNN SW / WHITE_DW (Colour Size page values)", self.old_filter_var)
+        self.frame_log_var = tk.BooleanVar(value=bool(g["frame_log"].get("enabled", True)))
+        check("Per-frame log (logs/frames_*.jsonl, kept 7 days)", self.frame_log_var)
+
+        ttk.Button(parent, text="APPLY GRADING SETTINGS", style="Primary.TButton", command=self._apply_grading_settings).pack(fill=tk.X, pady=(10, 2))
+        self.lbl_grading_status = tk.Label(parent, text="", bg=surf, fg=muted, font=("Roboto", 9), anchor="w", wraplength=410, justify="left")
+        self.lbl_grading_status.pack(fill=tk.X, pady=(0, 20))
+
+    def _apply_grading_settings(self):
+        g = copy.deepcopy(self.shared_state.grading)
+        ints = {"defect_min_frames", "good_min_frames", "neck_min_frames", "neck_weight", "rejection_min_frames",
+                "blue_h_min", "blue_h_max", "blue_s_min", "dark_v_max", "min_area_px", "edge_margin_px"}
+        try:
+            for (section, key), var in self.grading_vars.items():
+                value = float(var.get())
+                if value < 0 or (key.endswith("_conf") and value > 1):
+                    raise ValueError(f"{key}: {var.get()}")
+                if key in ints:
+                    if value != int(value):
+                        raise ValueError(f"{key} must be a whole number")
+                    value = int(value)
+                g[section][key] = value
+            if g["voting"]["neck_weight"] < 1 or g["voting"]["defect_min_frames"] < 1 or g["voting"]["good_min_frames"] < 1 or g["voting"]["rejection_min_frames"] < 1:
+                raise ValueError("frame counts and the NECK weight must be at least 1")
+            if g["segmentation"]["blue_h_min"] >= g["segmentation"]["blue_h_max"] or g["segmentation"]["blue_h_max"] > 179:
+                raise ValueError("belt hue: from must be below to, at most 179")
+            rules = {view: {} for view in view_features.VIEWS}
+            for view in view_features.VIEWS:
+                for name in view_features.FEATURES:
+                    lo, hi = (self.view_vars[(view, name, k)].get().strip() for k in (0, 1))
+                    if lo or hi:
+                        limits = [float(lo) if lo else None, float(hi) if hi else None]
+                        if limits[0] is not None and limits[1] is not None and limits[0] > limits[1]:
+                            raise ValueError(f"{view} {name}: min is above max")
+                        rules[view][name] = limits
+        except ValueError as e:
+            messagebox.showerror("Grading settings", f"Not applied. Wrong value: {e}")
+            return
+        g["voting"]["single_defect_blocks_good"] = bool(self.single_defect_var.get())
+        g["priority"] = list(self.priority_list.get(0, tk.END))
+        g["views"]["rules"] = rules
+        g["views"]["show_values"] = bool(self.show_values_var.get())
+        g["frame_log"]["enabled"] = bool(self.frame_log_var.get())
+        with self.shared_state.lock:
+            self.shared_state.opencv_filter["enabled"] = bool(self.old_filter_var.get())
+        self.shared_state.set_grading(g)
+        self.processing_thread.cashew_log.frames_enabled = g["frame_log"]["enabled"]
+        used = [view for view in view_features.VIEWS if rules[view]]
+        note = "" if "NECK" in used or g["voting"]["neck_min_frames"] == 0 else "  NOTE: NECK has no limits, so no cashew can become GOOD while M is above 0."
+        self.lbl_grading_status.config(text=f"Applied {datetime.now().strftime('%H:%M:%S')}. Views with limits: {', '.join(used) or 'none'}.{note}",
+                                       fg=self.colors["warning"] if note else self.colors["success"])
+        log.info("Grading settings applied: %s", g)
+
+    def _refresh_grading_live(self):
+        ss = self.shared_state
+        with ss.lock:
+            live, speed, teach_msg = dict(ss.view_live), dict(ss.lane_speed), ss.teach_belt_message
+            counts = dict(ss.result_counts)
+            seg = dict(ss.grading["segmentation"])
+        px_per_mm = float(ss.size_config.get("px_per_mm", 10.0)) or 10.0
+        self.lbl_view_live.config(text="\n".join(
+            f"ROI {r}: {live[r] or '-'}\n       lane speed {speed[r] * 1000:.0f} px/s = {speed[r] * 1000 / px_per_mm:.0f} mm/s at {px_per_mm:g} px/mm" for r in (1, 2)))
+        total = sum(n for k, n in counts.items() if not k.startswith("UNDEFINED: "))
+        self.lbl_result_counts.config(text=f"Decided: {total}   " + "   ".join(f"{k} {n}" for k, n in sorted(counts.items())))
+        if teach_msg != self.lbl_teach_belt.cget("text"):
+            self.lbl_teach_belt.config(text=teach_msg)
+            if teach_msg.startswith("Belt colour taught"):
+                for key in ("blue_h_min", "blue_h_max", "blue_s_min"):
+                    self.grading_vars[("segmentation", key)].set(f"{seg[key]:g}")
+
+    def _show_decision_detail(self, _event=None):
+        """Double click on a history row: the frame-by-frame votes of that cashew."""
+        sel = self.fire_tree.selection()
+        if not sel:
+            return
+        track_id = str(self.fire_tree.item(sel[0])["values"][1])
+        with self.shared_state.lock:
+            detail = self.shared_state.recent_decisions.get(track_id)
+        if not detail:
+            return
+        win = tk.Toplevel(self)
+        win.title(f"Cashew {track_id}")
+        win.geometry("1150x420")
+        box = tk.Text(win, bg=self.colors["surface"], fg=self.colors["text"], font=("Roboto Mono", 9), wrap="none")
+        box.insert("1.0", detail)
+        box.config(state="disabled")
+        box.pack(fill=tk.BOTH, expand=True)
 
     def _build_colour_size_page(self):
         """Build the dedicated Colour & Size settings page (OpenCV Filter + Size Logic)."""
@@ -4894,6 +5047,8 @@ except Exception as e:
             self.camera_thread.join(timeout=1.0)
         if hasattr(self, 'processing_thread') and self.processing_thread.is_alive():
             self.processing_thread.join(timeout=1.0)
+        if hasattr(self, 'processing_thread'):
+            self.processing_thread.cashew_log.stop()
             
         print("[SYSTEM] Shutdown complete.")
         self.destroy()

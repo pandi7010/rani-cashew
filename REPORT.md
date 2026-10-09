@@ -4,6 +4,70 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-09 (2): Step (c1) done - tracking, views, voting, grading rules, log
+
+### What changed
+
+| Area | Change |
+|---|---|
+| `segmentation.py` (new) | Cashew mask by blue-background removal (belt hue band + dark roller gaps removed). TEACH BELT COLOUR reads the band from an empty belt. A box touching the ROI edge is a cut-off cashew: tracked, but it does not vote and is not measured. |
+| `lane_tracker.py` (new) | One tracker and one ID series per ROI (`R1-000123`, `R2-000045`). Position = mask centroid, speed in px/ms along the belt, all tracks and detections paired at once (Hungarian), no backward match, sideways limit, a missed cashew keeps its ID for a set time. Replaces the old greedy tracker. |
+| `view_features.py` (new) | Per frame: aspect ratio, solidity, deepest bay, hollow share, hollow offset, symmetry, texture; also L*, a*, b*, dark %, red % and spot count (logged only). View = TOP / BACK / NECK / OTHER from limits **you** set; no limit is built in. Values are drawn under every cashew. |
+| `decision.py` (new) | The rules of PLAN 3.4 as one pure function: Double -> REJECTION (YOLO class, 0.50 in 2 frames) -> combination rules -> UPW (seen, or skin + another defect) -> priority list -> GOOD (3 frames at 0.80 and NECK in M frames) -> Undefined. NECK weight 2 for TESTA / TESTA SMALL. |
+| `cashew_log.py` (new) | `logs/cashews_YYYYMMDD.csv` (one row per cashew) and `logs/frames_YYYYMMDD.jsonl` (frame-by-frame, deleted after 7 days). |
+| `cashew_cnn_grader.py` | Frame loop rewritten around the above: every frame keeps the YOLO class **and** the CNN class; ONE decision when the centroid crosses the line; ONE fire. Relay 1 / 21 for REJECTION, Undefined, not rolled and classes without a relay. |
+| Decision lines | One line per ROI. Vision ROI page: "One line for both ROIs" is ticked at start (as before); untick it and click or drag inside a ROI to set that ROI's line. |
+| Sorting Logic page (now in the left menu) | Voting limits, priority order (UP / DOWN), view limits grid, live values and lane speed per ROI, result counters, belt colour values + TEACH, tracker values, old dark-spot filter switch (default OFF), APPLY GRADING SETTINGS. |
+| History (Home) | Columns are now ID, RESULT, FRAMES, RELAY. Double click a row for the frame-by-frame votes of that cashew. |
+| Config | New block `grading` in `pneumatic_config.json` (written the first time the program saves). Nothing old is removed. |
+
+Not in this step, as planned: SW/WW colour and the new size tables (c2), relay distances / centre fire / LATE (c3), double kernel and auto capture (d). Until then a GOOD cashew uses the old size table and mapping, and fire timing uses the old delay table.
+
+### Tested
+
+- `ast` check on all files; **83 unit tests pass** (45 new: tracker, decision rules, mask, views, log, config).
+- Tracker tests: one rolling cashew keeps one ID with a jittering centroid; two neighbours 150 px apart never swap or share an ID; missed frames keep the ID; a cashew behind is never taken for the one in front; separate IDs per ROI; both flow orientations.
+- Whole grading loop on a **simulated belt** (your four sample crops pasted on a blue striped background, 5 cashews, both ROIs, real YOLO + CNN): 5 cashews -> 5 IDs, 5 decisions, 5 reject-relay requests, all DRY-RUN, 0 pulses to the fake PLC, CSV and frame log written.
+- Whole program with the window hidden, fake PLC, temporary config: all pages build, DRY-RUN ON and MASTER EJECTOR OFF at start, settings applied and saved, a wrong value is refused, per-ROI line set / dragged / linked again, counters and live values update, belt teach works. The real config was not touched by the tests.
+
+### Not tested (needs the machine or a recording)
+
+- **Real cashews.** No recording exists yet, so: tracker values (step, sideways limit, hold time) are untuned; the ByteTrack / BoT-SORT comparison is not done; view limits are empty.
+- Real valves: none fired, the PLC was never contacted.
+
+### Things you must know
+
+1. **With the start settings nothing can become GOOD yet.** The view limits are empty, so every frame is OTHER, NECK is never seen, and with M = 1 every clean cashew is "Undefined: not_rolled" -> reject relay. Either set NECK limits on the Sorting Logic page, or set M to 0 while tuning.
+2. **Views, measured on your four frames:** outline values still cannot split NECK from BACK. "Red %" (testa colour inside the mask) was 0.7 and 0.5 on the two clean frames, 7.2 and 17.5 on the two frames with testa: promising for measuring skin, but it does not tell a clean NECK from BACK. I expect the view classifier (step f) to be needed for NECK.
+3. **YOLO class is noisy.** On the simulated belt YOLO called the clean sample cashew DW1 (0.87) in some frames and REJECTION often enough to reject it. The simulation uses small upscaled crops, so this is a warning, not a result. Please check REJECTION counts on real good cashews first; the YOLO class of every frame is in the history detail and in the frame log.
+4. **Spot count** from image processing is not usable yet (8 "spots" on a clean frame from surface texture). Logged only.
+5. **"No defect in any frame":** one defect frame below N is not a defect, but it blocks GOOD -> Undefined. That follows the prompt literally and can be switched off on the page. Tell me if you want it off by default.
+6. A cashew first seen after its line gets "Undefined: first_seen_after_line", is counted, and is **not fired** (no crossing time). Step (c3) can fire it by position.
+7. The per-class confidence sliders and "defect allowances" of the old logic are no longer used by grading; the voting limits replace them.
+8. UPW has no relay now, so UPW goes to the reject relay as "UNDEF no relay (UPW)" until you give the mapping.
+9. Belt colour: the default hue band 95-135 fits the real belt (the live camera read 106-122 during a test).
+10. `pneumatic_config.json` was re-saved by your own run of the grader at 22:10 (camera block and key order); I committed it as it is.
+
+### How to test
+
+```
+cd /home/phoenix/Documents/GSN_V21/CNN
+python3 -m unittest discover -s tests
+python3 cashew_cnn_grader.py
+```
+
+1. Pneumatic page: DRY-RUN ON, MASTER EJECTOR OFF (leave them).
+2. Sorting Logic page: with an empty belt press TEACH BELT COLOUR.
+3. START RUNNING with cashews: every cashew should show one ID from entry to the line, with the view values under it. Watch for an ID that changes or two boxes on one cashew.
+4. Home: history rows show ID, result, frames, relay; double click a row for the frame detail.
+5. Make the recording (Vision ROI, RECORD) and tell me the cashew count; I need it for tuning and the tracker comparison.
+
+### Still open
+
+Question 9a (BACK_CUT_OIL = ?, EDGECUT = ?) was left blank in your answer; those classes are left out until you say.
+
+---
+
 ## 2026-10-09: Recovery check after power cut; PLAN v3 (English) written, waiting for approval
 
 - `git fsck` clean, working tree clean, step (b) is committed (`8ff570d`). All `.py` pass the syntax check,
