@@ -29,6 +29,9 @@ SENT, DRY_RUN, MASTER_OFF, PLC_OFFLINE, REFUSED = "SENT", "DRY_RUN", "MASTER_OFF
 # The one wording for every button that fires by hand.
 RESULT_TEXT = {SENT: "pulse sent to the PLC", DRY_RUN: "DRY-RUN: NOT sent to the PLC", PLC_OFFLINE: "PLC OFFLINE: NOT sent",
                REFUSED: "refused (not an ejector relay)", MASTER_OFF: "MASTER EJECTOR off"}
+WRITE_FAIL, READBACK_FAIL = "WRITE_FAIL", "READBACK_FAIL"      # only from check_pulse(), which reads the coil back
+RESULT_TEXT.update({WRITE_FAIL: "PLC write failed", READBACK_FAIL: "PLC read-back wrong"})
+CONVEYOR_RELAY, FEEDER_RELAY = 41, 42               # M140, M141: never driven from here
 MANUAL_LOG_FIELDS = ["time", "action", "relay", "m_address", "pulse_ms", "result", "sent_to_plc", "dry_run", "plc_connected"]
 
 
@@ -156,6 +159,108 @@ class RelayOutput:
                                  "ON" if self.dry_run else "OFF", "YES" if self.is_connected() else "NO"])
         except Exception:
             log.exception("Could not write the manual fire log")
+
+    # ------------------------------------------------------------------ ejector check: pulse with read-back
+    def _protected_addresses(self):
+        """PLC addresses of conveyor and feeder as configured, plus M140 / M141: an ejector must never have them."""
+        out = {140, 141}
+        for relay in (CONVEYOR_RELAY, FEEDER_RELAY):
+            address = self.address_of(relay)
+            if address is not None:
+                out.add(address)
+        return out
+
+    def _write_now(self, relay, state) -> bool:
+        """One coil write, at once and waited for (the PLC controller's own single-relay write)."""
+        return bool(self._plc._write_relay(relay, state))
+
+    def read_back(self, relay):
+        """State of the relay's coil as the PLC reports it (Modbus read): True / False, or None when it cannot be read."""
+        address = self.address_of(relay)
+        if address is None:
+            return None
+        try:
+            driver = self._plc.driver
+            if "Coil" in str(getattr(self._plc, "register_type", "Coil")):
+                values = driver.read_coils(address, 1)
+            else:
+                values = driver.read_registers(address, 1)
+            return None if not values else bool(values[0])
+        except Exception:
+            log.exception("Read-back of relay %s failed", relay)
+            return None
+
+    def check_pulse(self, relay, pulse_ms, wait=time.sleep, action="EJECTOR CHECK"):
+        """One checked pulse of one ejector: write ON, read the coil back, wait, write OFF, read it back.
+        Returns (result, error text). Follows DRY-RUN like every manual fire: then nothing is sent.
+        Result: SENT (both writes confirmed), DRY_RUN, PLC_OFFLINE, REFUSED, WRITE_FAIL or READBACK_FAIL."""
+        error = ""
+        if not is_ejector(relay):
+            result, error = REFUSED, "not an ejector relay (only 1-40)"
+        elif self.address_of(relay) in self._protected_addresses():
+            result, error = REFUSED, f"relay {relay} is mapped to the conveyor / feeder address M{self.address_of(relay)}"
+        elif self.dry_run:
+            wait(pulse_ms / 1000.0)
+            result = DRY_RUN
+        elif not self.is_connected():
+            result, error = PLC_OFFLINE, "PLC not connected"
+        else:
+            result = SENT
+            try:
+                if not self._write_now(relay, True):
+                    result, error = WRITE_FAIL, "write ON failed"
+                else:
+                    seen = self.read_back(relay)
+                    if seen is not True:
+                        result = READBACK_FAIL
+                        error = "no answer when reading the coil after ON" if seen is None else "coil reads OFF after ON was written"
+                    wait(pulse_ms / 1000.0)
+            finally:
+                # Whatever happened above, the relay is switched OFF again.
+                off_ok = False
+                try:
+                    off_ok = self._write_now(relay, False)
+                except Exception:
+                    log.exception("Write OFF of relay %s failed", relay)
+                if not off_ok:
+                    result, error = WRITE_FAIL, (error + "; " if error else "") + "write OFF failed"
+                else:
+                    seen = self.read_back(relay)
+                    if seen is not False and result == SENT:
+                        result = READBACK_FAIL
+                        error = "no answer when reading the coil after OFF" if seen is None else "coil still reads ON after OFF was written"
+            if not self.is_connected():
+                result, error = PLC_OFFLINE, "PLC connection lost during the pulse"
+        with self._lock:
+            if is_ejector(relay):
+                self.wanted[relay] += 1
+                if result == SENT:
+                    self.sent[relay] += 1
+            if result in self.not_sent:
+                self.not_sent[result] += 1
+            self.events.appendleft((time.time(), relay, 0, pulse_ms, result, f"manual: {action}"))
+        self.log_manual(action, relay, pulse_ms, result)
+        return result, error
+
+    def all_ejectors_off(self):
+        """ALL RELAYS OFF NOW: writes OFF to relays 1-40, one by one (never the PLC's all_off(), which also
+        switches conveyor and feeder). Works in DRY-RUN too: switching OFF cannot fire a valve.
+        Returns (number switched off, error text)."""
+        if not self.is_connected():
+            self.log_manual("ALL EJECTORS OFF", "1-40", "", PLC_OFFLINE)
+            return 0, "PLC not connected: nothing could be written"
+        done, failed = 0, []
+        for relay in range(FIRST_EJECTOR, LAST_EJECTOR + 1):
+            try:
+                if self._write_now(relay, False):
+                    done += 1
+                else:
+                    failed.append(relay)
+            except Exception:
+                failed.append(relay)
+        log.warning("ALL EJECTORS OFF: %d of 40 relays written OFF%s", done, f", failed: {failed}" if failed else "")
+        self.log_manual("ALL EJECTORS OFF", "1-40", "", SENT if not failed else WRITE_FAIL)
+        return done, (f"OFF could not be written for relays {failed}" if failed else "")
 
     def test_sequence(self, pulse_ms, interval_ms=120, relays=None, stop_event=None, on_step=None):
         """Manual test: relays 1-40 (or the given ejectors) one after another. Blocks; run it in a thread."""

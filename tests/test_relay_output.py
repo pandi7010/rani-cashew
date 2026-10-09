@@ -171,7 +171,7 @@ class ManualFireRuleTest(unittest.TestCase):
         self.assertEqual(self.plc.pulses, [])
 
     def test_one_wording_for_every_result(self):
-        self.assertEqual(set(ro.RESULT_TEXT), {ro.SENT, ro.DRY_RUN, ro.PLC_OFFLINE, ro.REFUSED, ro.MASTER_OFF})
+        self.assertEqual(set(ro.RESULT_TEXT), {ro.SENT, ro.DRY_RUN, ro.PLC_OFFLINE, ro.REFUSED, ro.MASTER_OFF, ro.WRITE_FAIL, ro.READBACK_FAIL})
         self.assertEqual(ro.RESULT_TEXT[ro.DRY_RUN], "DRY-RUN: NOT sent to the PLC")
 
 

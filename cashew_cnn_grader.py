@@ -38,6 +38,8 @@ import ui_theme as ui
 import engines
 import alarms
 import fire_timing
+import ejector_check
+import ejector_check_ui
 import decision
 import grading_config
 from lane_tracker import LaneTracker, Detection, crossing_time, track_speed
@@ -1719,6 +1721,8 @@ class App(tk.Tk):
         # Every relay pulse of the grader goes through this object (relays 1-40 only, dry-run, master switch).
         self.relay_output = RelayOutput(self.controller)
         self.relay_output.manual_log_dir = app_paths.LOGS_DIR     # every manual fire is logged
+        # Automatic ejector check (tool window): only through relay_output, only when STOPPED with the conveyor OFF.
+        self.ejector_check = ejector_check.EjectorCheck(self.relay_output, log_dir=app_paths.LOGS_DIR, safe_to_run=self._ejector_check_blocked)
         self.processing_thread = ProcessingThread(
             self.model_path, self.registry, self.camera_queue, self.display_queue, 
             self.stop_event, self.shared_state, self.relay_output, self.fire_counts, self.fire_lock,
@@ -1826,7 +1830,8 @@ class App(tk.Tk):
         self.pills = {}
         self._pill_bar = top
         for key, name, short in (("camera", "CAMERA", "CAM"), ("plc", "PLC", "PLC"), ("safety", "SAFETY", "SAFETY"), ("master", "MASTER EJECTOR", "EJECTOR"),
-                                 ("mode", "MODE", "MODE"), ("conveyor", "CONVEYOR", "CONV"), ("state", "STATE", "STATE")):
+                                 ("mode", "MODE", "MODE"), ("conveyor", "CONVEYOR", "CONV"), ("state", "STATE", "STATE"),
+                                 ("check", "EJECTOR CHECK", "EJ CHECK")):
             pill = ui.Pill(top, name, "—", ui.MUTED, short=short)
             pill.pack(side=tk.LEFT, padx=3, pady=13)
             self.pills[key] = pill
@@ -1938,6 +1943,10 @@ class App(tk.Tk):
         self.pills["state"].set("RUNNING" if running else ("STOPPED" if phase == "READY" else "SETUP"),
                                 ui.GOOD if running else (ui.MUTED if phase == "READY" else ui.WARN))
         self.lbl_machine_state.config(text="RUNNING" if running else "STOPPED", fg=ui.GOOD if running else ui.BAD)
+        check_text, check_level = self.ejector_check.last_summary
+        if self.ejector_check.busy():
+            check_text, check_level = f"RUNNING R{self.ejector_check.current_relay or '-'}", "warn"
+        self.pills["check"].set(check_text, {"good": ui.GOOD, "warn": ui.WARN, "bad": ui.BAD}.get(check_level, ui.MUTED))
 
         counts = ss.get_result_counts()
         total = sum(n for key, n in counts.items() if not key.startswith("UNDEFINED: "))
@@ -2712,6 +2721,7 @@ class App(tk.Tk):
         all_row.columnconfigure(0, weight=1); all_row.columnconfigure(1, weight=1)
         ttk.Button(all_row, text="SEQUENCE 1-40", command=self._sequence_all).grid(row=0, column=0, sticky="ew", padx=(0, 3))
         ttk.Button(all_row, text="FIRE 1-40", command=self._fire_all).grid(row=0, column=1, sticky="ew", padx=(3, 0))
+        ttk.Button(pn_controls, text="RUN EJECTOR CHECK 1-40", style="Primary.TButton", command=self._open_ejector_check).pack(fill=tk.X, pady=(8, 0))
 
         pn_canvas = tk.Canvas(p_pneu, bg=self.colors["surface"], highlightthickness=0)
         pn_scroll = ttk.Scrollbar(p_pneu, orient="vertical", command=pn_canvas.yview)
@@ -4316,6 +4326,19 @@ except Exception as e:
         if hasattr(self, 'lbl_test_relay_result'):
             self.lbl_test_relay_result.config(text=text, fg=self.colors["success"] if sent else self.colors["warning"])
 
+    def _ejector_check_blocked(self) -> str:
+        """"" when the ejector check may run; otherwise the reason. Asked before the start and before every relay."""
+        if self.shared_state.phase == "RUNNING":
+            return "The machine is RUNNING."
+        if self.shared_state.is_conveyor_on:
+            return "The conveyor is ON."
+        return ""
+
+    def _open_ejector_check(self):
+        ejector_check_ui.open_ejector_check(self, self.ejector_check, self.relay_output,
+                                            is_stopped=lambda: self.shared_state.phase != "RUNNING",
+                                            conveyor_off=lambda: not self.shared_state.is_conveyor_on)
+
     def _open_plc_diagnostics(self):
         """The PLC diagnostics tool is a separate program that writes straight to the PLC: it does not know
         DRY-RUN or MASTER EJECTOR and can also switch conveyor and feeder. So it is only opened deliberately."""
@@ -4724,6 +4747,8 @@ except Exception as e:
         ph = self.shared_state.get_processing_state()["phase"]
         if ph == "RUNNING":
             self.shared_state.phase = "READY"
+        elif ph == "READY" and self.ejector_check.busy():
+            messagebox.showwarning("Ejector check", "The ejector check is running. Stop it first.")
         elif ph == "READY":
             st = self.shared_state.get_processing_state()
             if st["roi1"] and st["roi2"] and st["line_pos"] is not None and st["line_pos2"] is not None:
@@ -5409,6 +5434,8 @@ except Exception as e:
             self.processing_thread.join(timeout=1.0)
         if hasattr(self, 'processing_thread'):
             self.processing_thread.cashew_log.stop()
+        if hasattr(self, 'ejector_check') and self.ejector_check.busy():
+            self.ejector_check.stop()
             
         print("[SYSTEM] Shutdown complete.")
         self.destroy()

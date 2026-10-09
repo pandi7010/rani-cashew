@@ -26,6 +26,8 @@
 - Every manual fire button is `RelayOutput.test_fire()` (DRY-RUN checked, logged in `logs/manual_fire_*.csv`).
   The PLC diagnostics tool (`innovance_plc.py` run as a program) writes directly to the PLC; the grader only
   opens it with DRY-RUN off, STOPPED and after a confirmation.
+- Ejector check (`ejector_check.py`, window `ejector_check_ui.py`): `RelayOutput.check_pulse()` with read-back;
+  STOPPED and conveyor OFF only. `RelayOutput.all_ejectors_off()` writes OFF to relays 1-40 (allowed in DRY-RUN).
 
 ## Machine facts
 

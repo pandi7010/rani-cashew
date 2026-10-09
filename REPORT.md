@@ -4,6 +4,51 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-09 (8): Automatic EJECTOR CHECK (relays 1-40, 5 pulses each, read-back, operator marks)
+
+### What was built
+
+| Area | Detail |
+|---|---|
+| Where | Pneumatic page, button **RUN EJECTOR CHECK 1-40** (right column, under FIRE 1-40). It opens a tool window. The PLC diagnostics window of (e2b) will get the same button; the existing external diagnostics tool is not changed. |
+| What it does | Relays in order, one at a time, 5 pulses each. Defaults, editable in the window: pulse 100 ms, gap between pulses 400 ms, gap between relays 1000 ms, countdown 3 s. Range: ALL 1-40, ROI 1 (1-20), ROI 2 (21-40) or SINGLE relay; Repeat n times (for one relay or a range). |
+| Every pulse | Write coil ON -> read the coil back -> wait the pulse -> write OFF -> read back. Result per relay: **PLC OK** (all pulses confirmed) or **PLC FAIL** with the text ("write ON failed", "coil reads OFF after ON was written", "coil still reads ON after OFF was written", "no answer when reading the coil ..."). A PLC FAIL on one relay does not stop the check. |
+| Live | Current relay, its M address, "pulse 3 / 5", table of all 40 relays (PLC address, pulses confirmed, PLC result, operator mark). |
+| Operator marks | The relay being checked is selected; keys **1 / 2 / 3** or the buttons mark it AIR OK / NO AIR / WRONG VALVE. Click any row to mark another relay. Unmarked stays "not checked". |
+| Top bar | New pill **EJECTOR CHECK**: NOT RUN, RUNNING R12, ALL OK (hh:mm), 20 OK, DRY-RUN, STOPPED, FAILED R7,R9, AIR FAULT R5, ERROR. |
+| Log | `logs/ejector_check_YYYYMMDD.csv`: time, relay, M address, pulses sent, PLC OK / FAIL, operator mark, error. One line when a relay is finished and one more line each time you mark it (the last line of a relay counts). Each pulse is also in `logs/manual_fire_*.csv`. |
+
+### Safety
+
+- Starts only when the machine is **STOPPED** and the **conveyor is OFF**; both are checked again before every relay (if not, the check ends and all relays are switched OFF). The machine cannot be started while the check runs.
+- Question before every start: "Make sure nobody is at the nozzles and air is ON." with the DRY-RUN state and the duration.
+- **DRY-RUN** exactly as for every manual fire: with DRY-RUN ON nothing is written, the check only simulates, the window shows a yellow "DRY-RUN ON: nothing sent to the PLC" banner (red "DRY-RUN OFF: REAL VALVES" otherwise), and the result is DRY-RUN.
+- Red **STOP / ALL RELAYS OFF NOW**: always works, also in DRY-RUN and when no check runs; it writes OFF to relays 1-40 one by one. (This OFF write is the one thing sent in DRY-RUN: switching OFF cannot fire a valve.)
+- PLC disconnects during the check: the check stops, OFF is written to all relays (as far as possible), ERROR with the relay and pulse.
+- Only through `relay_output.py`: relays 1-40 only; a relay whose address is M140 / M141 is refused; never `fire_all()` / `sequence_all()` / the PLC's `all_off()`. `innovance_plc.py` is unchanged (its single-coil write and Modbus read are used).
+
+### Tested
+
+- `ast` check; **120 unit tests pass** (15 new, fake PLC with coil memory): 40 relays x 5 pulses in order with the exact waits; ON / OFF / read-back per pulse; DRY-RUN writes nothing; ranges and limits; PLC FAIL per relay; disconnect stops the check; STOP switches 1-40 off and leaves M140 / M141 alone; not started / stopped when RUNNING or conveyor ON; operator marks; start in a thread and stop.
+- The real window off-screen with a fake PLC: refused with conveyor ON and while RUNNING; DRY-RUN run of ROI 1 wrote nothing; a run with DRY-RUN off showed PLC FAIL for a relay whose coil does not switch and one whose write fails, marks by key, STOP at relay 30, pill "FAILED R7,R9". Screenshot: `design/ejector_check_window_fake_plc.png`.
+
+### Not tested
+
+- **The real PLC.** In particular the read-back: whether your PLC answers Modbus "read coils" for M100-M139 and whether the PLC program leaves those coils alone. If every relay shows PLC FAIL "no answer when reading the coil" although the valves fire, tell me; then the read function or address needs adjusting.
+- Timing accuracy of the pulses on the real machine (each write and read is one Modbus round trip, so a 100 ms pulse is about 100 ms plus two round trips).
+
+### How to run it on the machine
+
+1. Start the grader. Machine STOPPED, CONVEYOR OFF, air ON.
+2. Pneumatic page -> **RUN EJECTOR CHECK 1-40**.
+3. First with **DRY-RUN ON** (yellow banner): START CHECK, answer YES. No valve may move; all rows end as DRY-RUN.
+4. Then nobody at the nozzles: Pneumatic page, switch **DRY-RUN OFF** (the banner turns red). Try **SINGLE**, relay 1, START CHECK: valve 1 must blow 5 times and the row must say PLC OK 5 / 5. Press **1** (AIR OK), **2** (NO AIR) or **3** (WRONG VALVE).
+5. Then ALL 1-40 (about 2 min 20 s). Watch each valve and press 1 / 2 / 3 while its relay is selected; it is easier with "Gap between relays" at 2000-3000 ms.
+6. Red STOP at any time. Afterwards switch DRY-RUN ON again.
+7. Result: the EJECTOR CHECK pill and `logs/ejector_check_<date>.csv`.
+
+---
+
 ## 2026-10-09 (7): Sorting Logic page full width with SAVE; settings pages without the camera; new start values
 
 ### What changed
