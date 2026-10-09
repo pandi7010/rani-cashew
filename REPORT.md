@@ -4,6 +4,24 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-09: Recovery check after power cut; PLAN v3 (English) written, waiting for approval
+
+- `git fsck` clean, working tree clean, step (b) is committed (`8ff570d`). All `.py` pass the syntax check,
+  all `.json` parse, 38 unit tests pass. Nothing was reset or deleted.
+- `samples/rolling_example/frame1..4.jpg` were already in place (identical to the zip) and are now committed.
+- `FINAL_PROMPT.txt` was only in Downloads; copied into the project and committed.
+- New `PLAN.md` (English) covers the whole final prompt. `PLAN_TAMIL.md` is unchanged. No code changed.
+- Main findings (details in `PLAN.md` sections 1 and 2):
+  - Too few images: OIL 0, DW1 0, WHITE_DW 21, DW2 41; low: REJECTION 93, BROWN 117.
+  - The CNN in use has no REJECTION and no DW1 class.
+  - On the four sample frames the outline (aspect ratio, solidity, convexity defect) cannot tell NECK from
+    BACK; interior features are added to the view check.
+  - The same cashew measures b* 13 to 19 depending on the view, so SW/WW uses the median over the track.
+  - The config maps relay 1 / 21 to UPW, not reject; a new mapping is needed.
+- Open questions: `PLAN.md` section 10 (16 questions). For (c1): 6-11 and a recording with cashews (15).
+
+---
+
 ## 2026-10-08 (3): Step (b) done - camera backends, Bayer check, relay safety wrapper, single-relay test
 
 Commit: see `git log` ("Step (b): Aravis camera backend ..."). The earlier cv2.VideoCapture version (`b910963`) is replaced.

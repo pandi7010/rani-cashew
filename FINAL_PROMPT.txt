@@ -1,0 +1,160 @@
+FINAL PROMPT - GSN_V21 cashew grader. This file replaces every earlier prompt.
+Reply in English (the terminal cannot render Tamil). Keep PLAN.md / CLAUDE.md in English.
+
+#####################################################################
+# 0. CURRENT STATE - check first, do not redo
+#####################################################################
+- Project: /home/phoenix/Documents/GSN_V21/CNN (cashew_cnn_grader.py)
+- Done already: step 0 baseline (12792a7), step (a) bug fixes (b980fb7), step (b) camera_backends.py +
+  relay_output.py (check its commit). Run `git log --oneline` and `git status` and confirm.
+  Do not redo finished steps. If step (b) is not committed, finish and commit it first.
+- UI reference (READ ONLY, never modify): "1.0 TB Volume" drive, CNN/CNN/app/ (07-10, home_ui.py)
+  = yesterday's 5-track machine UI.
+- Sample data (READ ONLY): /home/phoenix/Documents/CNN_final/CNN/dataset/ (crops on blue belt)
+  and samples/rolling_example/frame1..4.jpg in this project.
+
+#####################################################################
+# 1. CAMERA (keep what works)
+#####################################################################
+- USB3 Vision industrial camera via Aravis, BayerGB8, ~70 fps full frame. Keep Aravis + file source.
+  No cv2.VideoCapture webcam backend.
+- Verify the Bayer conversion is correct for BayerGB8 (save one frame, confirm natural colours:
+  blue belt, cream cashew). SW/WW colour sorting depends on it.
+- Auto reconnect, exposure/gain/FPS in UI, keep FFC white calibration.
+- Recording: add a simple way to record raw camera frames (with timestamps) to recordings/ and replay
+  them through the file backend at real speed. Tell me exactly how to record (button, duration, path).
+
+#####################################################################
+# 2. PIPELINE
+#####################################################################
+- Two lanes: ROI1 and ROI2, each with its own Decision line (horizontal or vertical, set in UI, saved).
+- Belt background is blue: segment the cashew by blue-background removal; all colour, size and
+  dark/skin measurements use only the cashew mask.
+- YOLO detects -> CNN classifies every crop in every frame -> tracker gives one stable ID per cashew
+  (separate tracker per ROI) -> multi-frame voting -> ONE decision when the centroid crosses the
+  Decision line -> schedule ONE fire.
+- Ignore detections whose box touches the ROI/frame edge (cut-off crops) for voting, size, capture.
+
+#####################################################################
+# 3. ROLLING CASHEW, TRACKING, VIEWS
+#####################################################################
+- The cashew rolls 360 degrees while moving forward. Box shape/size changes every frame.
+- One cashew = one ID: no ID switch, no two IDs for one cashew, no shared ID for neighbours.
+  Review the current centroid tracker; add motion prediction or compare with ultralytics
+  ByteTrack / BoT-SORT and recommend the best.
+- Views (see samples/rolling_example/):
+    frame1 = TOP view (full kidney "C" shape), frame2 = BACK view (narrow, centre line),
+    frame3 = inner curve with TESTA, frame4 = UNDER-NECK view (inner concave side) with TESTA.
+  Skin usually hides under the neck. With only frames 1-2 this cashew would wrongly be GOOD.
+- Classify every frame's view: TOP / BACK / NECK / OTHER.
+    (a) start: contour shape features (aspect ratio, solidity, convexity-defect depth), values shown
+        live on screen so I can tune; do not guess thresholds.
+    (b) later: small view classifier trained on crops; add a view-labelling mode to the auto-labeler.
+  Give the NECK view extra weight for TESTA / TESTA SMALL.
+- GOOD only if NECK was seen in at least M frames (UI, start M = 1) and no defect in any frame.
+  No defect but NECK never seen (did not roll enough) -> Undefined -> reject relay,
+  capture to captures/not_rolled/.
+
+#####################################################################
+# 4. GRADING RULES
+#####################################################################
+Class definitions:
+- REJECTION : always REJECTION, no confusion. Includes fully dark / black area above 30%. -> reject relay.
+- DOUBLE KERNEL : two cashews stuck together -> reject relay. Detection default OFF; show box
+  measurements live; I set the limits.
+- UPW       : skin together with ANY other defect -> UPW; skin above 30% with no other defect -> UPW.
+- PKW2      : 2 or more black/green spots across the full rotation.
+- PKW1      : exactly ONE black/green spot across the full rotation (PKW2 wins if seen enough).
+- OIL       : yellow with a green tint.
+- BROWN     : looks brown. Light brown is decided by the CNN (taught with images), not a fixed threshold.
+- DW2       : dirty and dark.   DW1 : dirty.
+- TESTA     : skin only, 5-30%, no other defect.   TESTA SMALL : skin only, 1-5%, no other defect.
+- WHITE_DW  : no defect, white, but shrivelled (old / dried).
+- GOOD      : none of the above + NECK seen -> colour -> size grade -> grade relay.
+- Undefined : low CNN confidence, class not mapped, no clear vote, not rolled, size outside every
+  grade -> reject relay.
+
+Priority (highest first), editable in UI:
+  REJECTION = DOUBLE KERNEL = Undefined (reject relay)
+  > UPW > PKW2 > PKW1 > OIL > BROWN > DW2 > DW1 > TESTA > TESTA SMALL > WHITE_DW > GOOD
+
+Voting start values (from the 5-track machine): GOOD >= 3 views at >= 0.80; defect >= 0.50 in at
+least 2 frames. All editable in UI. Use priority_rules (#22) for this.
+
+For now skin %, dark %, spot count come from CNN votes. Tell me whether measuring skin area %,
+dark area % and counting spots with image processing (inside the mask, across frames, without
+counting the same spot twice) would be more reliable and what data you need.
+
+GOOD -> colour -> size:
+- Colour: SW (Scorched/Second White, slightly yellow) vs WW (premium white), decided by colour
+  measurement inside the mask (median over frames, after colour gain/FFC), NOT by the CNN SW class.
+  Propose the colour metric (e.g. LAB b*). SW/WW threshold: slider in UI with live value; I tune it
+  with a teach helper on samples.
+- Size: from the contour (length, width, area in mm via px_per_mm calibration, median/max over
+  frames). Separate grade tables for SW and WW: grade name, min/max, relay. I will give the grades.
+- Keep the old opencv_filter dark-spot filter, default OFF.
+
+History/log per ID: frame-by-frame class + confidence + view, final class, colour value, SW/WW,
+size mm, grade, relay, fire time, LATE flag. Keep per-frame logs 7 days.
+
+#####################################################################
+# 5. SPEED, ENCODER, CENTER FIRE  ("watch and match")
+#####################################################################
+- Relay -> PLC: relay r = Modbus coil M(100 + r - 1) at 192.168.1.88:502.
+  ROI1 = relays 1-20 (relay 1 = reject), ROI2 = relays 21-40 (relay 21 = reject).
+  M140 Conveyor, M141 Feeder: grading logic must NEVER touch them. Never call fire_all()/sequence_all().
+- Relay distance from its Decision line (mm) per relay in UI; default spacing ~220 mm. Relay 20/40 is
+  ~4.4 m away, so speed errors matter: 1% speed error = ~44 mm at the last relay.
+- Speed sources (all three, shown side by side in the UI):
+    1. ENCODER (main, coming soon): mm/pulse, position counter from the PLC. Design an encoder
+       position source now; implement the read once I give the hardware details.
+    2. VISION ("watch"): measure each cashew's forward speed from its track (centroid displacement in
+       mm / frame time) and a smoothed lane speed.
+    3. MANUAL: belt speed in UI (config 300 mm/s), fallback only.
+- MATCH: compare vision speed with encoder speed continuously. If they differ by more than X%
+  (UI, start 5%), show a warning and log it (slip, wrong mm/pulse, wrong px_per_mm). Add a
+  calibration helper that suggests mm/pulse and px_per_mm from the comparison.
+- Fire scheduling: position-based when the encoder is available (fire when the cashew centre reaches
+  relay distance - offsets), time-based from vision speed otherwise.
+- CENTER FIRE: the middle of the air pulse must hit the centre of the cashew:
+    start = time (or encoder position) the centroid reaches the relay - pulse/2 - valve delay
+  Crossing time interpolated from frame timestamps. Pulse (config 50 ms) fixed or from cashew length
+  and speed. Valve delay start 10 ms. Per-relay fine-tune offset (mm/ms) in UI.
+- If the fire time has already passed: do NOT fire; log LATE and show a LATE counter.
+
+#####################################################################
+# 6. AUTO CAPTURE
+#####################################################################
+Undefined, double, not_rolled, low-confidence crops + full frame -> captures/<category>/<date>/,
+file name with time, ID, ROI, CNN class, confidence, view. Saved after colour gain.
+Limit 500 per category per day (UI).
+
+#####################################################################
+# 7. UI
+#####################################################################
+Rebuild the UI in the style of CNN/CNN/app/ (dark blue, cyan accent, top status pills, left menu,
+centre camera, right START/STOP and KPI tiles, history). Pages/controls:
+class -> relay mapping; grading priority + voting thresholds; SW/WW colour + size grade tables
+(Sorting Logic page, #16); px_per_mm calibration; ROI1/ROI2/Decision lines; relay distance,
+offset, pulse, valve delay; speed panel (encoder / vision / manual, mismatch warning);
+live count per relay and per grade; Undefined / Double / not_rolled / LATE counters;
+camera settings; recording; MASTER EJECTOR ON/OFF; DRY-RUN; test-fire single relay.
+Branding: later. tcm_magic_wand + TCM Studio copied to external_tools/ (source untouched).
+
+#####################################################################
+# 8. HOW TO WORK
+#####################################################################
+1. First update PLAN (English) with everything above: open questions, data per class
+   (count images per class in both datasets, list classes with too few), your proposals.
+   Commit and STOP for my approval.
+2. Then, one commit per step, stopping after each:
+   (c1) tracking + views + voting + grading rules
+   (c2) colour SW/WW + size grading + px_per_mm calibration
+   (c3) relay mapping + speed (vision + manual, encoder-ready) + match + center fire + LATE
+   (d)  double kernel + auto capture
+   (e)  UI rebuild
+   (f)  training script with train/val split; view classifier
+3. MASTER EJECTOR OFF and DRY-RUN ON at every start. Never fire real relays during tests.
+4. After each step: syntax check, tests, replay test with a recording if available; tell me briefly
+   what changed and how I test it.
+5. Never guess: relay mapping, grade tables, thresholds, distances, encoder details -> ask me.
