@@ -4,6 +4,67 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-10 (1): After the power cut; PART A - DRY-RUN and MASTER EJECTOR removed, pulse buttons fire the real PLC
+
+### Check after the power cut
+
+- `git fsck` clean, history intact (last commit `99d9676`, step e2b). All `.py` parse, all `.json` load. Nothing was reset.
+- Your work since then is on disk and untouched: 1,307 captures labelled into the dataset (they left `cnn_final/golden_crops`,
+  which git shows as deleted files; I did not restore or commit that), new classes KNIEF_MARK and SW, and the model
+  `cnn_Default_20261010_005648.pth` with its `.json` (100 epochs, best epoch 68, validation 85.7 %). Model and result are kept;
+  it is not active (the grader still uses `cashew_color_cnn_new.pth`).
+- Pages of your last prompt. **Done:** Home, Pneumatic, PLC / ejector mapping window, Sorting Logic, Teaching CNN,
+  AI Model Select, Info. **Not rebuilt yet (still the older layout in the new colours):** Colour Size, Vision ROI,
+  Dataset Capture, Teaching YOLO, Network; Programs and the Speed page do not exist yet.
+
+### PART A - what changed
+
+| Area | Change |
+|---|---|
+| DRY-RUN, MASTER EJECTOR | **Removed completely**: switches, top-bar pills, banners, questions, counters, log columns, tests. `relay_output.py` has no such state any more. |
+| The only control | **START / STOP.** RUNNING: grading fires the valves. STOPPED: nothing fires from grading; pulses still waiting for their delay are cancelled and anything ON is switched OFF. The program opens STOPPED and nothing starts it by itself. |
+| How a pulse is written | As the old diagnostics tool does: coil ON, written ON again every 50 ms while the pulse lasts, then OFF. **Grading uses the same engine** (it no longer goes through the PLC controller's own pulse queue), so a pulse that fires from a button fires the same way in production. |
+| Pulse per ejector | New PULSE column in every row (5-2000 ms). "Pulse: set all ejectors" writes one value into every row. Grading and the buttons use the row's value. |
+| Lightning button | Every ejector row on the **Pneumatic page** and in the **mapping window** has one: a click fires that ejector's coil at once with the row's pulse, without a question. Result next to it: `OK hh:mm:ss` or `PLC ERROR ...`. |
+| FIRE ALL, SEQUENCE ALL, ALL RELAYS OFF NOW | In both places. FIRE ALL = ejectors 1-40 at once, SEQUENCE ALL = one after the other; both ask "Make sure nobody is at the nozzles." first. ALL RELAYS OFF NOW always works. |
+| Only when STOPPED | Every manual button is refused while RUNNING ("refused: machine is RUNNING"), also inside `relay_output.py`. |
+| Ejector check | Same rule: real PLC, STOPPED and conveyor OFF, asks first; the coil is held ON for the pulse; read-back as before. |
+| M140 / M141 | Never driven: relays above 40 are refused, an ejector mapped to such an address is refused, the PLC's own all-off is never called. |
+| Log | `logs/manual_fire_YYYYMMDD.csv`: time, action, ejector, M address, pulse, result, sent YES / NO, PLC connected, error. (A file with the older columns is kept as `..._old_HHMMSS.csv`.) |
+| `tools/ui_selftest.py` (new) | The whole program with a fake PLC and a simulated belt, off-screen; photographs every page. This is how I test; it never touches the real PLC. |
+
+### Read this before pressing START on the machine
+
+With DRY-RUN gone, **START makes grading fire real valves at once.** As the settings are now:
+1. Every GOOD cashew goes to the reject ejector A01 / A21 (SIZE_NOT_READY, your rule until sizes are taught).
+2. The delay table is the one calculated for 300 mm/s; the real belt speed is not measured, so pulses may come early.
+3. The active CNN is the old one; your new model is not activated.
+So a first START is a valve and timing trial, not sorting. Use the lightning buttons and the ejector check first.
+
+### Tested (fake PLC only - nothing was written to the real PLC by me)
+
+- `ast` check; 167 unit tests pass. `tests/test_relay_output.py` is rewritten: no DRY-RUN / MASTER left; STOPPED nothing fires
+  from grading; RUNNING fires after the delay and holds the coil ON; STOP cancels what waits; a manual pulse fires at once only
+  when STOPPED; FIRE ALL is 40 single pulses on M100-M139; conveyor / feeder addresses refused; PLC errors reported; ALL RELAYS OFF.
+- Self-test in the real window: lightning button -> coil ON then OFF, "OK"; FIRE ALL asked first and fired 1-40; SEQUENCE ALL
+  stopped by ALL RELAYS OFF NOW; RUNNING on the simulated belt wrote coils for the decisions, a manual pulse was refused, STOP
+  cancelled 3 waiting pulses and left no coil ON; mapping-window lightning button "OK". Screenshots in `design/pages/`.
+
+### Not tested
+
+- **The real PLC and valves.** Whether a pulse written this way fires your valves, and the real pulse length (each write is one
+  Modbus round trip), can only be seen on the machine.
+
+### How to test on the machine
+
+1. Start the grader (it opens STOPPED). Pneumatic page.
+2. Nobody at the nozzles. Click the lightning button of A01: the valve must blow once; the row shows `OK`.
+3. If it shows `PLC ERROR`, read the text in the tools column (not connected / write failed) and tell me.
+4. RUN EJECTOR CHECK 1-40 to go through all ejectors and mark AIR OK / NO AIR / WRONG VALVE.
+5. `logs/manual_fire_<date>.csv` has one line per fire.
+
+---
+
 ## 2026-10-09 (10): Combined ejectors - several classes per ejector, one ejector per class, summary before save
 
 ### What changed

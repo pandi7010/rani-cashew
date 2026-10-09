@@ -13,12 +13,12 @@ def min_safe_fps(lane_speed_px_s: float, max_step_px: float) -> float:
 
 
 def collect(camera_connected: bool, camera_state: str, plc_connected: bool, running: bool, ai_fps: float,
-            min_fps: float, free_gb: Optional[float], missed_rejects: List[str], dry_run: bool) -> List[str]:
+            min_fps: float, free_gb: Optional[float], missed_rejects: List[str]) -> List[str]:
     out = []
     if not camera_connected:
         out.append(f"CAMERA {camera_state} - no pictures from the camera")
     if not plc_connected:
-        out.append("PLC NOT CONNECTED - rejects cannot be ejected" + (" (DRY-RUN is on: nothing would be sent anyway)" if dry_run else ""))
+        out.append("PLC NOT CONNECTED - rejects cannot be ejected")
     if missed_rejects:
         out.append("CONVEYOR STOPPED WITH PENDING REJECTS: " + ", ".join(missed_rejects[-6:]) +
                    "\nThese crossed the line but were not ejected reliably. Remove the cashews between the line and the valves.")

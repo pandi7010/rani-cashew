@@ -89,19 +89,18 @@ class Base(unittest.TestCase):
 
 
 class CheckedPulseTest(Base):
-    def test_dry_run_sends_nothing(self):
-        self.assertEqual(self.out.check_pulse(5, 100, wait=lambda s: None), (ro.DRY_RUN, ""))
+    def test_refused_while_running(self):
+        self.out.is_running = lambda: True
+        self.assertEqual(self.out.check_pulse(5, 100, wait=lambda s: None), (ro.NOT_STOPPED, "machine is RUNNING"))
         self.assertEqual((self.plc.writes, self.plc.reads, self.plc.forbidden), ([], [], []))
 
     def test_on_and_off_are_written_and_read_back(self):
-        self.out.dry_run = False
         self.assertEqual(self.out.check_pulse(5, 100, wait=lambda s: None), (ro.SENT, ""))
-        self.assertEqual(self.plc.writes, [(5, True), (5, False)])
+        self.assertEqual(self.plc.writes, [(5, True), (5, True), (5, False)])       # held ON during the 100 ms pulse
         self.assertEqual(self.plc.reads, [104, 104])
         self.assertFalse(self.plc.coils[104])
 
     def test_failures_are_named_and_the_relay_is_always_switched_off(self):
-        self.out.dry_run = False
         self.plc.stuck_off.add(3)
         self.assertEqual(self.out.check_pulse(3, 100, wait=lambda s: None), (ro.READBACK_FAIL, "coil reads OFF after ON was written"))
         self.assertEqual(self.plc.writes[-1], (3, False))
@@ -116,7 +115,6 @@ class CheckedPulseTest(Base):
         self.assertEqual(self.out.check_pulse(7, 100, wait=lambda s: None)[0], ro.READBACK_FAIL)
 
     def test_conveyor_feeder_and_other_relays_are_refused(self):
-        self.out.dry_run = False
         for relay in (0, 41, 42, 43, 48):
             self.assertEqual(self.out.check_pulse(relay, 100, wait=lambda s: None)[0], ro.REFUSED)
         self.plc.get_relay_address = lambda relay: 140 if relay in (7, 41) else 100 + relay - 1    # a wrong mapping
@@ -126,12 +124,10 @@ class CheckedPulseTest(Base):
         self.assertEqual(self.plc.writes, [])
 
     def test_offline(self):
-        self.out.dry_run = False
         self.plc.connected_flag = False
         self.assertEqual(self.out.check_pulse(2, 100, wait=lambda s: None)[0], ro.PLC_OFFLINE)
 
-    def test_all_ejectors_off_writes_1_to_40_only_also_in_dry_run(self):
-        self.assertTrue(self.out.dry_run)
+    def test_all_ejectors_off_writes_1_to_40_only(self):
         self.plc.coils[139] = self.plc.coils[140] = self.plc.coils[141] = True
         self.assertEqual(self.out.all_ejectors_off(), (40, ""))
         self.assertEqual(self.plc.writes, [(r, False) for r in range(1, 41)])
@@ -144,12 +140,12 @@ class CheckedPulseTest(Base):
 
 class EjectorCheckTest(Base):
     def test_all_40_relays_five_pulses_each_in_order(self):
-        self.out.dry_run = False
         self.check.run(ec.relays_for("ALL"))
         self.assertEqual(self.check.phase, ec.DONE)
         ons = [relay for relay, state in self.plc.writes if state]
-        self.assertEqual(ons, [r for r in range(1, 41) for _ in range(5)])
-        self.assertEqual(len(self.plc.writes), 400)
+        firsts = [relay for (relay, state), (_, before) in zip(self.plc.writes, [(0, False)] + self.plc.writes[:-1]) if state and not before]
+        self.assertEqual(firsts, [r for r in range(1, 41) for _ in range(5)])
+        self.assertEqual(len([w for w in self.plc.writes if not w[1]]), 200)
         self.assertEqual(len(self.plc.reads), 400)
         self.assertEqual({r.status for r in self.check.results.values()}, {ec.PLC_OK})
         self.assertEqual(self.check.results[40].address, 139)
@@ -160,22 +156,13 @@ class EjectorCheckTest(Base):
         self.assertEqual(self.check.last_summary[1], "good")
         # 3 s countdown, then per relay 5 pulses of 0.1 s with 4 gaps of 0.4 s, 1 s between relays
         self.assertEqual(self.waits[:3], [1.0, 1.0, 1.0])
-        self.assertEqual(self.waits[3:12], [0.1, 0.4, 0.1, 0.4, 0.1, 0.4, 0.1, 0.4, 0.1])
-        self.assertEqual(self.waits[12], 1.0)
+        self.assertEqual(self.waits[3:6], [0.05, 0.05, 0.4])               # the pulse is held in two parts, then the gap
+        self.assertAlmostEqual(sum(self.waits[3:17]), 5 * 0.1 + 4 * 0.4)
+        self.assertEqual(self.waits[17], 1.0)
         rows = self.log_rows()
         self.assertEqual(len(rows), 40)
         self.assertEqual((rows[0]["relay"], rows[0]["m_address"], rows[0]["pulses_sent"], rows[0]["plc"], rows[0]["operator_mark"], rows[0]["error"]),
                          ("1", "M100", "5", "PLC OK", "not checked", ""))
-
-    def test_dry_run_only_simulates(self):
-        self.check.run(ec.relays_for("ROI1"))
-        self.assertEqual((self.plc.writes, self.plc.reads), ([], []))
-        self.assertEqual({self.check.results[r].status for r in range(1, 21)}, {ec.DRY})
-        self.assertEqual({self.check.results[r].status for r in range(21, 41)}, {ec.NOT_RUN})
-        self.assertEqual(self.check.message, ec.DRY_RUN_TEXT)
-        self.assertEqual(self.check.last_summary[1], "warn")
-        self.assertTrue(self.check.last_summary[0].startswith("DRY-RUN"))
-        self.assertEqual({r["pulses_sent"] for r in self.log_rows()}, {"0"})
 
     def test_ranges_and_parameters(self):
         self.assertEqual(ec.relays_for("ROI1"), list(range(1, 21)))
@@ -186,12 +173,11 @@ class EjectorCheckTest(Base):
         self.assertEqual(ec.clean_params(None), ec.DEFAULTS)
         self.assertEqual(ec.DEFAULTS, {"pulses": 5, "pulse_ms": 100, "gap_ms": 400, "relay_gap_ms": 1000, "countdown_s": 3})
         self.assertRaises(ValueError, ec.clean_params, {"pulse_ms": 5000})
-        self.out.dry_run = False
         self.check.run(ec.relays_for("SINGLE", 21) * 3, {"pulses": 2, "countdown_s": 0})      # one relay, repeated
-        self.assertEqual([w for w in self.plc.writes if w[1]], [(21, True)] * 6)
+        self.assertEqual({w for w in self.plc.writes}, {(21, True), (21, False)})
+        self.assertEqual(len([w for w in self.plc.writes if not w[1]]), 6)
 
     def test_plc_fail_is_reported_per_relay_and_the_check_goes_on(self):
-        self.out.dry_run = False
         self.plc.stuck_off.add(2)
         self.plc.fail_write.add(4)
         self.check.run([1, 2, 3, 4, 5], {"countdown_s": 0})
@@ -203,19 +189,17 @@ class EjectorCheckTest(Base):
         self.assertIn("FAILED R2,R4", self.check.last_summary[0])
 
     def test_plc_disconnect_stops_the_check(self):
-        self.out.dry_run = False
-        self.plc.disconnect_after_writes = 13                # in the middle of relay 2
+        self.plc.disconnect_after_writes = 18                # in the middle of relay 2
         self.check.run(ec.relays_for("ALL"), {"countdown_s": 0})
         self.assertEqual(self.check.phase, ec.ERROR)
         self.assertIn("PLC disconnected at relay 2", self.check.message)
         self.assertEqual(self.check.results[2].status, ec.PLC_FAIL)
         self.assertEqual(self.check.results[3].status, ec.NOT_RUN)
-        self.assertFalse(any(state for relay, state in self.plc.writes[13:]))    # nothing was switched on afterwards
+        self.assertFalse(any(state for relay, state in self.plc.writes[18:]))    # nothing was switched on afterwards
         self.assertEqual(self.check.last_summary[1], "bad")
 
     def test_stop_ends_the_check_and_switches_everything_off(self):
-        self.out.dry_run = False
-        self.stop_at_wait = 8                                # during relay 1
+        self.stop_at_wait = 9                                # during relay 1
         self.check.run(ec.relays_for("ALL"), {"countdown_s": 0})
         self.assertEqual(self.check.phase, ec.STOPPED)
         self.assertEqual(self.check.results[1].status, ec.UNFINISHED)
@@ -230,7 +214,6 @@ class EjectorCheckTest(Base):
         self.safe[0] = "The conveyor is ON."
         self.assertEqual(self.check.start(ec.relays_for("ALL")), "The conveyor is ON.")
         self.assertEqual(self.check.phase, ec.IDLE)
-        self.out.dry_run = False
         self.safe[0] = ""
         calls = []
 
@@ -244,7 +227,6 @@ class EjectorCheckTest(Base):
         self.assertEqual(sorted({relay for relay, state in self.plc.writes if state}), [1, 2])
 
     def test_operator_marks(self):
-        self.out.dry_run = False
         self.check.run([1, 2, 3], {"countdown_s": 0})
         self.check.mark(1, ec.AIR_OK)
         self.check.mark(2, ec.NO_AIR)
@@ -265,7 +247,8 @@ class EjectorCheckTest(Base):
         check._thread.join(2.0)
         self.assertFalse(check._thread.is_alive())
         self.assertEqual(check.phase, ec.STOPPED)
-        self.assertEqual(self.plc.writes, [(r, False) for r in range(1, 41)])    # DRY-RUN: only the OFF writes of STOP
+        self.assertEqual({relay for relay, state in self.plc.writes if not state}, set(range(1, 41)))    # STOP wrote OFF to every ejector
+        self.assertFalse(any(self.plc.coils.values()))
 
 
 if __name__ == "__main__":

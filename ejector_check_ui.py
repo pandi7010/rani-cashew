@@ -9,7 +9,7 @@ import ejector_check as ec
 import relay_output as ro
 import ui_theme as ui
 
-STATUS_COLOUR = {ec.PLC_OK: ui.GOOD, ec.PLC_FAIL: ui.BAD, ec.DRY: ui.WARN, ec.UNFINISHED: ui.WARN, ec.RUNNING: ui.ACCENT, ec.NOT_RUN: ui.MUTED}
+STATUS_COLOUR = {ec.PLC_OK: ui.GOOD, ec.PLC_FAIL: ui.BAD, ec.UNFINISHED: ui.WARN, ec.RUNNING: ui.ACCENT, ec.NOT_RUN: ui.MUTED}
 MARK_COLOUR = {ec.AIR_OK: ui.GOOD, ec.NO_AIR: ui.BAD, ec.WRONG_VALVE: ui.BAD, ec.NOT_CHECKED: ui.MUTED}
 RANGES = (("ALL 1-40", "ALL"), ("ROI 1  (1-20)", "ROI1"), ("ROI 2  (21-40)", "ROI2"), ("SINGLE", "SINGLE"))
 
@@ -36,7 +36,7 @@ class EjectorCheckWindow(tk.Toplevel):
         self._auto_selected = None
         F = ui.FONT
 
-        # ── head: title, DRY-RUN state ──
+        # ── head: title, machine state ──
         head = tk.Frame(self, bg=ui.PANEL)
         head.pack(fill=tk.X)
         tk.Label(head, text="EJECTOR CHECK", font=(F, ui.F_HEAD, "bold"), fg=ui.TEXT, bg=ui.PANEL).pack(side=tk.LEFT, padx=20, pady=14)
@@ -158,10 +158,7 @@ class EjectorCheckWindow(tk.Toplevel):
             messagebox.showerror("Ejector check", f"Wrong value: {e}", parent=self)
             return
         seconds = params["countdown_s"] + repeat * len(relays) * (params["pulses"] * (params["pulse_ms"] + params["gap_ms"]) + params["relay_gap_ms"]) / 1000.0
-        if self.out.dry_run:
-            mode = f"{ec.DRY_RUN_TEXT}. The check only simulates."
-        else:
-            mode = "DRY-RUN is OFF: the REAL valves will fire."
+        mode = "The REAL valves will fire."
         what = f"relay {relays[0]}" if len(relays) == 1 else f"relays {relays[0]}-{relays[-1]}"
         if not messagebox.askyesno("Ejector check", f"Make sure nobody is at the nozzles and air is ON.\n\n{mode}\n\n"
                                    f"{what}, {params['pulses']} pulses each" + (f", {repeat} times" if repeat > 1 else "") +
@@ -207,13 +204,12 @@ class EjectorCheckWindow(tk.Toplevel):
     def _tick(self):
         if not self.winfo_exists():
             return
-        check, dry = self.check, self.out.dry_run
-        self.lbl_mode.config(text=f"DRY-RUN ON:  {ec.DRY_RUN_TEXT.split(': ')[1]}" if dry else "DRY-RUN OFF:  REAL VALVES",
-                             fg="#1A1300" if dry else "#FFFFFF", bg=ui.WARN if dry else ui.BAD)
+        check = self.check
+        self.lbl_mode.config(text="REAL VALVES", fg="#FFFFFF", bg=ui.BAD)
         stopped, belt_off, plc = self.is_stopped(), self.conveyor_off(), self.out.is_connected()
         self.pill_machine.set("STOPPED" if stopped else "RUNNING", ui.GOOD if stopped else ui.BAD)
         self.pill_conveyor.set("OFF" if belt_off else "ON", ui.GOOD if belt_off else ui.BAD)
-        self.pill_plc.set("ONLINE" if plc else "OFFLINE", ui.GOOD if plc else (ui.WARN if dry else ui.BAD))
+        self.pill_plc.set("ONLINE" if plc else "OFFLINE", ui.GOOD if plc else ui.BAD)
         self.btn_start.set_enabled(not check.busy() and stopped and belt_off)
 
         relay = check.current_relay
@@ -221,8 +217,7 @@ class EjectorCheckWindow(tk.Toplevel):
             self.lbl_progress.config(text=f"Starting in {check.countdown} s ...   stand clear of the nozzles", fg=ui.WARN)
         elif check.phase == ec.RUNNING and relay:
             address = check.results[relay].address
-            self.lbl_progress.config(text=f"Relay {relay}   →   M{address}   •   pulse {check.current_pulse} / {check.pulses}" +
-                                          ("     (DRY-RUN, simulated)" if check.dry_run_at_start else ""), fg=ui.ACCENT)
+            self.lbl_progress.config(text=f"Relay {relay}   →   M{address}   •   pulse {check.current_pulse} / {check.pulses}", fg=ui.ACCENT)
         else:
             colour = {ec.DONE: ui.GOOD, ec.STOPPED: ui.WARN, ec.ERROR: ui.BAD}.get(check.phase, ui.TEXT)
             self.lbl_progress.config(text={ec.IDLE: "Not started.", ec.DONE: "FINISHED", ec.STOPPED: "STOPPED", ec.ERROR: "ERROR"}.get(check.phase, check.phase), fg=colour)
@@ -231,10 +226,10 @@ class EjectorCheckWindow(tk.Toplevel):
         for r, res in check.results.items():
             tree = self.trees[0 if r <= 20 else 1]
             plc_text = res.status
-            tag = {ec.PLC_OK: "ok", ec.PLC_FAIL: "bad", ec.DRY: "warn", ec.UNFINISHED: "warn", ec.RUNNING: "now"}.get(res.status, "idle")
+            tag = {ec.PLC_OK: "ok", ec.PLC_FAIL: "bad", ec.UNFINISHED: "warn", ec.RUNNING: "now"}.get(res.status, "idle")
             if res.mark in (ec.NO_AIR, ec.WRONG_VALVE):
                 tag = "bad"
-            pulses = "" if res.status == ec.NOT_RUN else (f"{res.pulses_ok} / {check.pulses}" if not check.dry_run_at_start else "simulated")
+            pulses = "" if res.status == ec.NOT_RUN else f"{res.pulses_ok} / {check.pulses}"
             values = (r, f"M{res.address}" if res.address is not None else "?", pulses, plc_text, res.mark if res.status != ec.NOT_RUN else "")
             if tuple(str(v) for v in tree.item(str(r), "values")) != tuple(str(v) for v in values) or tree.item(str(r), "tags") != (tag,):
                 tree.item(str(r), values=values, tags=(tag,))

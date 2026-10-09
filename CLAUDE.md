@@ -18,18 +18,19 @@
 
 ## Safety
 
-- Never fire real relays while testing. MASTER EJECTOR is OFF and DRY-RUN is ON at every start.
-- All relay firing goes through `relay_output.py`. Only relays 1-40 may be fired. It never calls the PLC's
-  `fire_all()` / `sequence_all()` (they pulse 48 coils, including conveyor M140 and feeder M141).
-- Grading logic never touches relay 41 (conveyor, M140) or 42 (feeder, M141).
+- **My own tests never contact the real PLC.** Tests and the self-test (`tools/ui_selftest.py`) use a fake PLC.
+- START / STOP is the only control (owner, 2026-10-10: DRY-RUN and MASTER EJECTOR were removed on purpose; do not
+  bring them back). RUNNING = grading fires the valves. STOPPED = nothing fires from grading (waiting pulses are
+  cancelled) and the manual buttons work. The program always opens STOPPED and never starts RUNNING by itself.
+- All ejector driving goes through `relay_output.py`: relays 1-40 only, never an address of M140 (conveyor) /
+  M141 (feeder), never the PLC's `fire_all()` / `sequence_all()` / `all_off()`. A pulse = coil written ON, written
+  ON again while it lasts, then OFF.
+- Manual fire (row lightning buttons, TEST FIRE, FIRE ALL, SEQUENCE ALL, ejector check, mapping window) writes to
+  the real PLC, only when STOPPED, and is logged in `logs/manual_fire_*.csv`. FIRE ALL, SEQUENCE ALL and the
+  ejector check ask "Make sure nobody is at the nozzles" first; a single pulse fires at once.
 - Class / grade -> ejector comes only from the mapping (`relay_mapping.py`): never tie a class name to an ejector
   number in code. Several classes per ejector are allowed; a class is on one ejector per ROI; none -> reject 1 / 21.
 - Do not change `innovance_plc.py` without asking first.
-- Every manual fire button is `RelayOutput.test_fire()` (DRY-RUN checked, logged in `logs/manual_fire_*.csv`).
-  The PLC diagnostics tool (`innovance_plc.py` run as a program) writes directly to the PLC; the grader only
-  opens it with DRY-RUN off, STOPPED and after a confirmation.
-- Ejector check (`ejector_check.py`, window `ejector_check_ui.py`): `RelayOutput.check_pulse()` with read-back;
-  STOPPED and conveyor OFF only. `RelayOutput.all_ejectors_off()` writes OFF to relays 1-40 (allowed in DRY-RUN).
 
 ## Machine facts
 

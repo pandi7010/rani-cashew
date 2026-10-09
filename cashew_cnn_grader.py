@@ -423,6 +423,7 @@ class SharedState:
         self.distances_mm = [0.0]*NUM_ACTUATORS
         self.conveyor_speed_mm_s = 300.0
         self.common_pulse_ms = DEFAULT_ON_MS
+        self.pulses_ms = [DEFAULT_ON_MS] * NUM_ACTUATORS       # pulse of each ejector (the "set all" value until a row is changed)
         
         self.mapping_by_act: Dict[int, List[str]] = {i: [] for i in range(1, NUM_ACTUATORS + 1)}
         self.mapping_t1: Dict[str, int] = {}
@@ -498,7 +499,7 @@ class SharedState:
 
     def get_timing(self, act_id: int) -> Tuple[int, int]:
         if not (1 <= act_id <= NUM_ACTUATORS): return (0, DEFAULT_ON_MS)
-        with self.lock: return (self.delays_ms[act_id-1], self.common_pulse_ms)
+        with self.lock: return (self.delays_ms[act_id-1], self.pulses_ms[act_id-1])
 
     def set_class_conf(self, cname: str, val: int):
         with self.lock: self.class_confs[cname.lower()] = int(val)
@@ -636,8 +637,14 @@ class SharedState:
         self.save_to_config(CFG_PATH)
 
     def set_common_pulse(self, pulse_ms: int):
-        with self.lock: self.common_pulse_ms = pulse_ms
+        with self.lock:
+            self.common_pulse_ms = pulse_ms
+            self.pulses_ms = [int(pulse_ms)] * NUM_ACTUATORS
         self.save_to_config(CFG_PATH)
+
+    def set_pulse(self, act_id: int, pulse_ms: int):
+        if 1 <= act_id <= NUM_ACTUATORS:
+            with self.lock: self.pulses_ms[act_id-1] = int(pulse_ms)
 
     def get_assigned_classes_for_track(self, track_num: int) -> set:
         assigned = set()
@@ -723,6 +730,8 @@ class SharedState:
                     self.distances_mm[i-1] = float(dists.get(str(i), 0.0))
                 
                 self.common_pulse_ms = int(cfg.get("common_pulse_ms", DEFAULT_ON_MS))
+                stored_pulses = cfg.get("pulses_ms", {})
+                self.pulses_ms = [int(stored_pulses.get(str(i), self.common_pulse_ms)) for i in range(1, NUM_ACTUATORS + 1)]
                 self.priority_rules = cfg.get("priority_rules", [])
                 
                 loaded_confs = cfg.get("class_confs", {})
@@ -783,6 +792,7 @@ class SharedState:
                     "distances_mm": {str(i+1): self.distances_mm[i] for i in range(NUM_ACTUATORS)},
                     "delays_ms": {str(i+1): self.delays_ms[i] for i in range(NUM_ACTUATORS)},
                     "common_pulse_ms": self.common_pulse_ms,
+                    "pulses_ms": {str(i+1): self.pulses_ms[i] for i in range(NUM_ACTUATORS)},
                     "mapping": {str(k): v for k,v in self.mapping_by_act.items()},
                     "priority_rules": self.priority_rules,
                     "size_config": self.size_config,
@@ -1770,7 +1780,8 @@ class App(tk.Tk):
         self.flat_field = FlatField(app_paths.FFC_GAIN_MAP_PATH)
         self.camera_thread = CameraThread(self.camera_queue, self.stop_event, self.shared_state.camera_settings, self.flat_field)
         # Every relay pulse of the grader goes through this object (relays 1-40 only, dry-run, master switch).
-        self.relay_output = RelayOutput(self.controller)
+        # RUNNING = grading fires the valves; STOPPED = only the manual buttons do (relay_output.py enforces both).
+        self.relay_output = RelayOutput(self.controller, is_running=lambda: self.shared_state.phase == "RUNNING")
         self.relay_output.manual_log_dir = app_paths.LOGS_DIR     # every manual fire is logged
         # Automatic ejector check (tool window): only through relay_output, only when STOPPED with the conveyor OFF.
         self.ejector_check = ejector_check.EjectorCheck(self.relay_output, log_dir=app_paths.LOGS_DIR, safe_to_run=self._ejector_check_blocked)
@@ -1880,8 +1891,8 @@ class App(tk.Tk):
 
         self.pills = {}
         self._pill_bar = top
-        for key, name, short in (("camera", "CAMERA", "CAM"), ("plc", "PLC", "PLC"), ("safety", "SAFETY", "SAFETY"), ("master", "MASTER EJECTOR", "EJECTOR"),
-                                 ("mode", "MODE", "MODE"), ("conveyor", "CONVEYOR", "CONV"), ("state", "STATE", "STATE"),
+        for key, name, short in (("camera", "CAMERA", "CAM"), ("plc", "PLC", "PLC"), ("safety", "SAFETY", "SAFETY"),
+                                 ("conveyor", "CONVEYOR", "CONV"), ("state", "STATE", "STATE"),
                                  ("check", "EJECTOR CHECK", "EJ CHECK")):
             pill = ui.Pill(top, name, "—", ui.MUTED, short=short)
             pill.pack(side=tk.LEFT, padx=3, pady=13)
@@ -1983,7 +1994,7 @@ class App(tk.Tk):
         page = tk.Frame(self.page_container, bg=ui.BG)
         self.pages["Pneumatic"] = page
         self.act_vars, self.dist_vars, self.pn_map_lbls, self.pn_leds, self.map_lbls = {}, {}, {}, {}, getattr(self, "map_lbls", {})
-        self._pn_status, self._pn_fires = {}, {}
+        self._pn_status, self._pn_fires, self.pulse_vars = {}, {}, {}
         self._recalc_active = False
 
         def card(parent, title, note="", **pack):
@@ -2019,7 +2030,7 @@ class App(tk.Tk):
         self.weight_var = tk.StringVar(value=f"{self.shared_state.grading.get('avg_cashew_weight_g', 1.8):g}")
         number_row("AVG CASHEW WEIGHT", self.weight_var, "g")
         self.common_pulse_var = tk.StringVar(value=str(self.shared_state.common_pulse_ms))
-        number_row("Pulse (all ejectors)", self.common_pulse_var, "ms")
+        number_row("Pulse: set all ejectors", self.common_pulse_var, "ms")
         self.common_pulse_var.trace_add("write", self._update_common_pulse)
         self.conveyor_speed_var = tk.StringVar(value=str(int(getattr(self.shared_state, 'conveyor_speed_mm_s', 300))))
         number_row("Conveyor speed", self.conveyor_speed_var, "mm/s")
@@ -2028,64 +2039,14 @@ class App(tk.Tk):
         tk.Label(tools, text="delay = distance / speed - pulse / 2", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL).pack(**pad)
         tk.Frame(tools, bg=ui.BORDER, height=1).pack(pady=8, **pad)
 
-        # MASTER EJECTOR (off at every start) and DRY-RUN (on at every start)
-        self.dry_run_var = tk.BooleanVar(value=True)
-        self.master_ejector_var = tk.BooleanVar(value=False)
-
-        def switch_row(title):
-            row = tk.Frame(tools, bg=ui.PANEL)
-            row.pack(pady=(2, 0), **pad)
-            tk.Label(row, text=title, font=(F, ui.F_SMALL, "bold"), fg=ui.MUTED, bg=ui.PANEL).pack(anchor="w")
-            line = tk.Frame(row, bg=ui.PANEL)
-            line.pack(fill=tk.X)
-            state = tk.Label(line, text="", font=(F, ui.F_HEAD, "bold"), bg=ui.PANEL)
-            state.pack(side=tk.LEFT)
-            note = tk.Label(tools, text="", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL, anchor="w", justify="left", wraplength=286)
-            return line, state, note
-
-        def refresh_safety_labels():
-            dry, master = self.relay_output.dry_run, self.relay_output.master_enabled
-            self.master_ej_btn.config(text="ON" if master else "OFF", fg=ui.GOOD if master else ui.MUTED)
-            self.dry_run_btn.config(text="ON" if dry else "OFF", fg=ui.WARN if dry else ui.BAD)
-            self._dry_note.config(text="Nothing is sent to the PLC." if dry else "REAL valves fire.", fg=ui.MUTED if dry else ui.BAD)
-            if not master:
-                text, colour = "Grading does not fire.", ui.MUTED
-            elif dry:
-                text, colour = "Grading: dry-run only.", ui.WARN
-            else:
-                text, colour = "Grading fires REAL valves.", ui.BAD
-            self.master_ej_led.config(text=text, fg=colour)
-            for switch, value in ((self._master_switch, master), (self._dry_switch, dry)):
-                if switch.on != value:
-                    switch.set(value)
-        self._refresh_safety_labels = refresh_safety_labels
-
-        def toggle_dry_run(want):
-            if not want and not messagebox.askyesno("DRY-RUN OFF", "With DRY-RUN off, test buttons and grading (if MASTER EJECTOR is on) energise REAL valves.\n\nSwitch DRY-RUN off?"):
-                want = True
-            self.dry_run_var.set(want)
-            self.relay_output.dry_run = want
-            log.info("DRY-RUN %s", "ON" if want else "OFF")
-            refresh_safety_labels()
-
-        def toggle_ejector(want):
-            self.master_ejector_var.set(want)
-            self.relay_output.master_enabled = bool(want)
-            log.info("MASTER EJECTOR %s", "ON" if want else "OFF")
-            refresh_safety_labels()
-
-        line, self.master_ej_btn, self.master_ej_led = switch_row("MASTER EJECTOR")
-        self._master_switch = ui.ToggleSwitch(line, ui.PANEL, on=False, command=toggle_ejector)
-        self._master_switch.pack(side=tk.RIGHT)
-        self.master_ej_led.pack(**pad)
-        line, self.dry_run_btn, self._dry_note = switch_row("DRY-RUN")
-        self._dry_switch = ui.ToggleSwitch(line, ui.PANEL, on=True, command=toggle_dry_run)
-        self._dry_switch.pack(side=tk.RIGHT)
-        self._dry_note.pack(**pad)
-        refresh_safety_labels()
+        tk.Label(tools, text="START / STOP", font=(F, ui.F_SMALL, "bold"), fg=ui.MUTED, bg=ui.PANEL, anchor="w").pack(**pad)
+        self.lbl_pn_state = tk.Label(tools, text="STOPPED", font=(F, ui.F_HEAD, "bold"), fg=ui.MUTED, bg=ui.PANEL, anchor="w")
+        self.lbl_pn_state.pack(**pad)
+        tk.Label(tools, text="RUNNING: grading fires the valves, the buttons here are locked.\nSTOPPED: nothing fires from grading, the buttons here fire the REAL valves.",
+                 font=(F, -11), fg=ui.MUTED, bg=ui.PANEL, anchor="w", justify="left", wraplength=286).pack(**pad)
         tk.Frame(tools, bg=ui.BORDER, height=1).pack(pady=8, **pad)
 
-        # MANUAL FIRE: one ejector, all at once, one after the other. All follow DRY-RUN, only when STOPPED.
+        # MANUAL FIRE: one ejector, all at once, one after the other. They write to the real PLC, only when STOPPED.
         tk.Label(tools, text="MANUAL FIRE", font=(F, ui.F_SMALL, "bold"), fg=ui.MUTED, bg=ui.PANEL, anchor="w").pack(**pad)
         row = tk.Frame(tools, bg=ui.PANEL)
         row.pack(pady=4, **pad)
@@ -2123,10 +2084,13 @@ class App(tk.Tk):
         ui.FlatButton(nav, "TEST FIRE THIS EJECTOR", command=self._test_fire_selected_relay, kind="danger", height=34).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
         both = tk.Frame(tools, bg=ui.PANEL)
         both.pack(**pad)
-        ui.FlatButton(both, "FIRE 1-40", command=self._fire_all, kind="danger", height=32, width=138).pack(side=tk.LEFT)
-        ui.FlatButton(both, "SEQUENCE 1-40", command=self._sequence_all, kind="danger", height=32, width=138).pack(side=tk.RIGHT)
-        tk.Label(tools, text="Only when STOPPED. They ask first and follow DRY-RUN.", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL, anchor="w", justify="left",
-                 wraplength=286).pack(pady=(4, 0), **pad)
+        ui.FlatButton(both, "FIRE ALL", command=self._fire_all, kind="danger", height=32, width=138).pack(side=tk.LEFT)
+        ui.FlatButton(both, "SEQUENCE ALL", command=self._sequence_all, kind="danger", height=32, width=138).pack(side=tk.RIGHT)
+        off = tk.Label(tools, text="■  ALL RELAYS OFF NOW", font=(F, ui.F_BODY, "bold"), fg="#FFFFFF", bg=ui.BAD, cursor="hand2", pady=7)
+        off.pack(pady=(6, 0), **pad)
+        off.bind("<Button-1>", lambda e: self._all_relays_off())
+        tk.Label(tools, text="Only when STOPPED. FIRE ALL and SEQUENCE ALL ask first; a single pulse fires at once.", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL,
+                 anchor="w", justify="left", wraplength=286).pack(pady=(4, 0), **pad)
         self.lbl_test_relay_result = tk.Label(tools, text="", bg=ui.PANEL, fg=ui.MUTED, font=(F, -12), anchor="w", justify="left", wraplength=286)
         self.lbl_test_relay_result.pack(pady=(4, 0), **pad)
 
@@ -2139,7 +2103,7 @@ class App(tk.Tk):
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tables = tk.Frame(left, bg=ui.BG)
         tables.pack(fill=tk.X)
-        columns = (("", 2), ("EJ", 4), ("PLC", 5), ("CLASSES / GRADES", 27), ("DIST mm", 7), ("DELAY", 7), ("TEST", 5), ("LAST FIRE", 17), ("FIRES", 6))
+        columns = (("", 2), ("EJ", 4), ("PLC", 5), ("CLASSES / GRADES", 27), ("DIST mm", 7), ("DELAY", 7), ("PULSE", 5), ("FIRE", 4), ("LAST FIRE", 15), ("FIRES", 5))
         for block, (title, relays) in enumerate((("EJECTORS  ROI 1", range(1, 21)), ("EJECTORS  ROI 2", range(21, 41)))):
             box, _ = card(tables, title, "click the classes of a row to change them" if block == 0 else "", side=tk.LEFT, fill=tk.BOTH, expand=True,
                           padx=(0, 6) if block == 0 else (6, 0))
@@ -2164,11 +2128,16 @@ class App(tk.Tk):
                 delay = tk.StringVar(value=str(self.shared_state.delays_ms[i - 1]))
                 field(grid, delay, 7).grid(row=r, column=5, sticky="w", pady=1)
                 self.dist_vars[i], self.act_vars[i] = dist, delay
-                ui.FlatButton(grid, "TEST", command=lambda x=i: self._pulse_and_flash(x), height=22, width=46, font=(F, -10, "bold")).grid(row=r, column=6, sticky="w", padx=(2, 4))
-                status = tk.Label(grid, text="", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL, anchor="w", width=19)
-                status.grid(row=r, column=7, sticky="w")
-                fires = tk.Label(grid, text="0", font=(F, -12, "bold"), fg=ui.TEXT, bg=ui.PANEL, anchor="e", width=6)
-                fires.grid(row=r, column=8, sticky="e")
+                pulse = tk.StringVar(value=str(self.shared_state.pulses_ms[i - 1]))
+                field(grid, pulse, 5).grid(row=r, column=6, sticky="w", pady=1)
+                self.pulse_vars[i] = pulse
+                pulse.trace_add("write", lambda *_, ii=i: self._update_row_pulse(ii))
+                # lightning button: one click fires this ejector's PLC coil at once, with the pulse of this row
+                ui.FlatButton(grid, "⚡", command=lambda x=i: self._pulse_and_flash(x), kind="danger", height=22, width=34, font=(F, -12, "bold")).grid(row=r, column=7, sticky="w", padx=(4, 4))
+                status = tk.Label(grid, text="", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL, anchor="w", width=17)
+                status.grid(row=r, column=8, sticky="w")
+                fires = tk.Label(grid, text="0", font=(F, -12, "bold"), fg=ui.TEXT, bg=ui.PANEL, anchor="e", width=5)
+                fires.grid(row=r, column=9, sticky="e")
                 self._pn_status[i], self._pn_fires[i] = status, fires
                 dist.trace_add("write", lambda *_, ii=i: self._on_distance_changed(ii))
                 delay.trace_add("write", lambda *_, ii=i: self._update_act_timing(ii))
@@ -2314,7 +2283,8 @@ class App(tk.Tk):
         last = {}
         for when, relay, delay_ms, pulse_ms, result, source in events:
             last.setdefault(relay, (when, result))
-        texts = {"SENT": "OK", "DRY_RUN": "DRY-RUN", "PLC_OFFLINE": "PLC OFFLINE", "MASTER_OFF": "MASTER OFF", "REFUSED": "REFUSED", "WRITE_FAIL": "WRITE FAIL", "READBACK_FAIL": "READ-BACK FAIL"}
+        texts = {"SENT": "OK", "PLC_OFFLINE": "PLC ERROR offline", "REFUSED": "REFUSED", "WRITE_FAIL": "PLC ERROR write", "READBACK_FAIL": "PLC ERROR read-back",
+                 "CANCELLED": "cancelled", "NOT_STOPPED": "refused: RUNNING"}
         for relay in range(FIRST_EJECTOR, LAST_EJECTOR + 1):
             if relay in last:
                 when, result = last[relay]
@@ -2331,7 +2301,13 @@ class App(tk.Tk):
                 stamp = time.strftime("%H:%M:%S", time.localtime(when)) + f".{int(when * 1000) % 1000:03d}"
                 self.event_tree.insert("", "end", values=(stamp, f"A{relay:02d}" if isinstance(relay, int) else relay, source, f"{delay_ms:.0f}", f"{pulse_ms:.0f}",
                                                          texts.get(result, result)), tags=("sent" if result == "SENT" else "not",))
-        self._refresh_safety_labels()
+        running = ss.phase == "RUNNING"
+        self.lbl_pn_state.config(text="RUNNING" if running else "STOPPED", fg=ui.GOOD if running else ui.MUTED)
+        shown = getattr(self, "_manual_shown", None)        # result of the last manual pulse, next to the buttons
+        if shown is not None and shown in out.last_result:
+            when, result, error = out.last_result[shown]
+            if when >= getattr(self, "_manual_at", 0.0):
+                self._show_manual_result(self._result_text(shown, result) + (f"  ({error})" if error else ""), result == "SENT")
         dirty = getattr(self, "_mapping_dirty", False)
         self.lbl_pn_saved.config(text="●  mapping changed, not saved" if dirty else "All changes saved", fg=ui.WARN if dirty else ui.MUTED)
 
@@ -2374,7 +2350,7 @@ class App(tk.Tk):
             pass
         tk.Label(left, text="TCM CASHEW X AI", font=(F, ui.F_KPI, "bold"), fg=ui.TEXT, bg=ui.PANEL, anchor="w").pack(fill=tk.X, padx=20)
         tk.Label(left, text="GSN V21  -  2 ROIs, 40 ejectors", font=(F, ui.F_BODY, "bold"), fg=ui.ACCENT, bg=ui.PANEL, anchor="w").pack(fill=tk.X, padx=20, pady=(0, 12))
-        for key, label in (("version", "Software (git commit)"), ("program", "Active program"), ("mode", "Ejector mode"),
+        for key, label in (("version", "Software (git commit)"), ("program", "Active program"), ("mode", "Ejectors"),
                            ("auto", "AUTO LEARNING"), ("samples", "Confirmed samples"), ("capture", "Production capture")):
             row(left, key, label)
 
@@ -2404,7 +2380,7 @@ class App(tk.Tk):
         total = sum(n for k, n in counts.items() if not k.startswith("UNDEFINED: "))
         values = {
             "version": _software_version(), "program": self.active_program_name,
-            "mode": ("DRY-RUN (nothing is sent to the PLC)" if out.dry_run else "LIVE (real valves)") + f",  MASTER EJECTOR {'ON' if out.master_enabled else 'OFF'}",
+            "mode": "fire from grading only while RUNNING; manual buttons only while STOPPED",
             "auto": ("ON" if enabled else "OFF") + "   (planned, not active in this version)",
             "samples": f"{ui.thousands(samples)} / {ui.thousands(target)}",
             "capture": ("ON" if capture_on else "OFF") + f"   ({self.processing_thread.capture.blocking_reason()})",
@@ -2469,9 +2445,11 @@ class App(tk.Tk):
             self.plc_reconnects += 1
         self._plc_was_ok = plc_ok
         self.pills["plc"].set("ONLINE" if plc_ok else "OFFLINE", ui.GOOD if plc_ok else ui.BAD)
-        master, dry = self.relay_output.master_enabled, self.relay_output.dry_run
-        self.pills["master"].set("ON" if master else "OFF", ui.GOOD if master else ui.MUTED)
-        self.pills["mode"].set("DRY-RUN" if dry else "LIVE", ui.WARN if dry else ui.GOOD)
+        if getattr(self, "_was_running", False) and ss.phase != "RUNNING":      # STOP, however it happened: nothing fires from grading
+            cancelled = self.relay_output.cancel_pending()
+            if cancelled:
+                log.info("STOP: %d waiting ejector pulse(s) cancelled", cancelled)
+        self._was_running = ss.phase == "RUNNING"
         self.pills["conveyor"].set("ON" if ss.is_conveyor_on else "OFF", ui.GOOD if ss.is_conveyor_on else ui.MUTED)
         phase = ss.phase
         running = phase == "RUNNING"
@@ -2519,7 +2497,7 @@ class App(tk.Tk):
             free_gb = None
         max_step = float(ss.grading.get("tracker", {}).get("max_step_px", 160.0))
         active = alarms.collect(cam.is_connected, str(cam.state), plc_ok, running, self.processing_thread.ai_fps,
-                                alarms.min_safe_fps(lane_px_s, max_step), free_gb, list(ss.missed_rejects), dry)
+                                alarms.min_safe_fps(lane_px_s, max_step), free_gb, list(ss.missed_rejects))
         self.pills["safety"].set("FAULT" if active else "OK", ui.BAD if active else ui.GOOD)
         # Production capture: not a machine fault (the SAFETY pill is not changed), shown in the same box.
         capture_state = self.processing_thread.capture.blocking_reason()
@@ -2584,7 +2562,7 @@ class App(tk.Tk):
         ops.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 18), pady=18)
         self.lbl_machine_state = tk.Label(ops, text="STOPPED", font=(F, ui.F_HEAD, "bold"), fg=ui.BAD, bg=ui.PANEL, anchor="w")
         self.lbl_machine_state.pack(fill=tk.X)
-        tk.Label(ops, text="MASTER EJECTOR is OFF and DRY-RUN is ON at every start.", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL,
+        tk.Label(ops, text="RUNNING = grading fires the valves. STOPPED = nothing fires from grading. The program always opens STOPPED.", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL,
                  anchor="w", justify="left", wraplength=330).pack(fill=tk.X, pady=(2, 10))
         row = tk.Frame(ops, bg=ui.PANEL)
         row.pack(fill=tk.X, pady=(0, 8))
@@ -4659,12 +4637,23 @@ except Exception as e:
         return f"{time.strftime('%H:%M:%S')}  {self.relay_output.describe(relay)}: {RESULT_TEXT.get(result, result)}"
 
     def _confirm_fire_many(self, title) -> bool:
-        """Question before FIRE 1-40 / SEQUENCE 1-40. Asked every time; it also says whether DRY-RUN is on."""
-        if self.relay_output.dry_run:
-            mode = "DRY-RUN is ON: nothing will be sent to the PLC."
-        else:
-            mode = "DRY-RUN is OFF: the REAL valves of relays 1-40 will fire."
-        return messagebox.askyesno(title, f"Make sure nobody is at the nozzles.\n\n{mode}\n\nGo on?")
+        """Question before FIRE ALL / SEQUENCE ALL (a single pulse button fires at once, without a question)."""
+        return messagebox.askyesno(title, "Make sure nobody is at the nozzles.\n\nThe REAL valves of ejectors 1-40 will fire.\n\nGo on?")
+
+    def _update_row_pulse(self, relay):
+        try:
+            value = int(self.pulse_vars[relay].get())
+        except (ValueError, tk.TclError, KeyError):
+            return
+        if 5 <= value <= 2000:
+            self.shared_state.set_pulse(relay, value)
+
+    def _all_relays_off(self):
+        """ALL RELAYS OFF NOW: always allowed; cancels every waiting pulse and writes OFF to ejectors 1-40."""
+        self._sequence_running = False
+        done, error = self.relay_output.all_ejectors_off()
+        self._manual_shown = None
+        self._show_manual_result(f"{time.strftime('%H:%M:%S')}  ALL RELAYS OFF: {done} of 40 written OFF." + (f"  PLC error: {error}" if error else ""), not error)
 
     def _show_manual_result(self, text, sent):
         if hasattr(self, 'lbl_test_relay_result'):
@@ -4689,38 +4678,38 @@ except Exception as e:
         plc_diag_ui.open_plc_diagnostics(self)
 
     def _open_plc_vendor_tool(self):
-        """The PLC vendor tool is a separate program that writes straight to the PLC: it does not know
-        DRY-RUN or MASTER EJECTOR and can also switch conveyor and feeder. So it is only opened deliberately."""
+        """The PLC vendor tool is a separate program that writes straight to the PLC with its own connection; it can
+        also switch conveyor and feeder, and what is done there is not in the manual fire log. Opened deliberately."""
         if not hasattr(self.controller, 'open_diagnostics_gui'):
             return
         if not self._manual_test_allowed():
             return
-        if self.relay_output.dry_run:
-            messagebox.showwarning("PLC diagnostics", "DRY-RUN is ON.\n\nThe PLC diagnostics tool writes directly to the PLC and would ignore DRY-RUN, "
-                                   "so it is blocked.\n\nSwitch DRY-RUN off first if you really want to drive the PLC by hand.")
-            self.relay_output.log_manual("PLC DIAGNOSTICS TOOL blocked (DRY-RUN)", "", "", "DRY_RUN")
-            return
-        if not messagebox.askyesno("PLC diagnostics", "Make sure nobody is at the nozzles.\n\nThis tool writes directly to the PLC: its buttons fire REAL "
-                                   "valves at once, ignore DRY-RUN and MASTER EJECTOR, and can also switch CONVEYOR (M140) and FEEDER (M141). "
+        if not messagebox.askyesno("PLC vendor tool", "Make sure nobody is at the nozzles.\n\nThis tool writes directly to the PLC: its buttons fire REAL "
+                                   "valves at once and can also switch CONVEYOR (M140) and FEEDER (M141). "
                                    "What is done there is NOT in the manual fire log.\n\nOpen it?"):
             return
-        log.warning("PLC diagnostics tool opened by the operator (direct PLC access, outside DRY-RUN)")
-        self.relay_output.log_manual("PLC DIAGNOSTICS TOOL opened", "", "", "DIRECT")
+        log.warning("PLC vendor tool opened by the operator (direct PLC access)")
+        self.relay_output.log_manual("PLC VENDOR TOOL opened", "", "", "DIRECT")
         self.controller.open_diagnostics_gui()
 
     def _flash_relay_led(self, relay, pulse):
         if hasattr(self, 'pn_leds') and relay in self.pn_leds:
-            self.pn_leds[relay].config(fg=self.colors["success"])
-            self.after(max(pulse, 200), lambda r=relay: self.pn_leds[r].config(fg=self.colors["surface_light"]))
+            self.pn_leds[relay].config(fg=ui.GOOD)
+            self.after(max(int(pulse), 200), lambda r=relay: self.pn_leds[r].config(fg=ui.BORDER))
 
-    def _test_fire_relay(self, relay, action="SINGLE RELAY TEST"):
-        """Fire one relay once, by hand. Returns the result code."""
+    def _row_pulse_ms(self, relay) -> int:
+        return int(self.shared_state.get_timing(relay)[1])
+
+    def _test_fire_relay(self, relay, action="PULSE", pulse=None):
+        """Fire one ejector once, by hand, at once (real PLC). Only when STOPPED. Returns the result code."""
         if not self._manual_test_allowed():
             return None
-        pulse = self._test_pulse_ms()
-        result = self.relay_output.test_fire(relay, pulse, action=action)
+        pulse = self._row_pulse_ms(relay) if pulse is None else pulse
+        self._manual_shown, self._manual_at = relay, time.time()
+        result = self.relay_output.manual_pulse(relay, pulse, action=action)
         self._flash_relay_led(relay, pulse)
-        self._show_manual_result(self._result_text(relay, result), result == "SENT")
+        if result != "SCHEDULED":           # refused or PLC offline: known at once; otherwise the page shows OK / PLC error when the pulse is over
+            self._show_manual_result(self._result_text(relay, result), False)
         return result
 
     def _test_fire_selected_relay(self):
@@ -4728,57 +4717,61 @@ except Exception as e:
             relay = int(self.test_relay_var.get())
         except (ValueError, tk.TclError):
             return
-        self._test_fire_relay(relay)
+        self._test_fire_relay(relay, action="TEST FIRE", pulse=self._test_pulse_ms())
 
     def _pulse_and_flash(self, act_idx):
         if hasattr(self, 'test_relay_var'):
             self.test_relay_var.set(str(act_idx))
-        self._test_fire_relay(act_idx, action="ROW TEST")
+        self._test_fire_relay(act_idx, action="ROW PULSE")
 
     def _fire_all(self):
         if not self._manual_test_allowed():
             return
-        if not self._confirm_fire_many("FIRE 1-40"):
+        if not self._confirm_fire_many("FIRE ALL"):
             return
         if not self._manual_test_allowed():      # the machine may have been started while the question was open
             return
-        pulse = self._test_pulse_ms()
-        results = self.relay_output.test_all(pulse)     # 40 x test_fire(): the same path as the single relay test
+        self._manual_shown = None
+        results = {relay: self.relay_output.manual_pulse(relay, self._row_pulse_ms(relay), "FIRE ALL") for relay in range(FIRST_EJECTOR, LAST_EJECTOR + 1)}
         for relay in results:
-            self._flash_relay_led(relay, pulse)
-        kinds = sorted(set(results.values()))
-        summary = "; ".join(f"{sum(1 for r in results.values() if r == kind)} x {RESULT_TEXT.get(kind, kind)}" for kind in kinds)
-        self._show_manual_result(f"{time.strftime('%H:%M:%S')}  FIRE 1-40 (relays 1-40, M100-M139): {summary}", kinds == ["SENT"])
-            
+            self._flash_relay_led(relay, self._row_pulse_ms(relay))
+        refused = sorted({RESULT_TEXT.get(r, r) for r in results.values() if r != "SCHEDULED"})
+        self._show_manual_result(f"{time.strftime('%H:%M:%S')}  FIRE ALL (ejectors 1-40, M100-M139): " + ("; ".join(refused) if refused else "fired; see LAST FIRE of each row"),
+                                 not refused)
+
     def _sequence_all(self):
-        """Relays 1-40 one after another. Runs on the UI timer (no extra thread); stops if the machine is started."""
+        """Ejectors 1-40 one after another. Runs on the UI timer (no extra thread); stops if the machine is started."""
         if not self._manual_test_allowed() or getattr(self, '_sequence_running', False):
             return
-        if not self._confirm_fire_many("SEQUENCE 1-40"):
+        if not self._confirm_fire_many("SEQUENCE ALL"):
             return
         if not self._manual_test_allowed():
             return
-        pulse = self._test_pulse_ms()
-        interval = max(120, pulse + 40)
         self._sequence_running = True
 
         def step(relay):
-            if relay > LAST_EJECTOR or self.stop_event.is_set() or self.shared_state.phase == "RUNNING":
+            if relay > LAST_EJECTOR or not self._sequence_running or self.stop_event.is_set() or self.shared_state.phase == "RUNNING":
                 self._sequence_running = False
                 return
-            result = self.relay_output.test_fire(relay, pulse, action="SEQUENCE 1-40")
+            pulse = self._row_pulse_ms(relay)
             self.test_relay_var.set(str(relay))
-            self._flash_relay_led(relay, pulse)
-            self._show_manual_result("SEQUENCE 1-40  " + self._result_text(relay, result), result == "SENT")
-            self.after(interval, lambda: step(relay + 1))
+            self._test_fire_relay(relay, action="SEQUENCE ALL", pulse=pulse)
+            self.after(max(150, pulse + 80), lambda: step(relay + 1))
 
         step(FIRST_EJECTOR)
 
     def _update_common_pulse(self, *args):
+        """The "set all" field: the same pulse for every ejector (each row can then be changed on its own)."""
         try:
             pulse = int(self.common_pulse_var.get())
-            self.shared_state.set_common_pulse(pulse)
-        except (ValueError, tk.TclError): pass
+        except (ValueError, tk.TclError):
+            return
+        if not 5 <= pulse <= 2000:
+            return
+        self.shared_state.set_common_pulse(pulse)
+        for var in getattr(self, "pulse_vars", {}).values():
+            if var.get() != str(pulse):
+                var.set(str(pulse))
 
     def _update_conveyor_speed(self, *args):
         try:
@@ -4959,6 +4952,7 @@ except Exception as e:
     def _mapping_names(self):
         """(classes, grades) that need an ejector: the defect classes of the priority list, then the size grades."""
         fixed = {normalize_name(n) for n in (decision.REJECTION, decision.DOUBLE, decision.UNDEFINED)}
+        fixed |= {normalize_name(c) for c in self.shared_state.grading.get("good_classes", [])}       # a PASS class needs no ejector
         classes = [c for c in self.shared_state.grading.get("priority", []) if normalize_name(c) not in fixed]
         return classes, relay_mapping.GRADES_WW + relay_mapping.GRADES_SW
 
@@ -5194,6 +5188,7 @@ except Exception as e:
         ph = self.shared_state.get_processing_state()["phase"]
         if ph == "RUNNING":
             self.shared_state.phase = "READY"
+            self.relay_output.cancel_pending()      # STOPPED: nothing fires from grading, also not what was still waiting
         elif ph == "READY" and self.ejector_check.busy():
             messagebox.showwarning("Ejector check", "The ejector check is running. Stop it first.")
         elif ph == "READY":
@@ -5886,6 +5881,9 @@ except Exception as e:
             self.ejector_check.stop()
         if hasattr(self, 'processing_thread'):
             self.processing_thread.capture.stop()
+        if hasattr(self, 'relay_output'):
+            self.relay_output.cancel_pending()
+            self.relay_output.stop()
             
         print("[SYSTEM] Shutdown complete.")
         self.destroy()

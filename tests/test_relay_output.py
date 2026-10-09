@@ -1,178 +1,214 @@
+import csv
+import glob
 import os
 import sys
+import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import relay_output as ro
 from relay_output import RelayOutput
+from test_ejector_check import FakeCheckPLC
 
 
-class FakePLC:
-    """Records every call. fire_all / sequence_all / set_relay / conveyor / feeder must never be reached."""
+class FakePLC(FakeCheckPLC):
+    """PLC with coil memory; `pulses` lists the ejectors that were switched ON, in order (used by the window tests)."""
 
-    def __init__(self, connected=True):
-        self.connected_flag = connected
-        self.pulses = []
-        self.forbidden = []
-
-    def is_connected(self):
-        return self.connected_flag
-
-    def get_relay_address(self, relay):
-        return 100 + relay - 1
-
-    def pulse_actuator(self, idx, delay_ms, pulse_ms):
-        self.pulses.append((idx, delay_ms, pulse_ms))
-
-    def __getattr__(self, name):            # anything else the wrapper might call is recorded as forbidden
-        def call(*args, **kwargs):
-            self.forbidden.append((name, args))
-        return call
+    @property
+    def pulses(self):
+        out, on = [], set()
+        for relay, state in self.writes:
+            if state and relay not in on:
+                out.append(relay)
+                on.add(relay)
+            elif not state:
+                on.discard(relay)
+        return out
 
 
-class RelayOutputTest(unittest.TestCase):
-    def live(self, connected=True):
-        plc = FakePLC(connected)
-        out = RelayOutput(plc)
-        out.dry_run, out.master_enabled = False, True
-        return plc, out
-
-    def test_safe_at_start(self):
-        plc = FakePLC()
-        out = RelayOutput(plc)
-        self.assertTrue(out.dry_run)
-        self.assertFalse(out.master_enabled)
-        self.assertEqual(out.fire(5, 100, 50), ro.MASTER_OFF)
-        self.assertEqual(out.test_fire(5, 50), ro.DRY_RUN)
-        out.master_enabled = True
-        self.assertEqual(out.fire(5, 100, 50), ro.DRY_RUN)
-        self.assertEqual(plc.pulses, [])
-
-    def test_fires_when_live_and_counts(self):
-        plc, out = self.live()
-        self.assertEqual(out.fire(7, 1234.4, 50), ro.SENT)
-        self.assertEqual(plc.pulses, [(7, 1234, 50)])
-        wanted, sent, not_sent = out.counts()
-        self.assertEqual((wanted[7], sent[7]), (1, 1))
-        out.dry_run = True
-        out.fire(7, 10, 50)
-        wanted, sent, not_sent = out.counts()
-        self.assertEqual((wanted[7], sent[7], not_sent[ro.DRY_RUN]), (2, 1, 1))
-        self.assertEqual(out.recent_events()[0][4], ro.DRY_RUN)
-
-    def test_only_relays_1_to_40(self):
-        plc, out = self.live()
-        for relay in (0, 41, 42, 43, 48, -1, 7.0, "7", None, True):
-            self.assertEqual(out.fire(relay, 0, 50), ro.REFUSED, relay)
-            self.assertEqual(out.test_fire(relay, 50), ro.REFUSED, relay)
-        self.assertEqual(plc.pulses, [])
-        self.assertEqual(out.fire(1, 0, 50), ro.SENT)
-        self.assertEqual(out.fire(40, 0, 50), ro.SENT)
-
-    def test_all_and_sequence_use_single_pulses_of_1_to_40_only(self):
-        plc, out = self.live()
-        out.test_all(60)
-        self.assertEqual([p[0] for p in plc.pulses], list(range(1, 41)))
-        plc.pulses.clear()
-        out.test_sequence(60, interval_ms=0)
-        self.assertEqual([p[0] for p in plc.pulses], list(range(1, 41)))
-        self.assertEqual(plc.forbidden, [])             # never fire_all, sequence_all, set_relay, set_conveyor, set_feeder
-
-    def test_conveyor_and_feeder_coils_are_never_addressed(self):
-        plc, out = self.live()
-        out.test_all(60); out.test_sequence(60, interval_ms=0)
-        for relay in range(1, 41):
-            out.fire(relay, 0, 50)
-        addresses = {plc.get_relay_address(p[0]) for p in plc.pulses}
-        self.assertEqual(addresses, set(range(100, 140)))
-        self.assertNotIn(140, addresses)
-        self.assertNotIn(141, addresses)
-
-    def test_plc_offline_is_reported_not_hidden(self):
-        plc, out = self.live(connected=False)
-        self.assertEqual(out.fire(3, 0, 50), ro.PLC_OFFLINE)
-        self.assertEqual(out.counts()[2][ro.PLC_OFFLINE], 1)
-        self.assertEqual(plc.pulses, [])
-
-    def test_master_blocks_grading_but_not_a_manual_test(self):
-        plc, out = self.live()
-        out.master_enabled = False
-        self.assertEqual(out.fire(9, 0, 50), ro.MASTER_OFF)
-        self.assertEqual(out.test_fire(9, 50), ro.SENT)
-        self.assertEqual(plc.pulses, [(9, 0, 50)])
-
-    def test_describe_shows_the_coil(self):
-        _, out = self.live()
-        self.assertEqual(out.describe(1), "Relay 1 -> M100 (Modbus address 100)")
-        self.assertEqual(out.describe(21), "Relay 21 -> M120 (Modbus address 120)")
-        self.assertEqual(ro.REJECT_RELAY, {1: 1, 2: 21})
-
-
-
-class ManualFireRuleTest(unittest.TestCase):
-    """Every manual fire button is test_fire(): one rule, one wording, one log."""
-
+class Base(unittest.TestCase):
     def setUp(self):
-        import tempfile
         self.tmp = tempfile.TemporaryDirectory()
         self.plc = FakePLC()
-        self.out = RelayOutput(self.plc)
+        self.now = [1000.0]
+        self.running = [False]
+        self.out = RelayOutput(self.plc, is_running=lambda: self.running[0], clock=lambda: self.now[0], start_thread=False)
         self.out.manual_log_dir = self.tmp.name
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def rows(self):
-        import csv
-        import glob
+    def at(self, seconds):
+        """Move the clock to start + seconds and let the engine work."""
+        self.now[0] = 1000.0 + seconds
+        self.out.step()
+
+    def log_rows(self):
         files = glob.glob(os.path.join(self.tmp.name, "manual_fire_*.csv"))
         if not files:
             return []
         with open(files[0], encoding="utf-8") as f:
             return list(csv.DictReader(f))
 
-    def test_dry_run_blocks_single_all_and_sequence_alike(self):
-        self.assertTrue(self.out.dry_run)
-        self.assertEqual(self.out.test_fire(7, 100), ro.DRY_RUN)
-        self.assertEqual(set(self.out.test_all(100).values()), {ro.DRY_RUN})
-        self.assertEqual(set(self.out.test_sequence(100, interval_ms=0).values()), {ro.DRY_RUN})
-        self.assertEqual(self.plc.pulses, [])
-        self.assertEqual(self.plc.forbidden, [])
-        rows = self.rows()
-        self.assertEqual(len(rows), 81)
-        self.assertEqual({r["sent_to_plc"] for r in rows}, {"NO"})
-        self.assertEqual({r["dry_run"] for r in rows}, {"ON"})
 
-    def test_with_dry_run_off_all_three_send_single_pulses_of_relays_1_to_40(self):
-        self.out.dry_run = False
-        self.out.test_fire(7, 100)
-        self.out.test_all(120)
-        self.out.test_sequence(90, interval_ms=0)
-        self.assertEqual(self.plc.pulses[0], (7, 0, 100))
-        self.assertEqual([p[0] for p in self.plc.pulses[1:41]], list(range(1, 41)))
-        self.assertEqual([p[0] for p in self.plc.pulses[41:]], list(range(1, 41)))
-        self.assertEqual(self.plc.forbidden, [])             # never fire_all / sequence_all / set_relay of the PLC
-        rows = self.rows()
-        self.assertEqual({r["sent_to_plc"] for r in rows}, {"YES"})
-        self.assertEqual((rows[0]["action"], rows[0]["relay"], rows[0]["m_address"], rows[0]["pulse_ms"], rows[0]["result"]),
-                         ("SINGLE RELAY TEST", "7", "M106", "100", "SENT"))
-        self.assertEqual({r["action"] for r in rows[1:41]}, {"FIRE 1-40"})
-        self.assertEqual(rows[40]["m_address"], "M139")
-        self.assertEqual({r["action"] for r in rows[41:]}, {"SEQUENCE 1-40"})
+class StartStopIsTheOnlyControl(Base):
+    def test_there_is_no_dry_run_and_no_master_switch(self):
+        for name in ("dry_run", "master_enabled", "test_fire", "test_all"):
+            self.assertFalse(hasattr(self.out, name), name)
+        for name in ("DRY_RUN", "MASTER_OFF"):
+            self.assertFalse(hasattr(ro, name), name)
 
-    def test_offline_and_refused_are_logged_as_not_sent(self):
-        self.out.dry_run = False
+    def test_stopped_nothing_fires_from_grading(self):
+        self.assertEqual(self.out.fire(3, 200, 100), ro.NOT_RUNNING)
+        self.at(1.0)
+        self.assertEqual(self.plc.writes, [])
+        self.assertEqual(self.out.counts()[2][ro.NOT_RUNNING], 1)
+
+    def test_running_grading_fires_after_its_delay_and_holds_the_coil_on(self):
+        self.running[0] = True
+        self.assertEqual(self.out.fire(3, 500, 100, source="R1-000007 TESTA"), ro.SCHEDULED)
+        self.at(0.49)
+        self.assertEqual(self.plc.writes, [])                      # not before its time
+        self.at(0.50)
+        self.assertEqual(self.plc.writes, [(3, True)])
+        self.assertTrue(self.plc.coils[102])
+        self.at(0.52)
+        self.assertEqual(len(self.plc.writes), 1)                  # no need to write again yet
+        self.at(0.56)
+        self.assertEqual(self.plc.writes[-1], (3, True))           # written ON again while the pulse lasts
+        self.assertEqual(len(self.plc.writes), 2)
+        self.at(0.60)
+        self.assertEqual(self.plc.writes[-1], (3, False))
+        self.assertFalse(self.plc.coils[102])
+        self.assertEqual(self.out.recent_events()[0][1:], (3, 500.0, 100, ro.SENT, "R1-000007 TESTA"))
+        self.assertEqual((self.out.wanted[3], self.out.sent[3]), (1, 1))
+        self.assertEqual(self.log_rows(), [])                      # grading is not a manual fire
+
+    def test_stop_cancels_what_is_waiting_and_switches_off_what_is_on(self):
+        self.running[0] = True
+        self.out.fire(5, 0, 300)
+        self.out.fire(9, 4000, 100)
+        self.at(0.01)
+        self.assertTrue(self.plc.coils[104])
+        self.assertEqual([p[1] for p in self.out.pending()], [9])
+        self.running[0] = False
+        self.assertEqual(self.out.cancel_pending(), 2)
+        self.assertFalse(self.plc.coils[104])
+        self.at(5.0)
+        self.assertEqual([w for w in self.plc.writes if w[0] == 9], [])       # the waiting one never fired
+        self.assertEqual(self.out.counts()[2][ro.CANCELLED], 2)
+
+    def test_a_waiting_grading_pulse_is_dropped_when_the_machine_was_stopped_meanwhile(self):
+        self.running[0] = True
+        self.out.fire(9, 1000, 100)
+        self.running[0] = False                                    # stopped without anybody calling cancel_pending
+        self.at(1.2)
+        self.assertEqual(self.plc.writes, [])
+        self.assertEqual(self.out.recent_events()[0][4], ro.CANCELLED)
+
+
+class ManualFire(Base):
+    def test_manual_pulse_fires_the_real_coil_at_once_only_when_stopped(self):
+        done = []
+        self.assertEqual(self.out.manual_pulse(7, 120, "ROW PULSE", on_done=lambda *a: done.append(a)), ro.SCHEDULED)
+        self.at(0.0)
+        self.assertEqual(self.plc.writes, [(7, True)])             # at once
+        self.at(0.06)
+        self.at(0.11)
+        self.at(0.12)
+        self.assertEqual(self.plc.writes, [(7, True), (7, True), (7, True), (7, False)])    # held ON, then OFF
+        self.assertEqual(done, [(7, ro.SENT, "")])
+        self.assertEqual(self.out.last_result[7][1], ro.SENT)
+        row = self.log_rows()[0]
+        self.assertEqual((row["action"], row["relay"], row["m_address"], row["pulse_ms"], row["result"], row["sent_to_plc"]),
+                         ("ROW PULSE", "7", "M106", "120", "SENT", "YES"))
+        self.running[0] = True
+        self.assertEqual(self.out.manual_pulse(7, 120), ro.NOT_STOPPED)
+        self.at(1.0)
+        self.assertEqual(len(self.plc.writes), 4)
+        self.assertEqual(self.log_rows()[-1]["result"], "NOT_STOPPED")
+
+    def test_fire_all_is_40_single_pulses_of_ejectors_1_to_40(self):
+        results = self.out.fire_all_now(100)
+        self.assertEqual(set(results.values()), {ro.SCHEDULED})
+        self.at(0.0)
+        self.assertEqual(self.plc.pulses, list(range(1, 41)))
+        self.assertEqual(sorted(a for a, on in self.plc.coils.items() if on), list(range(100, 140)))
+        self.at(0.11)
+        self.assertFalse(any(self.plc.coils.values()))
+        self.assertEqual(self.plc.forbidden, [])                   # never fire_all / sequence_all / all_off / pulse_actuator of the PLC
+        self.assertEqual({r["action"] for r in self.log_rows()}, {"FIRE ALL"})
+        self.assertEqual(len(self.log_rows()), 40)
+
+    def test_only_ejectors_1_to_40_and_never_the_conveyor_or_feeder_address(self):
+        for relay in (0, 41, 42, 43, 48, -1, 7.0, "7", None, True):
+            self.assertEqual(self.out.manual_pulse(relay, 100), ro.REFUSED, relay)
+        self.running[0] = True
+        self.assertEqual(self.out.fire(41, 0, 100), ro.REFUSED)
+        self.assertEqual(self.out.fire(42, 0, 100), ro.REFUSED)
+        self.running[0] = False
+        self.plc.get_relay_address = lambda relay: 141 if relay in (9, 42) else 100 + relay - 1      # a wrong mapping
+        self.assertEqual(self.out.manual_pulse(9, 100), ro.REFUSED)
+        self.at(1.0)
+        self.assertEqual(self.plc.writes, [])
+        self.assertIn("conveyor / feeder", self.out.last_result[9][2])
+
+    def test_plc_errors_are_reported_not_hidden(self):
         self.plc.connected_flag = False
-        self.assertEqual(self.out.test_fire(3, 100), ro.PLC_OFFLINE)
-        self.assertEqual(self.out.test_fire(41, 100), ro.REFUSED)
-        rows = self.rows()
-        self.assertEqual([(r["result"], r["sent_to_plc"], r["plc_connected"]) for r in rows],
-                         [("PLC_OFFLINE", "NO", "NO"), ("REFUSED", "NO", "NO")])
-        self.assertEqual(self.plc.pulses, [])
+        self.assertEqual(self.out.manual_pulse(3, 100), ro.PLC_OFFLINE)
+        self.plc.connected_flag = True
+        self.plc.fail_write.add(4)
+        done = []
+        self.out.manual_pulse(4, 100, on_done=lambda *a: done.append(a))
+        self.at(0.0)
+        self.at(0.2)
+        self.assertEqual(done[0][1], ro.WRITE_FAIL)
+        self.assertIn("write ON failed", done[0][2])
+        self.assertTrue(ro.RESULT_TEXT[ro.WRITE_FAIL].startswith("PLC error"))
+        self.assertEqual(ro.RESULT_TEXT[ro.SENT], "OK")
+        self.assertEqual([r["sent_to_plc"] for r in self.log_rows()], ["NO", "NO"])
 
-    def test_one_wording_for_every_result(self):
-        self.assertEqual(set(ro.RESULT_TEXT), {ro.SENT, ro.DRY_RUN, ro.PLC_OFFLINE, ro.REFUSED, ro.MASTER_OFF, ro.WRITE_FAIL, ro.READBACK_FAIL})
-        self.assertEqual(ro.RESULT_TEXT[ro.DRY_RUN], "DRY-RUN: NOT sent to the PLC")
+    def test_all_relays_off_cancels_everything_and_leaves_conveyor_and_feeder(self):
+        self.plc.coils[140] = self.plc.coils[141] = True
+        self.out.manual_pulse(2, 500)
+        self.at(0.0)
+        self.assertTrue(self.plc.coils[101])
+        self.assertEqual(self.out.all_ejectors_off(), (40, ""))
+        self.assertEqual(self.plc.writes[-40:], [(r, False) for r in range(1, 41)])
+        self.assertFalse(self.plc.coils[101])
+        self.assertTrue(self.plc.coils[140] and self.plc.coils[141])
+        self.assertFalse(self.out.busy())
+        self.assertEqual(self.plc.forbidden, [])
+
+    def test_two_pulses_on_one_ejector_become_one_longer_pulse_and_both_are_reported(self):
+        self.running[0] = True
+        self.out.fire(6, 0, 100, source="a")
+        self.out.fire(6, 60, 100, source="b")
+        self.at(0.0)
+        self.at(0.06)
+        self.at(0.11)
+        self.assertTrue(self.plc.coils[105])                       # still ON for the second cashew
+        self.at(0.16)
+        self.assertFalse(self.plc.coils[105])
+        self.assertEqual(sorted(e[5] for e in self.out.recent_events()), ["a", "b"])
+        self.assertEqual(self.out.sent[6], 2)
+
+    def test_the_engine_thread_fires_a_real_time_pulse(self):
+        plc = FakePLC()
+        out = RelayOutput(plc)                                     # its own thread and the real clock
+        try:
+            self.assertEqual(out.manual_pulse(12, 30), ro.SCHEDULED)
+            end = time.time() + 2.0
+            while 12 not in out.last_result and time.time() < end:
+                time.sleep(0.005)
+            self.assertEqual(out.last_result[12][1], ro.SENT)
+            self.assertEqual((plc.writes[0], plc.writes[-1]), ((12, True), (12, False)))
+        finally:
+            out.stop()
+
+    def test_describe_shows_the_coil(self):
+        self.assertEqual(self.out.describe(21), "Ejector 21 -> M120 (Modbus address 120)")
 
 
 if __name__ == "__main__":

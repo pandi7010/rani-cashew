@@ -1,8 +1,8 @@
 """PLC DIAGNOSTICS window: the 5-track "Ejector Hardware Test" for the Inovance PLC.
 
-Connection, counters since program start, the ejector -> M coil table with TEST per ejector and SAVE MAPPING
-(supervisor password, logs/mapping_changes.log), ejector check, ALL EJECTORS OFF NOW.
-Every test goes through relay_output (DRY-RUN, relays 1-40, never M140 / M141).
+Connection, counters since program start, the ejector -> M coil table with a pulse button per ejector and SAVE
+MAPPING (supervisor password, logs/mapping_changes.log), SEQUENCE ALL, FIRE ALL, ejector check, ALL RELAYS OFF NOW.
+Every button writes to the real PLC through relay_output: only while STOPPED, relays 1-40, never M140 / M141.
 """
 import tkinter as tk
 from tkinter import messagebox
@@ -64,8 +64,8 @@ class PlcDiagnostics(tk.Toplevel):
         # ── counters ──
         body, top = card("DIAGNOSTIC COUNTERS", "since program start")
         self.tiles = {}
-        for i, (key, title) in enumerate((("sent", "PULSES SENT"), ("dry", "DRY-RUN (NOT SENT)"), ("reconnects", "RECONNECTS"), ("write_fail", "WRITE / READ-BACK FAIL"),
-                                          ("lost", "LOST (PLC OFFLINE)"), ("blocked", "BLOCKED"))):
+        for i, (key, title) in enumerate((("sent", "PULSES OK"), ("reconnects", "RECONNECTS"), ("write_fail", "WRITE / READ-BACK FAIL"),
+                                          ("lost", "LOST (PLC OFFLINE)"), ("blocked", "BLOCKED"), ("cancelled", "CANCELLED BY STOP"))):
             tile = tk.Frame(body, bg=ui.FIELD, highlightthickness=1, highlightbackground=ui.BORDER, width=188, height=62)
             tile.pack(side=tk.LEFT, padx=(0, 8))
             tile.pack_propagate(False)
@@ -73,18 +73,15 @@ class PlcDiagnostics(tk.Toplevel):
             value = tk.Label(tile, text="0", font=(F, ui.F_HEAD, "bold"), fg=ui.GOOD, bg=ui.FIELD, anchor="w")
             value.pack(fill=tk.X, padx=10)
             self.tiles[key] = value
-        tk.Label(top, text="BLOCKED = refused (not an ejector) or MASTER EJECTOR off.  The PLC controller does not count write timeouts itself: NOT AVAILABLE.",
+        tk.Label(top, text="BLOCKED = refused (not an ejector, or a manual button while RUNNING).  Write timeouts are not counted by the PLC controller: NOT AVAILABLE.",
                  font=(F, -11), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.RIGHT)
 
         # ── mapping ──
         body, top = card("EJECTORS AND PLC COILS", "ejector -> M address;  M140 conveyor and M141 feeder can never be ejectors")
-        tk.Label(top, text="TEST PULSE (ms)", font=(F, ui.F_SMALL, "bold"), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.RIGHT, padx=(0, 70))
-        self.pulse_var = tk.StringVar(value="100")
-        tk.Entry(top, textvariable=self.pulse_var, width=5, bg=ui.FIELD, fg=ui.TEXT, insertbackground=ui.TEXT, bd=0, justify="center",
-                 font=(F, ui.F_BODY, "bold"), highlightthickness=1, highlightbackground=ui.BORDER).place(relx=1.0, x=-8, y=0, anchor="ne")
+        tk.Label(top, text="⚡ fires that ejector at once with its pulse from the Pneumatic page", font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.RIGHT)
         grid = tk.Frame(body, bg=ui.PANEL)
         grid.pack(fill=tk.X)
-        self.addr_vars, self.addr_entries, self.row_status = {}, {}, {}
+        self.addr_vars, self.addr_entries, self.row_status, self._fired = {}, {}, {}, {}
         self.saved = {r: self.out.address_of(r) for r in plc_mapping.EJECTORS}
         for relay in plc_mapping.EJECTORS:
             block, row = (relay - 1) // 10, (relay - 1) % 10
@@ -98,8 +95,8 @@ class PlcDiagnostics(tk.Toplevel):
                              font=(F, ui.F_BODY), highlightthickness=1, highlightbackground=ui.BORDER)
             entry.pack(side=tk.LEFT, padx=(2, 6), ipady=1)
             var.trace_add("write", lambda *_: self._mapping_edited())
-            ui.FlatButton(cell, "TEST", command=lambda r=relay: self._test(r), height=24, width=52, font=(F, -11, "bold")).pack(side=tk.LEFT)
-            status = tk.Label(cell, text="", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL, width=11, anchor="w")
+            ui.FlatButton(cell, "⚡", command=lambda r=relay: self._test(r), kind="danger", height=24, width=40, font=(F, -12, "bold")).pack(side=tk.LEFT)
+            status = tk.Label(cell, text="", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL, width=13, anchor="w")
             status.pack(side=tk.LEFT, padx=(6, 0))
             self.addr_vars[relay], self.addr_entries[relay], self.row_status[relay] = var, entry, status
         low = tk.Frame(body, bg=ui.PANEL)
@@ -110,21 +107,23 @@ class PlcDiagnostics(tk.Toplevel):
         self.btn_save.pack(side=tk.RIGHT)
         ui.FlatButton(low, "RESET TO DEFAULT", command=self._reset_default, kind="muted", height=34, width=170).pack(side=tk.RIGHT, padx=8)
 
-        tk.Label(self, text="TEST fires the ejector of that row through the saved table (it follows DRY-RUN). SAVE MAPPING asks for the supervisor password. "
+        tk.Label(self, text="⚡ fires the REAL valve of that row through the saved table, only when STOPPED. SAVE MAPPING asks for the supervisor password. "
                             "The software cannot sense air or the valve: confirm each ejector by eye, or use the ejector check.",
                  font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.BG, justify="left", anchor="w", wraplength=1200).pack(fill=tk.X, padx=18, pady=(10, 0))
         self.lbl_result = tk.Label(self, text="", font=(F, ui.F_BODY, "bold"), fg=ui.TEXT, bg=ui.BG, anchor="w")
         self.lbl_result.pack(fill=tk.X, padx=18, pady=(6, 0))
 
-        self.btn_off = tk.Label(self, text="■  ALL EJECTORS OFF NOW", font=(F, ui.F_HEAD, "bold"), fg="#FFFFFF", bg=ui.BAD, cursor="hand2", pady=12)
+        self.btn_off = tk.Label(self, text="■  ALL RELAYS OFF NOW", font=(F, ui.F_HEAD, "bold"), fg="#FFFFFF", bg=ui.BAD, cursor="hand2", pady=12)
         self.btn_off.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=(8, 14))
         self.btn_off.bind("<Button-1>", lambda e: self._all_off())
         buttons = tk.Frame(self, bg=ui.BG)
         buttons.pack(side=tk.BOTTOM, fill=tk.X, padx=16)
-        ui.FlatButton(buttons, "RUN EJECTOR CHECK 1-40", command=app._open_ejector_check, height=40, width=280).pack(side=tk.LEFT)
-        ui.FlatButton(buttons, "COPY DIAGNOSTICS", command=self._copy, kind="muted", height=40, width=220).pack(side=tk.LEFT, padx=8)
-        ui.FlatButton(buttons, "CLOSE", command=self.destroy, kind="muted", height=40, width=140).pack(side=tk.RIGHT)
-        ui.FlatButton(buttons, "PLC VENDOR TOOL ...", command=app._open_plc_vendor_tool, kind="muted", height=40, width=220).pack(side=tk.RIGHT, padx=8)
+        ui.FlatButton(buttons, "SEQUENCE ALL", command=app._sequence_all, kind="danger", height=40, width=160).pack(side=tk.LEFT)
+        ui.FlatButton(buttons, "FIRE ALL", command=app._fire_all, kind="danger", height=40, width=120).pack(side=tk.LEFT, padx=8)
+        ui.FlatButton(buttons, "EJECTOR CHECK 1-40", command=app._open_ejector_check, height=40, width=210).pack(side=tk.LEFT)
+        ui.FlatButton(buttons, "COPY DIAGNOSTICS", command=self._copy, kind="muted", height=40, width=190).pack(side=tk.LEFT, padx=8)
+        ui.FlatButton(buttons, "CLOSE", command=self.destroy, kind="muted", height=40, width=110).pack(side=tk.RIGHT)
+        ui.FlatButton(buttons, "VENDOR TOOL ...", command=app._open_plc_vendor_tool, kind="muted", height=40, width=170).pack(side=tk.RIGHT, padx=8)
         self._mapping_edited()
         self._tick()
 
@@ -180,32 +179,32 @@ class PlcDiagnostics(tk.Toplevel):
     def _stopped(self):
         return self.app.shared_state.phase != "RUNNING"
 
-    def _pulse(self):
-        try:
-            return min(1000, max(20, int(self.pulse_var.get())))
-        except ValueError:
-            return 100
-
     def _test(self, relay):
+        """Lightning button of a row: fires that ejector at once (real PLC), with its pulse of the Pneumatic page."""
         if not self._stopped():
-            self.lbl_result.config(text="Tests are only possible when the machine is STOPPED.", fg=ui.WARN)
+            self.lbl_result.config(text="Refused: the machine is RUNNING. Manual fire only when STOPPED.", fg=ui.WARN)
             return
         if self.table().get(relay) != self.saved.get(relay):
-            self.lbl_result.config(text=f"A{relay:02d}: the changed address is not saved yet. TEST uses the saved table: SAVE MAPPING first.", fg=ui.WARN)
+            self.lbl_result.config(text=f"A{relay:02d}: the changed address is not saved yet. The button uses the saved table: SAVE MAPPING first.", fg=ui.WARN)
             return
-        result = self.out.test_fire(relay, self._pulse(), action="PLC DIAGNOSTICS TEST")
-        self.row_status[relay].config(text={ro.SENT: "sent", ro.DRY_RUN: "dry-run"}.get(result, result.lower()), fg=ui.GOOD if result == ro.SENT else ui.WARN)
-        self.lbl_result.config(text=f"A{relay:02d} -> M{self.saved.get(relay)}:  {ro.RESULT_TEXT.get(result, result)}", fg=ui.GOOD if result == ro.SENT else ui.WARN)
+        pulse = int(self.app.shared_state.get_timing(relay)[1])
+        self._fired[relay] = self.app.relay_output._clock()
+        result = self.out.manual_pulse(relay, pulse, action="MAPPING WINDOW PULSE")
+        self.row_status[relay].config(text="firing ..." if result == ro.SCHEDULED else ro.RESULT_TEXT.get(result, result)[:16],
+                                      fg=ui.ACCENT if result == ro.SCHEDULED else ui.BAD)
+        self.lbl_result.config(text=f"A{relay:02d} -> M{self.saved.get(relay)}, {pulse} ms:  {ro.RESULT_TEXT.get(result, result)}",
+                               fg=ui.ACCENT if result == ro.SCHEDULED else ui.BAD)
 
     def _all_off(self):
         done, error = self.out.all_ejectors_off()
-        self.lbl_result.config(text=f"ALL EJECTORS OFF: {done} of 40 written OFF." + (f"  {error}" if error else ""), fg=ui.BAD if error else ui.GOOD)
+        self.app._sequence_running = False
+        self.lbl_result.config(text=f"ALL RELAYS OFF: {done} of 40 written OFF." + (f"  PLC error: {error}" if error else ""), fg=ui.BAD if error else ui.GOOD)
 
     def diagnostics_text(self):
         wanted, sent, not_sent = self.out.counts()
         lines = ["PLC DIAGNOSTICS", f"PLC {getattr(self.plc, 'plc_ip', '?')}:{getattr(self.plc, 'plc_port', '?')} unit {getattr(self.plc, 'plc_unit_id', '?')}  "
                  f"{'ONLINE' if self.out.is_connected() else 'OFFLINE'}  type {getattr(self.plc, 'register_type', '?')}",
-                 f"DRY-RUN {'ON' if self.out.dry_run else 'OFF'}  MASTER EJECTOR {'ON' if self.out.master_enabled else 'OFF'}",
+                 f"machine {'STOPPED' if self._stopped() else 'RUNNING'}",
                  f"pulses sent {sum(sent.values())}  not sent {not_sent}  reconnects {self.app.plc_reconnects}",
                  "table " + " ".join(f"A{r:02d}=M{self.saved.get(r)}" for r in plc_mapping.EJECTORS)]
         return "\n".join(lines)
@@ -218,17 +217,27 @@ class PlcDiagnostics(tk.Toplevel):
     def _tick(self):
         if not self.winfo_exists():
             return
-        dry, online, stopped = self.out.dry_run, self.out.is_connected(), self._stopped()
-        self.lbl_mode.config(text="DRY-RUN ON:  nothing sent to the PLC" if dry else "DRY-RUN OFF:  REAL VALVES", fg="#1A1300" if dry else "#FFFFFF", bg=ui.WARN if dry else ui.BAD)
+        online, stopped = self.out.is_connected(), self._stopped()
+        self.lbl_mode.config(text="REAL VALVES  -  manual fire only when STOPPED", fg="#FFFFFF", bg=ui.BAD)
+        for relay, since in list(self._fired.items()):          # OK / PLC error next to the button when the pulse is over
+            last = self.out.last_result.get(relay)
+            if last and last[0] >= since:
+                ok = last[1] == ro.SENT
+                self.row_status[relay].config(text="OK" if ok else "PLC error", fg=ui.GOOD if ok else ui.BAD)
+                self.lbl_result.config(text=f"A{relay:02d} -> M{self.saved.get(relay)}:  {ro.RESULT_TEXT.get(last[1], last[1])}" + (f"  ({last[2]})" if last[2] else ""),
+                                       fg=ui.GOOD if ok else ui.BAD)
+                del self._fired[relay]
         self.pill_machine.set("STOPPED" if stopped else "RUNNING", ui.GOOD if stopped else ui.BAD)
         self.pill_plc.set("ONLINE" if online else "OFFLINE", ui.GOOD if online else ui.BAD)
         self.lbl_conn.config(text=f"Inovance PLC, Modbus TCP  {getattr(self.plc, 'plc_ip', '?')} : {getattr(self.plc, 'plc_port', '?')}    unit {getattr(self.plc, 'plc_unit_id', '?')}"
                                   f"    {getattr(self.plc, 'register_type', '')}")
         wanted, sent, not_sent = self.out.counts()
-        values = {"sent": sum(sent.values()), "dry": not_sent.get(ro.DRY_RUN, 0), "reconnects": self.app.plc_reconnects,
+        values = {"sent": sum(sent.values()), "reconnects": self.app.plc_reconnects,
                   "write_fail": not_sent.get(ro.WRITE_FAIL, 0) + not_sent.get(ro.READBACK_FAIL, 0), "lost": not_sent.get(ro.PLC_OFFLINE, 0),
-                  "blocked": not_sent.get(ro.REFUSED, 0) + not_sent.get(ro.MASTER_OFF, 0)}
+                  "blocked": not_sent.get(ro.REFUSED, 0) + not_sent.get(ro.NOT_STOPPED, 0), "cancelled": not_sent.get(ro.CANCELLED, 0)}
         for key, value in values.items():
             bad = value > 0 and key in ("reconnects", "write_fail", "lost", "blocked")
+            if key == "cancelled":
+                bad = False
             self.tiles[key].config(text=str(value), fg=ui.BAD if bad else ui.GOOD)
         self.after(300, self._tick)

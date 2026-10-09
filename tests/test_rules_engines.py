@@ -151,7 +151,7 @@ class TrackerRuleTest(unittest.TestCase):
 class AlarmTest(unittest.TestCase):
     def collect(self, **kw):
         base = dict(camera_connected=True, camera_state="ONLINE", plc_connected=True, running=True, ai_fps=30.0,
-                    min_fps=10.0, free_gb=200.0, missed_rejects=[], dry_run=False)
+                    min_fps=10.0, free_gb=200.0, missed_rejects=[])
         base.update(kw)
         return alarms.collect(**base)
 

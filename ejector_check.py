@@ -1,8 +1,7 @@
 """Automatic ejector check: every chosen relay gets a few pulses, each confirmed by reading the coil back.
 
-No GUI here (the window is ejector_check_ui.py). All firing goes through RelayOutput.check_pulse(), so
-DRY-RUN holds exactly as for every other manual fire, only relays 1-40 can be addressed and conveyor (M140)
-and feeder (M141) are never touched.
+No GUI here (the window is ejector_check_ui.py). All firing goes through RelayOutput.check_pulse(): real PLC,
+only while the machine is STOPPED, only relays 1-40; conveyor (M140) and feeder (M141) are never touched.
 
 The software cannot see the air. PLC OK only means: the PLC took the ON and the OFF write and reported the
 coil in that state. Whether the right valve blew is marked by the operator: AIR OK / NO AIR / WRONG VALVE.
@@ -23,11 +22,10 @@ DEFAULTS = {"pulses": 5, "pulse_ms": 100, "gap_ms": 400, "relay_gap_ms": 1000, "
 LIMITS = {"pulses": (1, 20), "pulse_ms": (10, 1000), "gap_ms": (50, 5000), "relay_gap_ms": (0, 10000), "countdown_s": (0, 30)}
 
 IDLE, COUNTDOWN, RUNNING, DONE, STOPPED, ERROR = "IDLE", "COUNTDOWN", "RUNNING", "DONE", "STOPPED", "ERROR"
-PLC_OK, PLC_FAIL, DRY, NOT_RUN, UNFINISHED = "PLC OK", "PLC FAIL", "DRY-RUN", "not run", "STOPPED"
+PLC_OK, PLC_FAIL, NOT_RUN, UNFINISHED = "PLC OK", "PLC FAIL", "not run", "STOPPED"
 AIR_OK, NO_AIR, WRONG_VALVE, NOT_CHECKED = "AIR OK", "NO AIR", "WRONG VALVE", "not checked"
 MARKS = (AIR_OK, NO_AIR, WRONG_VALVE)
 LOG_FIELDS = ["time", "relay", "m_address", "pulses_sent", "plc", "operator_mark", "error"]
-DRY_RUN_TEXT = "DRY-RUN: nothing sent to the PLC"
 
 
 def relays_for(choice: str, single: int = 1) -> List[int]:
@@ -62,7 +60,7 @@ class RelayResult:
     relay: int
     address: Optional[int]
     status: str = NOT_RUN
-    pulses_sent: int = 0        # pulses given to the PLC (0 in DRY-RUN)
+    pulses_sent: int = 0        # pulses given to the PLC
     pulses_ok: int = 0          # of them: ON and OFF confirmed by read-back
     error: str = ""
     mark: str = NOT_CHECKED
@@ -81,7 +79,6 @@ class EjectorCheck:
         self._thread = None
         self.phase, self.message = IDLE, ""
         self.current_relay, self.current_pulse, self.pulses, self.countdown = None, 0, DEFAULTS["pulses"], 0
-        self.dry_run_at_start = True
         self.results: Dict[int, RelayResult] = {r: RelayResult(r, relay_output.address_of(r)) for r in range(ro.FIRST_EJECTOR, ro.LAST_EJECTOR + 1)}
         self.last_summary = ("NOT RUN", "idle")     # (text for the top bar pill, level: good / warn / bad / idle)
 
@@ -131,8 +128,8 @@ class EjectorCheck:
     def run(self, relays: List[int], params: Optional[dict] = None):
         p = clean_params(params)
         with self._lock:
-            self.phase, self.pulses, self.dry_run_at_start = COUNTDOWN, p["pulses"], bool(self.out.dry_run)
-            self.message = DRY_RUN_TEXT if self.dry_run_at_start else "Stand clear of the nozzles."
+            self.phase, self.pulses = COUNTDOWN, p["pulses"]
+            self.message = "Stand clear of the nozzles."
             for relay in set(relays):
                 self.results[relay] = RelayResult(relay, self.out.address_of(relay))
         try:
@@ -155,7 +152,7 @@ class EjectorCheck:
                     return self._end(STOPPED, f"Stopped at relay {relay}.")
                 if n < len(relays) - 1 and self._wait(p["relay_gap_ms"] / 1000.0):
                     return self._end(STOPPED, f"Stopped after relay {relay}.")
-            self._end(DONE, DRY_RUN_TEXT if self.dry_run_at_start else "Check finished.")
+            self._end(DONE, "Check finished.")
         except Exception as e:      # never leave a relay on because of a bug here
             log.exception("Ejector check failed")
             self._abort(f"Internal error: {e}")
@@ -173,12 +170,15 @@ class EjectorCheck:
             if result == ro.SENT:
                 res.pulses_sent += 1
                 res.pulses_ok += 1
-            elif result != ro.DRY_RUN:
+            else:
                 if result in (ro.WRITE_FAIL, ro.READBACK_FAIL):
                     res.pulses_sent += 1
                 res.error = res.error or f"pulse {i}: {error or result}"
                 if result == ro.PLC_OFFLINE:
                     fault = f"PLC disconnected at relay {relay}, pulse {i}."
+                    break
+                if result == ro.NOT_STOPPED:
+                    fault = f"The machine was started at ejector {relay}, pulse {i}."
                     break
                 if result == ro.REFUSED:
                     break
@@ -190,8 +190,6 @@ class EjectorCheck:
             res.status = PLC_FAIL
         elif attempted < p["pulses"]:
             res.status = UNFINISHED
-        elif self.dry_run_at_start or res.pulses_sent == 0:
-            res.status = DRY
         else:
             res.status = PLC_OK
         self._log(res)
@@ -229,8 +227,6 @@ class EjectorCheck:
                 self.last_summary = (f"AIR FAULT {short(bad_air)} ({when})", "bad")
             elif self.phase == STOPPED:
                 self.last_summary = (f"STOPPED ({when})", "warn")
-            elif ran and all(r.status == DRY for r in ran):
-                self.last_summary = (f"DRY-RUN ({when})", "warn")
             elif ran:
                 self.last_summary = (f"{'ALL' if len(ran) == 40 else len(ran)} OK ({when})", "good")
 
