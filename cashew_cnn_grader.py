@@ -41,6 +41,7 @@ import fire_timing
 import ejector_check
 import ejector_check_ui
 import production_capture
+import undefined_capture
 import dataset_ops
 import relay_mapping
 import decision
@@ -928,6 +929,9 @@ class ProcessingThread(threading.Thread):
         self.model_lock = threading.Lock()
         self.trackers = {1: LaneTracker(1), 2: LaneTracker(2)}    # one tracker and one ID series per ROI
         self.capture = production_capture.ProductionCapture()     # inbox capture; its own saver thread
+        # Every Undefined / lost / double cashew: all views + the full frame into captures/<undefined|double>/<date>/
+        self.undefined_capture = undefined_capture.UndefinedCapture(app_paths.CAPTURES_DIR)
+        self._clean_frame = None
         self.frame_time = time.time()
         self.ai_fps, self._ai_count, self._ai_since = 0.0, 0, time.time()   # frames graded per second
         frame_log = shared_state.grading.get("frame_log", {})
@@ -1259,6 +1263,7 @@ class ProcessingThread(threading.Thread):
                 tracker.clear()
 
         clean_frame = frame.copy()                      # for inference and saved images (no overlay)
+        self._clean_frame = clean_frame
         flow, grading = state["flow"], state["grading"]
         lines = {1: state["line_pos"], 2: state.get("line_pos2")}
         self._draw_lines(frame, state, 2)
@@ -1302,6 +1307,8 @@ class ProcessingThread(threading.Thread):
                     self.capture.note_view(det.track.id, crop, decision.canonical(det.data["cnn"]), det.data["cnn_conf"])
                 if not det.track.decided:
                     det.track.frames.append(det.data)
+                    bx1, by1, bx2, by2 = det.data["box"]
+                    self.undefined_capture.note_view(det.track.id, clean_frame[max(0, by1):by2, max(0, bx1):bx2])
                 det.track.info["last"] = det.data
             live = next((d.data for d in detections if d.data.get("feat")), None)
             for lost in tracker.dropped:        # disappeared before its line: LOST, nothing is fired
@@ -1520,6 +1527,16 @@ class ProcessingThread(threading.Thread):
             detail.append(f"+{r['t']:6.0f} ms  CNN {str(r['cnn']):<12} {r['cnn_conf']:.2f}  YOLO {str(r['yolo']):<12} {r['yolo_conf']:.2f}  "
                           f"{r['view']:<5}{' EDGE' if r['edge_cut'] else ''}  {feat_txt}")
         self.shared_state.add_decision(trk.id, label, f"{d.frames_used}f", relay or 0, count_keys, "\n".join(detail))
+        # Auto capture: Undefined (not the GOOD cashews held back only because the size grades are not ready) and double.
+        if d.result == decision.DOUBLE:
+            category = undefined_capture.DOUBLE
+        elif d.result == decision.UNDEFINED and not str(d.reason).startswith(decision.SIZE_NOT_READY):
+            category = undefined_capture.UNDEFINED
+        else:
+            category = None
+        self.undefined_capture.on_result(trk.id, category, d.reason, {
+            "roi": rid, "result": d.result, "label": label, "relay": relay or "", "fire": fire_result, "frames": d.frames_total,
+            "frames_used": d.frames_used, "votes": d.votes, "views_seen": d.views, "box": [int(v) for v in trk.box]}, self._clean_frame)
         with self.shared_state.lock:
             self.shared_state.size_samples.append({
                 "id": trk.id, "t": time.time(), "l": (length_px or 0.0) / px_per_mm, "w": (width_px or 0.0) / px_per_mm,
@@ -1556,6 +1573,8 @@ class ProcessingThread(threading.Thread):
             pass
         self.cashew_log.write({"id": trk.id, "roi": rid, "frames": len(trk.frames), "result": decision.LOST, "reason": reason,
                                "fire": "NOT_FIRED", "shadow": note})
+        self.undefined_capture.on_result(trk.id, undefined_capture.UNDEFINED, f"LOST_{reason}", {
+            "roi": rid, "result": decision.LOST, "fire": "NOT_FIRED", "frames": len(trk.frames), "where": note}, self._clean_frame)
 
     def _draw_track(self, frame, trk, grading):
         x1, y1, x2, y2 = [int(v) for v in trk.box]
@@ -2504,6 +2523,8 @@ class App(tk.Tk):
         self.kpi["throughput"].set(f"{kg_hr(per_min):.1f}", f"kg/hr   •   {per_min} pcs/min")
         shown = (decision.GOOD, decision.UNDEFINED, decision.REJECTION)
         parts = [f"NOT ROLLED {counts.get('UNDEFINED: ' + decision.NOT_ROLLED, 0)}", f"DOUBLE {counts.get(decision.DOUBLE, 0)}", f"LOST {counts.get(decision.LOST, 0)}", "LATE: step (c3)", f"kg/hr at {weight_g:g} g per cashew"]
+        captured = self.processing_thread.undefined_capture.status()
+        parts.insert(3, f"CAPTURED {captured['today']}" + (f" ({captured['blocked']})" if captured["blocked"] else ""))
         with ss.lock:
             engine_counts = dict(ss.engine_counts)
         if engine_counts:
@@ -6271,6 +6292,7 @@ except Exception as e:
             self.ejector_check.stop()
         if hasattr(self, 'processing_thread'):
             self.processing_thread.capture.stop()
+            self.processing_thread.undefined_capture.stop()
         if hasattr(self, 'relay_output'):
             self.relay_output.cancel_pending()
             self.relay_output.stop()

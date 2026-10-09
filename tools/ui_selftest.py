@@ -53,6 +53,7 @@ json.dump(cfg, open(T / "pneumatic_config.json", "w"), indent=2)
 
 import app_paths
 app_paths.LOGS_DIR, app_paths.CFG_PATH, app_paths.INBOX_DIR = T / "logs", T / "pneumatic_config.json", T / "inbox"
+app_paths.CAPTURES_DIR = T / "captures"
 app_paths.MACHINE_CONFIG_PATH, app_paths.ACTIVE_MODELS_PATH = T / "machine_config.json", T / "active_models.json"
 import cashew_cnn_grader as g
 import ui_debug
@@ -139,6 +140,8 @@ print("  STOP: state", app.shared_state.phase, "| waiting pulses", len(out.pendi
 print("== pages")
 names = ["Pneumatic", "Sorting Logic", "Colour Size", "Vision ROI", "Teaching CNN", "Dataset Capture", "Teaching YOLO", "AI Model Select", "Test Console", "Network", "Info"]
 names = [n for n in names if n in app.pages] + [n for n in app.nav_buttons if n not in names and n != "Home"]
+if os.environ.get("GSN_SELFTEST_QUICK"):      # only the checks, no page pictures (faster)
+    names = []
 for number, page in enumerate(names, start=2):
     app._switch_page(page)
     pump(2.5 if page in ("AI Model Select", "Info", "Teaching CNN") else 0.8)
@@ -150,27 +153,31 @@ for number, page in enumerate(names, start=2):
         app.model_page.refresh()
     shot(app, f"{number:02d}_" + page.lower().replace(" ", "_"))
 print("== tool windows")
-app._switch_page("Pneumatic")
-app._open_plc_diagnostics()
-win = app._plc_diag_window
-pump(0.5)
-win._test(5)
-pump(0.5)
-print("  mapping window lightning A05:", win.row_status[5].cget("text"), "|", win.lbl_result.cget("text"))
-shot(win, "20_window_plc_mapping")
-win.destroy()
-app._open_ejector_check()
-w = app._ejector_check_window
-w.overrideredirect(True)
-w.geometry(f"1180x980+{app.winfo_screenwidth() + 4500}+0")
-shot(w, "21_window_ejector_check")
-w.destroy()
-app._popup_mapper(7)
-shot(app._mapper_window[0], "22_window_ejector_picker")
-app._mapper_window[0].destroy()
+if not os.environ.get("GSN_SELFTEST_QUICK"):
+    app._switch_page("Pneumatic")
+    app._open_plc_diagnostics()
+    win = app._plc_diag_window
+    pump(0.5)
+    win._test(5)
+    pump(0.5)
+    print("  mapping window lightning A05:", win.row_status[5].cget("text"), "|", win.lbl_result.cget("text"))
+    shot(win, "20_window_plc_mapping")
+    win.destroy()
+    app._open_ejector_check()
+    w = app._ejector_check_window
+    w.overrideredirect(True)
+    w.geometry(f"1180x980+{app.winfo_screenwidth() + 4500}+0")
+    shot(w, "21_window_ejector_check")
+    w.destroy()
+    app._popup_mapper(7)
+    shot(app._mapper_window[0], "22_window_ejector_picker")
+    app._mapper_window[0].destroy()
 if len(sys.argv) > 2:
     exec(open(sys.argv[2]).read())          # extra checks of a development step
 print("  menu:", list(app.nav_buttons))
+app.destroy = lambda: None          # without a Tk main loop, destroying the window can stall; the process ends below
 app._on_close()
 shutil.rmtree(T, ignore_errors=True)
 print("done ->", OUT)
+sys.stdout.flush()
+os._exit(0)            # worker threads of the AI libraries can keep the interpreter from ending

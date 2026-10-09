@@ -4,6 +4,56 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## HANDOFF - paused 2026-10-10 about 03:00 on your instruction
+
+### Done and committed
+
+| Commit | Content |
+|---|---|
+| `7b0e2c3` | Home: ROI boxes (ROI 1 yellow, ROI 2 magenta) drawn again while RUNNING. LOST rows in `logs/cashews_*.csv` now say where the cashew was seen (column `shadow`). |
+| this commit | PART 1 (part): automatic capture of Undefined / lost / double cashews. |
+
+### PART 1 - what I can say so far
+
+| Step of the flow | Result |
+|---|---|
+| Cashew enters ROI, gets one ID | **Not reliable yet.** In your run of 02:03-02:05, 10 of 32 log rows are LOST with only 1-4 frames; 7 of them are followed about 0.6 s later by a normally decided cashew in the same ROI. So most LOST are probably not missing cashews but a second short-lived ID (broken ID or a second box on the same cashew). I could not find the cause: the old log had no positions. A simulation of "cashew enters, frames missed" did **not** split the ID, so I did not change the tracker. The next run logs positions; then it can be decided. |
+| YOLO finds it in every frame | Mostly: decided cashews had 17-24 frames of about 25 possible; gaps up to 114 ms were seen inside a track. |
+| CNN every frame, voting, defect -> its ejector | Works in the log (UPW -> 2 / 22, TESTA SMALL -> 29, REJECTION -> 21). Note: 98 of 435 frames were "edge cut" (cashew touching the ROI edge) and do not vote; some cashews had only 2-8 usable frames of 22. |
+| Undefined -> reject ejector 1 / 21 | Works (too_few_frames, LOST over 300 ms -> 1 / 21). A cashew that **vanishes** before the line (LOST) is not fired: there is nothing to time the pulse on. |
+| Undefined -> auto capture | **Was not built. Built now**: `captures/undefined/<YYYYMMDD>/<HHMMSS>_<id>_<reason>_full.jpg` (whole frame), `..._v01.jpg ...` (every view, up to 30), `....json` (reason, votes, ejector). Vanished cashews go there too (`LOST_...`); DOUBLE goes to `captures/double/<date>/`. Own thread, nothing is deleted, pauses at 5,000 cashews per day or under 20 GB free (my assumption, same numbers as the inbox). GOOD cashews held back only by SIZE_NOT_READY are not captured. Home shows `CAPTURED n`. Tested with the simulated belt: 11 Undefined cashews -> 187 files, none missing. **Not tested on the machine.** |
+| GOOD -> SW / WW -> size grade -> grade ejector | **Not working yet**: colour is not measured, the grade comes from the old length table, and all GOOD go to 1 / 21 while SIZE GRADES READY is off. This is PART 2. |
+
+### Finding: the program can freeze when it is closed
+
+In my test (fake PLC) closing the window (EXIT / `_on_close`) stalls inside Tk while destroying a TEACH button of the size
+table on the Colour Size page. It closed normally when Colour Size was the page on screen, and stalled when another page was
+on screen or several pages had been visited. Cause not found yet. If EXIT freezes on the machine: this is it; kill the
+window, nothing is lost (settings are saved before that point). It came in with the Colour Size page (`66bd3fb`).
+
+### Half done
+
+- Nothing is half written in the code. One experiment for the freeze (TEACH buttons in a holder frame) was taken out again, untested.
+- Not on a branch, not stashed: everything in the working tree is either committed or yours (config files, the
+  models `cnn_Default_20261010_005648` and `..._022114`, the `golden_crops` deletions).
+
+### Exact next steps
+
+1. **Close freeze**: find the widget rule that stalls (try: TEACH buttons packed in a holder frame; then without
+   `columnspan` / `weight` in that table), test with a script that closes inside a real Tk main loop after visiting 0, 1 and 4 pages.
+2. **PART 1 rest**: read the new `shadow` notes of LOST rows after your next run and decide the tracker change; look at why
+   so many frames are "edge cut" (ROI 2 reaches the image border at y 2047).
+3. **PART 2 (c2)**: (a) colour value per frame inside the mask (proposal: LAB b* median; L and a are already measured per
+   frame), median over the track; (b) SW / WW threshold + TEACH SW / TEACH WW with two histograms on Colour Size;
+   (c) grade from the taught limits (`size_config.grades`, WW and SW sets), median length in mm; (d) SHADOW: log "would be
+   W240 / SW210" until SIZE GRADES READY; (e) RECENT RESULTS columns class, SW / WW, colour, length, grade, ejector;
+   (f) machine instructions for px per mm, colours, grades.
+4. **PART 3**: fixed colour per class (14 colours) used in graphs, class list and confusion matrix; live per-class
+   validation lines + overall white line; train / validation loss; clickable legend; red for FIRE classes under 98 %;
+   PNG next to the model (per-epoch per-class accuracy must be added to the training history first).
+
+---
+
 ## 2026-10-10 (3): PART C - remaining pages in the 5-track layout; summary of this session
 
 ### Pages

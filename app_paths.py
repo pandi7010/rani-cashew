@@ -18,6 +18,7 @@ ASSETS_DIR = BASE_DIR / "assets"
 NAV_ICONS_DIR = ASSETS_DIR / "nav_icons"
 RUNS_DIR = BASE_DIR / "runs"
 LOGS_DIR = BASE_DIR / "logs"
+CAPTURES_DIR = BASE_DIR / "captures"                     # captures/undefined/<date>/, captures/double/<date>/ (not in git)
 AUTO_LABELER_SCRIPT = BASE_DIR / "ai_auto_labeler.py"
 # The active program's data (5-track layout: programs/<name>/dataset, testset, inbox). One program until (e3).
 PROGRAM_NAME = "Default"
