@@ -34,6 +34,7 @@ import copy
 from collections import OrderedDict
 import segmentation
 import view_features
+import ui_theme as ui
 import decision
 import grading_config
 from lane_tracker import LaneTracker, Detection, crossing_time, track_speed
@@ -137,7 +138,7 @@ DEFAULT_ON_MS = 25
 VIDEO_PANE_W = 1000 
 VIDEO_PANE_H = 800 
 
-BG_COLOR = (30, 30, 30)
+BG_COLOR = (13, 8, 5)        # letterbox around the camera picture (B, G, R) = the theme's darkest tone
 TEXT_COLOR = (230, 230, 230)
 LINE_COLOR = (0, 0, 255) 
 AOI_COLOR1 = (0, 255, 255) 
@@ -455,6 +456,8 @@ class SharedState:
         self.lane_speed = {1: 0.0, 2: 0.0}                  # px/ms, from the tracker
         self.teach_belt_requested = False
         self.teach_belt_message = ""
+        self.decision_times = deque(maxlen=5000)            # for pcs/min on the Home page
+        self.last_result = {}                               # ROI -> (time, was GOOD), for the lane LEDs
         self.opencv_filter = {
             "sw_color_thresh": 45,
             "sw_defect_size_px": 20,
@@ -548,8 +551,17 @@ class SharedState:
             for key in count_keys:
                 self.result_counts[key] = self.result_counts.get(key, 0) + 1
             self.recent_decisions[track_id] = detail
+            now = time.time()
+            self.decision_times.append(now)
+            if track_id[:1] == "R" and track_id[1:2].isdigit():
+                self.last_result[int(track_id[1])] = (now, label.startswith("GOOD"))
             while len(self.recent_decisions) > 300:
                 self.recent_decisions.popitem(last=False)
+
+    def decisions_last_minute(self) -> int:
+        limit = time.time() - 60.0
+        with self.lock:
+            return sum(1 for t in self.decision_times if t >= limit)
 
     def get_result_counts(self) -> Dict[str, int]:
         with self.lock: return dict(self.result_counts)
@@ -870,6 +882,7 @@ class ProcessingThread(threading.Thread):
         self.model_lock = threading.Lock()
         self.trackers = {1: LaneTracker(1), 2: LaneTracker(2)}    # one tracker and one ID series per ROI
         self.frame_time = time.time()
+        self.ai_fps, self._ai_count, self._ai_since = 0.0, 0, time.time()   # frames graded per second
         frame_log = shared_state.grading.get("frame_log", {})
         self.cashew_log = CashewLog(app_paths.LOGS_DIR, keep_days=int(frame_log.get("keep_days", 7)),
                                     frames_enabled=bool(frame_log.get("enabled", True))).start()
@@ -1049,6 +1062,10 @@ class ProcessingThread(threading.Thread):
                 if state["phase"] == "RUNNING" and self.model and (state["roi1"] or state["roi2"]):
                     # Don't draw rulers here, just process it directly to save massive amounts of CPU on the 5MP frame
                     frame_drawn = self._process_frame(frame_full, state)
+                    self._ai_count += 1
+                    if time.time() - self._ai_since >= 1.0:
+                        self.ai_fps = self._ai_count / (time.time() - self._ai_since)
+                        self._ai_count, self._ai_since = 0, time.time()
                     
                     # Crop and stack only the ROIs for the GUI display!
                     crops_to_show = []
@@ -1069,6 +1086,7 @@ class ProcessingThread(threading.Thread):
                 else:
                     for tracker in self.trackers.values():
                         tracker.clear()
+                    self.ai_fps = 0.0
                     self._tracking_reset.clear()
                     frame_drawn = draw_rulers(frame_full.copy())
                     self._draw_setup_overlays(frame_drawn, state)
@@ -1505,19 +1523,29 @@ class NavButton(tk.Frame):
 
 # ---------------- Main GUI Application ----------------
 
+def _software_version() -> str:
+    """Short git commit of this folder (what is really running), or 'unknown'."""
+    try:
+        import subprocess
+        out = subprocess.run(["git", "-C", str(app_paths.BASE_DIR), "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=2)
+        return out.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Newton Automation | Industrial HMI")
         self.geometry("1800x900+10+10")
         self.attributes("-zoomed", True)
-        self.configure(bg="#0F172A")
+        self.configure(bg=ui.BG)
         
-        self.colors = {
-            "bg": "#0F172A", "surface": "#1E293B", "surface_light": "#334155",
-            "text": "#F8FAFC", "text_muted": "#94A3B8",
-            "success": "#10B981", "danger": "#EF4444", "warning": "#F59E0B", "info": "#0EA5E9",
-            "accent": "#38BDF8"
+        self.colors = {     # the palette of ui_theme.py under the names the older pages use
+            "bg": ui.BG, "surface": ui.PANEL, "surface_light": ui.BORDER,
+            "text": ui.TEXT, "text_muted": ui.MUTED,
+            "success": ui.GOOD, "danger": ui.BAD, "warning": ui.WARN, "info": ui.ACCENT,
+            "accent": ui.ACCENT
         }
         
         self._last_fires_state = []
@@ -1684,6 +1712,11 @@ class App(tk.Tk):
         
         style.configure("Treeview", background=surf, foreground=text, fieldbackground=surf, borderwidth=0, rowheight=30)
         style.configure("Treeview.Heading", background=self.colors["surface_light"], foreground=self.colors["info"], font=("Roboto", 10, "bold"), borderwidth=0)
+        style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])      # no light frame around tables
+        for bar in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            style.configure(bar, background=ui.BORDER, troughcolor=ui.FIELD, bordercolor=ui.FIELD, lightcolor=ui.BORDER,
+                            darkcolor=ui.BORDER, arrowcolor=ui.MUTED, relief="flat", borderwidth=0)
+            style.map(bar, background=[("active", ui.IDLE), ("disabled", ui.FIELD)])
         style.map("Treeview", background=[('selected', self.colors["surface_light"])])
 
         style.configure("TEntry", fieldbackground=self.colors["surface_light"], foreground=text, borderwidth=0, padding=5)
@@ -1691,97 +1724,172 @@ class App(tk.Tk):
         self.option_add('*TCombobox*Listbox.foreground', 'black')
 
     def _build_gui(self):
-        header_frm = tk.Frame(self, bg=self.colors["bg"], height=60, bd=0)
-        header_frm.pack(side=tk.TOP, fill=tk.X, padx=20, pady=10)
-        header_frm.pack_propagate(False)
-        
-        ttk.Label(header_frm, text="NEWTON AUTOMATION", font=("Roboto", 16, "bold"), foreground=self.colors["text"]).pack(side=tk.LEFT)
-        ttk.Label(header_frm, text=" | INSTANT FIRE GRADER", font=("Roboto", 14), foreground=self.colors["text_muted"]).pack(side=tk.LEFT)
-        
-        self.lbl_clock = tk.Label(header_frm, text="00:00:00", font=("Roboto", 14, "bold"), bg=self.colors["bg"], fg=self.colors["text_muted"])
-        self.lbl_clock.pack(side=tk.RIGHT, padx=20)
-        
-        self.lbl_state_badge = tk.Label(header_frm, text="● IDLE", font=("Roboto", 14, "bold"), bg=self.colors["surface"], fg=self.colors["text_muted"], padx=15, pady=5)
-        self.lbl_state_badge.pack(side=tk.RIGHT, padx=20)
-        
-        body_frm = tk.Frame(self, bg=self.colors["bg"])
-        body_frm.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
-        
-        nav_frm = tk.Frame(body_frm, bg=self.colors["bg"], width=220)
-        nav_frm.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 15))
+        """Window frame in the style of the 5-track machine: top bar with status pills, left menu,
+        camera in the centre, page column on the right."""
+        F = ui.FONT
+        self.configure(bg=ui.BG)
+
+        # ── top bar ──
+        top = tk.Frame(self, bg=ui.PANEL, height=ui.TOP_H)
+        top.pack(side=tk.TOP, fill=tk.X)
+        top.pack_propagate(False)
+        tk.Frame(self, bg=ui.BORDER, height=1).pack(side=tk.TOP, fill=tk.X)
+
+        brand = tk.Frame(top, bg=ui.PANEL, width=ui.NAV_W)      # customer logo goes here when it is given
+        brand.pack(side=tk.LEFT, fill=tk.Y)
+        brand.pack_propagate(False)
+        tk.Label(brand, text="NEWTON", font=(F, ui.F_BODY, "bold"), fg=ui.TEXT, bg=ui.PANEL).pack(anchor="w", padx=16, pady=(12, 0))
+        tk.Label(brand, text="AUTOMATION", font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.PANEL).pack(anchor="w", padx=16)
+
+        right = tk.Frame(top, bg=ui.PANEL)
+        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10))
+        for kind, label, colour, command in (("power", "SHUTDOWN", ui.BAD, self._on_shutdown), ("exit", "EXIT", ui.MUTED, self._on_exit)):
+            col = tk.Frame(right, bg=ui.PANEL)
+            col.pack(side=tk.RIGHT, padx=6)
+            ui.IconButton(col, kind, ui.PANEL, command).pack(pady=(3, 0))
+            tk.Label(col, text=label, font=(F, -9, "bold"), fg=colour, bg=ui.PANEL).pack()
+        clock = tk.Frame(right, bg=ui.PANEL, width=150)
+        clock.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10))
+        clock.pack_propagate(False)
+        self.lbl_clock = tk.Label(clock, text="00:00:00", font=(F, ui.F_HEAD, "bold"), fg=ui.TEXT, bg=ui.PANEL)
+        self.lbl_clock.pack(anchor="e", pady=(9, 0))
+        self.lbl_date = tk.Label(clock, text="", font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.PANEL)
+        self.lbl_date.pack(anchor="e")
+
+        prog = tk.Frame(top, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
+        prog.pack(side=tk.LEFT, padx=(12, 8), pady=13)
+        tk.Label(prog, text="PROGRAM", font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT, padx=(10, 6), pady=8)
+        tk.Label(prog, text="Default", font=(F, ui.F_SMALL, "bold"), fg=ui.TEXT, bg=ui.PANEL).pack(side=tk.LEFT)
+        tk.Label(prog, text="NEW / COPY: NOT AVAILABLE", font=(F, -10), fg=ui.IDLE, bg=ui.PANEL).pack(side=tk.LEFT, padx=(8, 10))
+
+        self.pills = {}
+        self._pill_bar = top
+        for key, name, short in (("camera", "CAMERA", "CAM"), ("plc", "PLC", "PLC"), ("master", "MASTER EJECTOR", "EJECTOR"),
+                                 ("mode", "MODE", "MODE"), ("conveyor", "CONVEYOR", "CONV"), ("state", "STATE", "STATE")):
+            pill = ui.Pill(top, name, "—", ui.MUTED, short=short)
+            pill.pack(side=tk.LEFT, padx=3, pady=13)
+            self.pills[key] = pill
+        top.bind("<Configure>", lambda e: self._fit_pills())
+
+        # The old layout wrote to these labels; the pills show the same facts now.
+        self.cam_indicator = self.ard_indicator = self.lbl_state_badge = self.lbl_prod_count = ui.Sink()
+
+        # ── body ──
+        body_frm = tk.Frame(self, bg=ui.BG)
+        body_frm.pack(fill=tk.BOTH, expand=True)
+
+        nav_frm = tk.Frame(body_frm, bg=ui.PANEL, width=ui.NAV_W)
+        nav_frm.pack(side=tk.LEFT, fill=tk.Y)
         nav_frm.pack_propagate(False)
-        
+        tk.Frame(body_frm, bg=ui.BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y)
+        tk.Frame(nav_frm, bg=ui.PANEL, height=14).pack(fill=tk.X)
         nav_items = ["Home", "Pneumatic", "Sorting Logic", "Colour Size", "Vision ROI", "Teaching CNN", "Dataset Capture", "Teaching YOLO", "AI Model Select", "Test Console", "Network"]
         self.nav_buttons = {}
         for item in nav_items:
-            icon_img = self.nav_icons.get(item)
-            btn = NavButton(nav_frm, item, icon_img, self.colors, command=lambda i=item: self._switch_page(i))
-            btn.pack(fill=tk.X, pady=2)
+            btn = ui.NavItem(nav_frm, item, command=lambda i=item: self._switch_page(i))
+            btn.pack(fill=tk.X)
             self.nav_buttons[item] = btn
-            
-        self.center_frm = tk.Frame(body_frm, bg=self.colors["surface"], bd=1, relief=tk.FLAT)
-        self.center_frm.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        self.video_label = tk.Label(self.center_frm, bg="black")
+        foot = tk.Frame(nav_frm, bg=ui.PANEL)
+        foot.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 12))
+        tk.Frame(foot, bg=ui.BORDER, height=1).pack(fill=tk.X, padx=10, pady=(0, 10))
+        tk.Label(foot, text="GSN V21", font=(F, ui.F_HEAD, "bold"), fg=ui.TEXT, bg=ui.PANEL).pack(anchor="w", padx=14)
+        tk.Label(foot, text="CASHEW GRADER", font=(F, -11, "bold"), fg=ui.ACCENT, bg=ui.PANEL).pack(anchor="w", padx=14)
+        tk.Label(foot, text=f"Software {_software_version()}", font=(F, -10), fg=ui.MUTED, bg=ui.PANEL).pack(anchor="w", padx=14, pady=(6, 0))
+
+        self.center_frm = tk.Frame(body_frm, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
+        self.center_frm.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=16, pady=16)
+
+        # Lane LED strip under the camera: one LED per ROI, green / red for the last decision.
+        led_bar = tk.Frame(self.center_frm, bg=ui.PANEL, height=ui.LANE_BAR_H)
+        led_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        led_bar.pack_propagate(False)
+        self.lane_leds = {}
+        for rid in (1, 2):
+            cell = tk.Frame(led_bar, bg=ui.PANEL)
+            cell.pack(side=tk.LEFT, expand=True)
+            led = ui.LedLabel(cell, ui.PANEL)
+            led.pack(side=tk.LEFT, padx=(0, 8))
+            tk.Label(cell, text=f"ROI {rid}", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT)
+            self.lane_leds[rid] = led
+
+        self.video_label = tk.Label(self.center_frm, bg="#05080D")
         self.video_label.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         self.video_label.bind("<Button-1>", self._on_mouse)
         self.video_label.bind("<B1-Motion>", self._on_mouse)
         self.video_label.bind("<ButtonRelease-1>", self._on_mouse)
-        
-        self.fps_lbl = tk.Label(self.video_label, text="FPS: 0.0", font=("Roboto", 14, "bold"), bg="black", fg=self.colors["info"])
-        self.fps_lbl.place(relx=0.98, rely=0.02, anchor="ne")
-        
-        self.right_frm = tk.Frame(body_frm, bg=self.colors["bg"], width=480)
-        self.right_frm.pack(side=tk.RIGHT, fill=tk.Y, padx=(15, 0))
+
+        self.fps_lbl = tk.Label(self.video_label, text="CAM 0 fps", font=(F, ui.F_SMALL), bg=ui.PANEL, fg=ui.MUTED, padx=10, pady=4)
+        self.fps_lbl.place(relx=0.01, rely=0.99, anchor="sw")
+
+        self.right_frm = tk.Frame(body_frm, bg=ui.BG, width=ui.RIGHT_W)
+        self.right_frm.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 16), pady=16)
         self.right_frm.pack_propagate(False)
-        
-        self.op_frm = tk.Frame(self.right_frm, bg=self.colors["surface"], padx=15, pady=15)
-        self.op_frm.pack(fill=tk.X, pady=(0, 15))
-        
-        self.start_btn = ttk.Button(self.op_frm, text="START RUNNING", style="Success.TButton", command=self._on_start_stop)
-        self.start_btn.pack(fill=tk.X, pady=(0, 10))
-        
-        # Conveyor and Feeder Controls Row
-        cf_frm = tk.Frame(self.op_frm, bg=self.colors["surface"])
-        cf_frm.pack(fill=tk.X, pady=(0, 10))
-        cf_frm.columnconfigure(0, weight=1)
-        cf_frm.columnconfigure(1, weight=1)
 
-        self.conv_btn = tk.Button(
-            cf_frm, text="CONVEYOR: OFF", font=("Roboto", 10, "bold"),
-            bg=self.colors["surface_light"], fg=self.colors["text_muted"],
-            activebackground=self.colors["surface_light"], activeforeground="white",
-            bd=0, padx=6, pady=8, cursor="hand2", command=self._toggle_conv
-        )
-        self.conv_btn.grid(row=0, column=0, sticky="ew", padx=(0, 5))
-
-        self.feed_btn = tk.Button(
-            cf_frm, text="FEEDER: OFF", font=("Roboto", 10, "bold"),
-            bg=self.colors["surface_light"], fg=self.colors["text_muted"],
-            activebackground=self.colors["surface_light"], activeforeground="white",
-            bd=0, padx=6, pady=8, cursor="hand2", command=self._toggle_feed
-        )
-        self.feed_btn.grid(row=0, column=1, sticky="ew", padx=(5, 0))
-
-        health_frm = tk.Frame(self.op_frm, bg=self.colors["surface"])
-        health_frm.pack(fill=tk.X, pady=(15, 0))
-        
-        self.cam_indicator = tk.Label(health_frm, text="● Camera", font=("Roboto", 10, "bold"), bg=self.colors["surface"], fg=self.colors["danger"])
-        self.cam_indicator.pack(side=tk.LEFT)
-        
-        plc_name = "● Inovance PLC" if InovancePLCController and isinstance(self.controller, InovancePLCController) else "● Comm Board"
-        self.ard_indicator = tk.Label(health_frm, text=plc_name, font=("Roboto", 10, "bold"), bg=self.colors["surface"], fg=self.colors["danger"])
-        self.ard_indicator.pack(side=tk.RIGHT)
-
-
-        self.page_container = tk.Frame(self.right_frm, bg=self.colors["bg"])
+        self.page_container = tk.Frame(self.right_frm, bg=ui.BG)
         self.page_container.pack(fill=tk.BOTH, expand=True)
-        
+
         self._build_pages()
         self._build_teaching_console_page()
         self._build_colour_size_page()
         self._build_test_console_page()
         self._switch_page("Home")
+
+    def _fit_pills(self):
+        """Keep the status pills inside the top bar: tighter padding, then short names, then a smaller font."""
+        bar = self._pill_bar
+        bar.update_idletasks()
+        for level in (0, 1, 2, 3):
+            for pill in self.pills.values():
+                pill.set_level(level)
+            bar.update_idletasks()
+            if sum(child.winfo_reqwidth() + 16 for child in bar.winfo_children()) <= bar.winfo_width() or level == 3:
+                break
+
+    def _on_exit(self):
+        if messagebox.askyesno("Exit", "Close the grader program?"):
+            self._on_close()
+
+    def _on_shutdown(self):
+        if messagebox.askyesno("Shutdown", "Close the grader and SWITCH OFF this computer?"):
+            self._on_close()
+            import subprocess
+            subprocess.Popen(["systemctl", "poweroff"])
+
+    def _refresh_status(self):
+        """Top bar pills, Home tiles and lane LEDs (called a few times per second)."""
+        ss, cam = self.shared_state, self.camera_thread
+        cam_colour = ui.GOOD if cam.is_connected else (ui.WARN if cam.state in ("CONNECTING", "RECONNECTING") else ui.BAD)
+        self.pills["camera"].set(str(cam.state), cam_colour)
+        plc_ok = self.controller.is_connected()
+        self.pills["plc"].set("ONLINE" if plc_ok else "OFFLINE", ui.GOOD if plc_ok else ui.BAD)
+        master, dry = self.relay_output.master_enabled, self.relay_output.dry_run
+        self.pills["master"].set("ON" if master else "OFF", ui.GOOD if master else ui.MUTED)
+        self.pills["mode"].set("DRY-RUN" if dry else "LIVE", ui.WARN if dry else ui.GOOD)
+        self.pills["conveyor"].set("ON" if ss.is_conveyor_on else "OFF", ui.GOOD if ss.is_conveyor_on else ui.MUTED)
+        phase = ss.phase
+        running = phase == "RUNNING"
+        self.pills["state"].set("RUNNING" if running else ("STOPPED" if phase == "READY" else "SETUP"),
+                                ui.GOOD if running else (ui.MUTED if phase == "READY" else ui.WARN))
+        self.lbl_machine_state.config(text="RUNNING" if running else "STOPPED", fg=ui.GOOD if running else ui.BAD)
+
+        counts = ss.get_result_counts()
+        total = sum(n for key, n in counts.items() if not key.startswith("UNDEFINED: "))
+        good, undefined = counts.get(decision.GOOD, 0), counts.get(decision.UNDEFINED, 0)
+        rejection = counts.get(decision.REJECTION, 0)
+        self.kpi["total"].set(ui.thousands(total), f"detected {ui.thousands(ss.get_detected_count())}")
+        self.kpi["good"].set(ui.thousands(good), f"{100.0 * good / total:.1f} %" if total else "")
+        self.kpi["undefined"].set(ui.thousands(undefined), f"{100.0 * undefined / total:.1f} %" if total else "")
+        self.kpi["rejection"].set(ui.thousands(rejection), f"{100.0 * rejection / total:.1f} %" if total else "")
+        self.kpi["throughput"].set(str(ss.decisions_last_minute()), "pcs/min")
+        shown = (decision.GOOD, decision.UNDEFINED, decision.REJECTION)
+        parts = [f"NOT ROLLED {counts.get('UNDEFINED: ' + decision.NOT_ROLLED, 0)}", f"DOUBLE {counts.get(decision.DOUBLE, 0)}", "LATE: step (c3)", "kg/hr: NOT AVAILABLE (no cashew weight yet)"]
+        parts += [f"{key} {n}" for key, n in sorted(counts.items()) if key not in shown and key != decision.DOUBLE and not key.startswith("UNDEFINED: ")]
+        self.lbl_kpi_more.config(text="     ".join(parts))
+
+        now = time.time()
+        for rid, led in self.lane_leds.items():
+            when, was_good = ss.last_result.get(rid, (0.0, True))
+            led.set(("good" if was_good else "bad") if now - when < 0.6 else "idle")
 
     def _build_pages(self):
         # Shared Auto Capture State & Logic for multiple tabs
@@ -1807,48 +1915,79 @@ class App(tk.Tk):
                 if hasattr(self, 'golden_pneumatic_btn'):
                     self.golden_pneumatic_btn.config(text="Auto Capture", bg=self.colors["info"])
 
-        p_prod = tk.Frame(self.page_container, bg=self.colors["surface"], padx=15, pady=15)
+        # PAGE: Home (5-track layout: machine button, KPI tiles, recent results)
+        F = ui.FONT
+        p_prod = tk.Frame(self.page_container, bg=ui.BG)
         self.pages["Home"] = p_prod
-        
-        prod_hdr = tk.Frame(p_prod, bg=self.colors["surface"])
-        prod_hdr.pack(fill="x", pady=(0,10))
-        ttk.Label(prod_hdr, text="PRODUCTION HISTORY", style="Title.TLabel").pack(side="left")
-        
-        self.lbl_prod_count = tk.Label(
-            prod_hdr, text="[ Detected: 0 ]",
-            bg=self.colors["surface_light"], fg=self.colors["success"],
-            font=("Roboto", 10, "bold"), padx=8, pady=2, relief="flat"
-        )
-        self.lbl_prod_count.pack(side="left", padx=(12, 0))
-        
+
+        machine = tk.Frame(p_prod, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
+        machine.pack(fill=tk.X)
+        self.start_btn = ui.EngineButton(machine, ui.PANEL, command=self._on_start_stop)
+        self.start_btn.pack(side=tk.LEFT, padx=(18, 6), pady=2)
+        ops = tk.Frame(machine, bg=ui.PANEL)
+        ops.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 18), pady=18)
+        self.lbl_machine_state = tk.Label(ops, text="STOPPED", font=(F, ui.F_HEAD, "bold"), fg=ui.BAD, bg=ui.PANEL, anchor="w")
+        self.lbl_machine_state.pack(fill=tk.X)
+        tk.Label(ops, text="MASTER EJECTOR is OFF and DRY-RUN is ON at every start.", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL,
+                 anchor="w", justify="left", wraplength=330).pack(fill=tk.X, pady=(2, 10))
+        row = tk.Frame(ops, bg=ui.PANEL)
+        row.pack(fill=tk.X, pady=(0, 8))
+        self.conv_btn = ui.FlatButton(row, "CONVEYOR: OFF", command=self._toggle_conv, kind="muted", height=36, width=165)
+        self.conv_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.feed_btn = ui.FlatButton(row, "FEEDER: OFF", command=self._toggle_feed, kind="muted", height=36, width=165)
+        self.feed_btn.pack(side=tk.LEFT)
+        self.golden_pneumatic_btn = ui.FlatButton(ops, "Auto Capture", command=toggle_golden, height=32, width=165)
+        self.golden_pneumatic_btn.pack(anchor="w")
+
+        tiles = tk.Frame(p_prod, bg=ui.BG)
+        tiles.pack(fill=tk.X, pady=(ui.GRID, 0))
+        for col in range(3):
+            tiles.columnconfigure(col, weight=1, uniform="kpi")
+        self.kpi = {}
+        for i, (key, title, colour) in enumerate((("total", "TOTAL", ui.TEXT), ("good", "GOOD", ui.GOOD), ("undefined", "UNDEFINED", ui.WARN),
+                                                  ("rejection", "REJECTION", ui.BAD), ("throughput", "THROUGHPUT", ui.TEXT))):
+            tile = ui.KpiTile(tiles, title, colour)
+            tile.grid(row=i // 3, column=i % 3, sticky="nsew", padx=(0 if i % 3 == 0 else ui.GRID, 0), pady=(0, ui.GRID))
+            self.kpi[key] = tile
+
+        def reset_counters():
+            if messagebox.askyesno("Reset counters", "Set all counters on this page to zero?"):
+                self.shared_state.reset_result_counts()
+                self.shared_state.reset_detected_count()
+                self.relay_output.reset_counts()
+        reset = tk.Frame(tiles, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER, height=ui.KPI_H, cursor="hand2")
+        reset.grid(row=1, column=2, sticky="nsew", padx=(ui.GRID, 0), pady=(0, ui.GRID))
+        reset_lbl = tk.Label(reset, text="RESET COUNTERS", font=(F, ui.F_BODY, "bold"), fg=ui.TEXT, bg=ui.PANEL, cursor="hand2")
+        reset_lbl.place(relx=0.5, rely=0.5, anchor="center")
+        for widget in (reset, reset_lbl):
+            widget.bind("<Button-1>", lambda e: reset_counters())
+
+        self.lbl_kpi_more = tk.Label(p_prod, text="", font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.BG, anchor="w", justify="left", wraplength=ui.RIGHT_W - 8)
+        self.lbl_kpi_more.pack(fill=tk.X, pady=(0, ui.GRID))
+
         def clear_history():
             with self.shared_state.lock:
                 self.shared_state.recent_fires.clear()
-                self.shared_state.reset_detected_count()
             self._last_fires_state = []
-            self._last_det_cnt = 0
             for item in self.fire_tree.get_children():
                 self.fire_tree.delete(item)
-            if hasattr(self, 'lbl_prod_count'):
-                self.lbl_prod_count.config(text="[ Detected: 0 ]")
-                
-        ttk.Button(prod_hdr, text="Clear History", command=clear_history).pack(side="right")
-        
-        self.golden_pneumatic_btn = tk.Button(prod_hdr, text="Auto Capture", 
-                                              bg=self.colors["info"], fg="white", font=("Roboto", 9, "bold"),
-                                              bd=0, cursor="hand2", padx=10, pady=5, command=toggle_golden)
-        self.golden_pneumatic_btn.pack(side="right", padx=(5, 10))
-        
-        tree_frame = tk.Frame(p_prod, bg=self.colors["surface"])
+
+        prod_hdr = tk.Frame(p_prod, bg=ui.BG)
+        prod_hdr.pack(fill="x", pady=(0, 6))
+        tk.Label(prod_hdr, text="RECENT RESULTS", font=(F, ui.F_SMALL, "bold"), fg=ui.TEXT, bg=ui.BG).pack(side="left")
+        tk.Label(prod_hdr, text="double click a row for its frames", font=(F, -11), fg=ui.MUTED, bg=ui.BG).pack(side="left", padx=10)
+        ui.FlatButton(prod_hdr, "CLEAR HISTORY", command=clear_history, kind="muted", height=26).pack(side="right")
+
+        tree_frame = tk.Frame(p_prod, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
         cols = ("time", "track", "label", "conf", "act")
-        self.fire_tree = ttk.Treeview(tree_frame, columns=cols, show='headings', height=18)
-        self.fire_tree.heading("time", text="TIME"); self.fire_tree.column("time", width=70, anchor='center')
-        self.fire_tree.heading("track", text="ID"); self.fire_tree.column("track", width=90, anchor='center')
-        self.fire_tree.heading("label", text="RESULT"); self.fire_tree.column("label", width=170, anchor='w')
-        self.fire_tree.heading("conf", text="FRAMES"); self.fire_tree.column("conf", width=55, anchor='center')
-        self.fire_tree.heading("act", text="RELAY"); self.fire_tree.column("act", width=50, anchor='center')
+        self.fire_tree = ttk.Treeview(tree_frame, columns=cols, show='headings', height=8)
+        self.fire_tree.heading("time", text="TIME"); self.fire_tree.column("time", width=80, anchor='center')
+        self.fire_tree.heading("track", text="ID"); self.fire_tree.column("track", width=110, anchor='center')
+        self.fire_tree.heading("label", text="RESULT / CLASS"); self.fire_tree.column("label", width=280, anchor='w')
+        self.fire_tree.heading("conf", text="FRAMES"); self.fire_tree.column("conf", width=70, anchor='center')
+        self.fire_tree.heading("act", text="RELAY"); self.fire_tree.column("act", width=70, anchor='center')
         self.fire_tree.bind("<Double-1>", self._show_decision_detail)     # frame-by-frame votes of that cashew
 
         tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.fire_tree.yview)
@@ -3609,11 +3748,6 @@ except Exception as e:
         if page_name in self.pages:
             self.pages[page_name].pack(fill=tk.BOTH, expand=True)
             
-        if page_name in ["Teaching YOLO", "Pneumatic", "Teaching CNN", "Colour Size"]:
-            self.op_frm.pack_forget()
-        else:
-            self.op_frm.pack(fill=tk.X, pady=(0, 15), before=self.page_container)
-            
         # Full Screen Logic for specific pages
         if page_name in ["Pneumatic", "Teaching CNN", "Colour Size"]:
             if hasattr(self, 'center_frm'):
@@ -3621,14 +3755,14 @@ except Exception as e:
             if hasattr(self, 'right_frm'):
                 self.right_frm.pack_forget()
                 self.right_frm.config(width=900)
-                self.right_frm.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(15, 0))
+                self.right_frm.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=16, pady=16)
         else:
             if hasattr(self, 'center_frm'):
-                self.center_frm.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                self.center_frm.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=16, pady=16)
             if hasattr(self, 'right_frm'):
                 self.right_frm.pack_forget()
-                self.right_frm.config(width=480)
-                self.right_frm.pack(side=tk.RIGHT, fill=tk.Y, padx=(15, 0))
+                self.right_frm.config(width=ui.RIGHT_W)
+                self.right_frm.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 16), pady=16)
 
         if page_name == "Teaching YOLO":
             if hasattr(self, 'test_canvas'): self.test_canvas.pack_forget()
@@ -4430,6 +4564,7 @@ except Exception as e:
         color = self.colors["success"] if state else self.colors["surface_light"]
         fg_col = "white" if state else self.colors["text_muted"]
         self.conv_btn.config(text=f"CONVEYOR: {'ON' if state else 'OFF'}", bg=color, fg=fg_col)
+        self.conv_btn.set_kind("primary" if state else "muted")
         if hasattr(self.controller, 'set_conveyor'):
             self.controller.set_conveyor(state)
         elif hasattr(self.controller, 'set_relay'):
@@ -4441,6 +4576,7 @@ except Exception as e:
         color = self.colors["success"] if state else self.colors["surface_light"]
         fg_col = "white" if state else self.colors["text_muted"]
         self.feed_btn.config(text=f"FEEDER: {'ON' if state else 'OFF'}", bg=color, fg=fg_col)
+        self.feed_btn.set_kind("primary" if state else "muted")
         if hasattr(self.controller, 'set_feeder'):
             self.controller.set_feeder(state)
         elif hasattr(self.controller, 'set_relay'):
@@ -4507,9 +4643,11 @@ except Exception as e:
                 self.start_btn.config(text="START RUNNING", style="Success.TButton")
                 self.lbl_state_badge.config(text="● READY", fg=self.colors["warning"])
         
-        self.fps_lbl.config(text=f"CAM {self.camera_thread.fps:.1f} fps")
+        self.fps_lbl.config(text=f"CAM {self.camera_thread.fps:.0f} fps   •   AI {self.processing_thread.ai_fps:.0f} fps")
 
-        self.lbl_clock.config(text=datetime.now().strftime("%H:%M:%S"))
+        now_dt = datetime.now()
+        self.lbl_clock.config(text=now_dt.strftime("%H:%M:%S"))
+        self.lbl_date.config(text=now_dt.strftime("%a %d-%m-%Y"))
         
         current_fires = self.shared_state.get_recent_fires()
         if current_fires != self._last_fires_state:
@@ -4519,6 +4657,8 @@ except Exception as e:
             self._last_fires_state = list(current_fires)
 
         self._grading_tick = getattr(self, "_grading_tick", 0) + 1
+        if self._grading_tick % 5 == 0:
+            self._refresh_status()
         if self._grading_tick % 10 == 0 and hasattr(self, "lbl_view_live"):
             self._refresh_grading_live()
 

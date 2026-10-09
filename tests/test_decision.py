@@ -125,6 +125,15 @@ class DecisionTest(unittest.TestCase):
         d = decide(frames(("EDGECUT", 0.9), ("EDGECUT", 0.9)))
         self.assertEqual((d.result, d.reason, d.reject), (dc.UNDEFINED, dc.NOT_IN_PRIORITY, True))
 
+    def test_back_cut_oil_is_graded_as_oil_and_edgecut_is_rejected(self):
+        d = decide(frames(("BACK_CUT_OIL", 0.9), ("OIL_BACKCUT", 0.9)))
+        self.assertEqual((d.result, d.reject), ("OIL", False))
+        self.assertEqual(d.votes, {"OIL": 2})
+        d = decide(frames(("TESTA", 0.9), ("TESTA", 0.9), ("BACK_CUT_OIL", 0.9), ("OIL", 0.9)))
+        self.assertEqual(d.result, "UPW")                       # skin + OIL
+        d = decide(frames(("EDGECUT", 0.9), ("EDGECUT", 0.9), ("GOOD_CASHEW", 0.9)))
+        self.assertEqual((d.result, d.reject), (dc.UNDEFINED, True))
+
     def test_owner_combination_rule(self):
         rules = [{"conditions": ["PKW1", "BROWN", "", ""], "final": "DW2"}]
         d = decide(frames(("PKW1", 0.9), ("PKW1", 0.9), ("BROWN", 0.9), ("BROWN", 0.9)), combination_rules=rules)

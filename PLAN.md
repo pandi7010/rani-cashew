@@ -355,8 +355,8 @@ pages made by the program itself, stop for your OK.
 
 | Sub-step | Content |
 |---|---|
-| (e1) | `ui_theme.py` (port of `home_ui.py`), window frame: top bar, pills, clock, EXIT / SHUTDOWN, left menu; **Home** page |
-| (e2) | **Relay Mapping** (Pneumatic) page, PLC test window, **Sorting Logic** |
+| (e1) **done** | `ui_theme.py` (port of `home_ui.py`), window frame: top bar, pills, clock, EXIT / SHUTDOWN, left menu; **Home** page. Programs (recipes) are shown as NOT AVAILABLE and move to (e2). |
+| (e2) | **Relay Mapping** (Pneumatic) page, PLC test window, **Sorting Logic**, programs (recipes) |
 | (e3) | **Vision ROI**, **Colour Size** shell, **Speed** shell |
 | (e4) | Teaching CNN, Dataset Capture, Teaching YOLO, AI Model Select, Network, Info, Test Console |
 
@@ -382,6 +382,15 @@ except the existing CONVEYOR / FEEDER operator buttons; `innovance_plc.py` uncha
 that frames of one cashew stay on one side, same `preprocess.py` as inference, class weights, best-val
 checkpoint, accuracy + confusion matrix saved. A new model is never activated automatically.
 View classifier (TOP / BACK / NECK / OTHER) trained the same way from the labeler's view mode.
+
+### Dataset for the retraining (owner, 2026-10-09)
+
+The owner retrains the CNN with all classes. Step (f) delivers **one clean dataset folder per final class
+name**, with exactly the names the grading rules use: GOOD, SW (only if still wanted), UPW, PKW2, PKW1, OIL
+(including BACK_CUT_OIL / OIL_BACKCUT), BROWN, DW2, DW1, TESTA, TESTA SMALL, WHITE_DW, REJECTION, EDGECUT,
+DOUBLE KERNEL (if it becomes a class). Built by **copying** from the old and the project datasets (nothing is
+moved or deleted; full frames and duplicates are left out and listed). With it comes a table: images per
+class now, and how many each class still needs.
 
 ## 9. Testing
 
@@ -430,13 +439,13 @@ SW/WW by colour with teach helper, double kernel OFF with live values.
 | 6 | NECK weight 2 (a TESTA / TESTA SMALL vote from a NECK frame counts as 2 frames). |
 | 7 | CNN `SW` with no defect is a "no defect" vote like GOOD; colour alone decides SW / WW. |
 | 8 | REJECTION from the YOLO class, confidence >= 0.50 in at least 2 frames. Dark area % is only logged. |
-| 9a | **Still open:** BACK_CUT_OIL = ? (OIL / own class BACK_CUT / other), EDGECUT = ? Until answered they are left out. |
+| 9a | BACK_CUT_OIL / OIL_BACKCUT = **OIL** (merged for grading and training). **EDGECUT** = broken-edge cashew, its own class, reject relay until the relay list is given; only 2 images, more to be collected. |
 | 9b | WHITE_DW counts as "another defect": skin + WHITE_DW = UPW. |
 | 10 | GOOD needs 3 frames at >= 0.80 (frames, not view types). |
 | 11 | One Decision line per ROI with a "one line for both" switch, ON at start. |
 
 ## 11. Approval
 
-Step (c1) is done (`3059824`). Next is step (e1): on "approved, start (e1)" I do (e1) only, commit, show the
+Steps (c1) and (e1) are done. Next is step (e2): on "approved, start (e2)" I do (e2) only, commit, show the
 screenshots, and stop. Questions E1-E7 have proposals; without answers I follow the proposals.
 The recording (question 15) is still needed for tracker tuning and view limits.

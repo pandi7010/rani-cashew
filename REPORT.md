@@ -4,6 +4,53 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-09 (4): Step (e1) done - 5-track look: theme, top bar, left menu, Home
+
+### What changed
+
+| Area | Change |
+|---|---|
+| `ui_theme.py` (new) | Port of the 5-track `home_ui.py` (newest copy, with the pills that always fit): same colours, sizes, drawn START / STOP button, EXIT / SHUTDOWN, pills, LEDs, KPI tiles, flat buttons. Roboto instead of Segoe UI; three more menu icons; right column 640 px for the 1920 x 1080 screen. The source on the drive is untouched. |
+| Top bar | Brand text, PROGRAM box, pills CAMERA, PLC, MASTER EJECTOR, MODE (DRY-RUN / LIVE), CONVEYOR, STATE, clock and date, EXIT, SHUTDOWN (both ask first). |
+| Left menu | 176 px, drawn icons, active page marked in cyan; "GSN V21 CASHEW GRADER" and the running git commit at the bottom. |
+| Home | Round MACHINE START / STOP with red / green ring, state text, CONVEYOR / FEEDER / Auto Capture buttons, tiles TOTAL, GOOD, UNDEFINED, REJECTION, THROUGHPUT (pcs/min), RESET COUNTERS, a line with NOT ROLLED / DOUBLE / other classes, RECENT RESULTS table. |
+| Camera panel | CAM fps and AI fps (AI fps is new: frames graded per second), one LED per ROI (green / red for the last decision). |
+| All other pages | Get the new colours and the new frame now; their layout is rebuilt in (e2)-(e4). |
+| `ui_debug.py` (new) | The program photographs its own window placed outside the visible screen, so checking pages never shows a window on your display and never clicks. |
+| Question 9a | BACK_CUT_OIL / OIL_BACKCUT are graded as OIL; EDGECUT stays its own class and goes to the reject relay. PLAN section 8 now says what dataset step (f) delivers. |
+
+Design only: grading, tracking and relay logic are unchanged (apart from the OIL alias above).
+
+### Shown as NOT AVAILABLE (honest list)
+
+- Programs (NEW / COPY): moved to (e2).
+- kg/hr: needs the average cashew weight from you.
+- LATE counter: comes with centre fire in (c3).
+- Customer logo / branding: text "NEWTON AUTOMATION" (the old header text) until you give the logo.
+
+### Tested
+
+- `ast` check on all files; 84 unit tests pass.
+- Whole program with a fake PLC, a simulated belt as the test source and a temporary config, window placed off-screen: window is 1920 x 1080, all six pills fit, DRY-RUN ON and MASTER EJECTOR OFF at start, START / STOP changes button ring, pill and state text, tiles and history update, LEDs light, CONVEYOR button reaches only `set_conveyor` of the (fake) controller, 0 pulses to the PLC, the real config was not touched.
+- Real screenshots taken by the program: `design/e1_home_stopped.png`, `design/e1_home_running_simulated.png`. Pneumatic, Sorting Logic and Vision ROI were also photographed and work in the new frame.
+
+### Not tested
+
+- SHUTDOWN (it would switch the PC off) and EXIT were not pressed; they call the existing close routine after a yes / no question.
+- Real camera picture in the new frame, real cashews, AI FPS on the machine. Please compare the AI fps number with what you had before.
+
+### How to test
+
+```
+cd /home/phoenix/Documents/GSN_V21/CNN
+python3 cashew_cnn_grader.py
+```
+
+Look at Home: pills, clock, START / STOP, tiles. Open each page from the left menu. Tell me what should look
+different before I do (e2): Relay Mapping, PLC test window, Sorting Logic, programs.
+
+---
+
 ## 2026-10-09 (3): 5-track UI studied; PLAN step (e) rewritten and moved before (c2)
 
 - Read (read only): `TCM_CASHEWXAI_2026-10-06/` `CLAUDE.md`, `PROJECT_HISTORY.md`, `VERSIONS.txt`, `TODO.md`,

@@ -36,6 +36,14 @@ VOTING_DEFAULTS = {
 PRIORITY_DEFAULT = ["UPW", "PKW2", "PKW1", "OIL", "BROWN", "DW2", "DW1", "TESTA", "TESTA SMALL", "WHITE_DW"]
 GOOD_CLASSES_DEFAULT = ["GOOD_CASHEW", "GOOD", "SW"]       # "no defect" votes; SW / WW is decided by colour
 SKIN_CLASSES_DEFAULT = ["TESTA", "TESTA SMALL"]
+# Owner, 2026-10-09: BACK_CUT_OIL / OIL_BACKCUT are graded (and trained) as OIL. EDGECUT stays its own class;
+# it is not in the priority list, so it goes to the reject relay until a relay is given for it.
+CLASS_ALIASES = {"back cut oil": "OIL", "oil backcut": "OIL", "backcut oil": "OIL", "oil back cut": "OIL"}
+
+
+def canonical(name):
+    """The class name the grading rules use for a model's class name."""
+    return CLASS_ALIASES.get(normalize_name(name), name) if name else name
 
 
 @dataclass
@@ -90,6 +98,7 @@ def decide(votes: List[FrameVote], voting: Optional[dict] = None, priority: Opti
         if f.view == NECK:
             d.neck_frames += 1
         name, conf = f.cls
+        name = canonical(name)
         key = normalize_name(name) if name else ""
         if name:
             display.setdefault(key, name)
