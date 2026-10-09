@@ -29,6 +29,13 @@ DEFAULTS = {
     "stuck_speed_fraction": 0.30,   # slower than this share of the lane speed ...
     "stuck_time_ms": 700.0,         # ... for this long = STUCK (values of the 5-track machine)
     "stopped_speed_fraction": 0.10, # all cashews slower than this share of the lane speed = conveyor stopped
+    "young_hits": 4,            # a track seen fewer times than this is predicted with the lane speed: while a cashew
+                                # is only partly inside the ROI its box centre moves at about half the real speed
+    "speed_tolerance": 0.5,     # allowed error of the predicted position, as a share of the distance travelled
+    "min_travel_px": 150.0,     # only a track that travelled this far tells the lane speed (a mark that hardly moves does not)
+    "size_ratio_min": 0.4,      # a box much narrower / wider ACROSS the lane than the cashew's last box is something else
+                                # (along the lane the box grows while the cashew enters the ROI, so that side is not compared)
+    "duplicate_overlap": 0.60,  # a new box lying this much inside a tracked cashew's box (or the other way) is the same cashew
 }
 _FAR = 1e6
 
@@ -39,7 +46,9 @@ class Detection:
     cy: float
     box: list
     data: Any = None            # whatever the caller wants back (class, view, features, ...)
-    track: Any = None           # set by LaneTracker.update(): the track this detection belongs to
+    track: Any = None           # set by LaneTracker.update(): the track this detection belongs to (None: ignored)
+    weak: bool = False          # low YOLO confidence: may continue a known cashew, never starts a new ID
+    ignored: str = ""           # why it got no track: "weak" or "duplicate of <id>"
 
 
 @dataclass
@@ -55,6 +64,7 @@ class Track:
     v: float = 0.0              # px/ms along the flow
     hits: int = 1
     missed: bool = False        # True while the position is only predicted
+    misses: int = 0             # frames in a row without a detection
     max_gap_ms: float = 0.0     # longest time without a detection (LOST rule)
     stuck: bool = False         # much slower than the lane for stuck_time_ms
     slow_since: Optional[float] = None
@@ -85,12 +95,53 @@ class LaneTracker:
         self.tracks = []
         self.dropped = []
         self.stopped = False
-        self._speeds.clear()
+        # The lane speed is kept: the belt runs as fast after the next START, and the first cashew needs it.
 
     @property
     def lane_speed(self) -> float:
         """Typical speed of this lane in px/ms (0 until some cashews have been tracked)."""
         return median(self._speeds) if self._speeds else 0.0
+
+    def _speed_of(self, trk):
+        """(speed used to predict this track, highest speed it may have) in px/ms."""
+        lane = self.lane_speed
+        own = trk.v if trk.hits > 1 else 0.0
+        if trk.hits < self.params["young_hits"]:
+            if lane > 0:
+                return lane, max(own, lane)     # entering the ROI: its own speed is not reliable yet
+            if own > 0:                         # no lane speed yet (first cashew): the real speed is between the
+                return own * 1.5, own * 2.2     # measured one and twice that (box centre of a partly visible cashew)
+        return (own if own > 0 else lane), max(own, lane)
+
+    def _covering(self, det, tracks):
+        """The track (seen in this frame) whose box the detection overlaps enough to be the same cashew, or None."""
+        need = self.params["duplicate_overlap"]
+        ax1, ay1, ax2, ay2 = det.box
+        area = max(1.0, (ax2 - ax1) * (ay2 - ay1))
+        for trk in tracks:
+            if trk.missed:
+                continue
+            bx1, by1, bx2, by2 = trk.box
+            inter = max(0.0, min(ax2, bx2) - max(ax1, bx1)) * max(0.0, min(ay2, by2) - max(ay1, by1))
+            if inter / area >= need or inter / max(1.0, (bx2 - bx1) * (by2 - by1)) >= need:
+                return trk
+        return None
+
+    def companion(self, trk, flow):
+        """Another live cashew at (almost) the same place as this track: the two are one cashew. Used to merge a
+        fragment (a short track) into the track that carries on, so that it never gets its own decision."""
+        (ax, ay), (lx, ly) = _axes(flow)
+        length = abs((trk.box[2] - trk.box[0]) * ax + (trk.box[3] - trk.box[1]) * ay) or 1.0
+        best, best_gap = None, None
+        for other in self.tracks:
+            if other is trk:
+                continue
+            other_length = abs((other.box[2] - other.box[0]) * ax + (other.box[3] - other.box[1]) * ay) or 1.0
+            gap = abs((other.cx - trk.cx) * ax + (other.cy - trk.cy) * ay)
+            side = abs((other.cx - trk.cx) * lx + (other.cy - trk.cy) * ly)
+            if gap <= 0.6 * max(length, other_length) and side <= self.params["max_lateral_px"] and (best is None or gap < best_gap):
+                best, best_gap = other, gap
+        return best
 
     def update(self, detections: List[Detection], t_ms: float, flow, roi=None):
         """Pair detections with tracks. Returns the tracks alive after this frame; `track.missed`
@@ -100,18 +151,32 @@ class LaneTracker:
         along = lambda x, y: x * ax + y * ay
         lateral = lambda x, y: x * lx + y * ly
 
+        # A detection belongs to a track when it lies near the place the cashew must have reached since it was LAST
+        # SEEN (not since the last frame): a cashew that was missed for some frames is found again under the same ID.
         cost = np.full((len(self.tracks), len(detections)), _FAR)
+        lane = self.lane_speed
         for i, trk in enumerate(self.tracks):
-            dt = max(0.0, t_ms - trk.now_ms)
-            v = trk.v if trk.hits > 1 else self.lane_speed
-            pred = along(trk.cx, trk.cy) + v * dt
-            forward_limit = (v * dt * p["speed_factor"] + p["gate_extra_px"]) if v > 0 else p["max_step_px"]
+            _, sx, sy = trk.path[-1]
+            dt = max(0.0, t_ms - trk.seen_ms)
+            v, v_high = self._speed_of(trk)
+            start = along(sx, sy)
+            pred = start + v * dt
+            if v_high > 0:
+                # one frame at the usual step gives the old limit: step <= v * dt * speed_factor + gate_extra_px
+                reach = p["gate_extra_px"] + max(p["speed_factor"] - 1.0, p["speed_tolerance"]) * v_high * dt
+                low, high = pred - reach, pred + reach
+            else:                           # no speed known yet: a fixed step per frame
+                low, high = start, start + p["max_step_px"] * (trk.misses + 1)
+            across = max(1.0, abs((trk.box[2] - trk.box[0]) * lx + (trk.box[3] - trk.box[1]) * ly))
             for j, det in enumerate(detections):
-                step = along(det.cx, det.cy) - along(trk.cx, trk.cy)
-                side = abs(lateral(det.cx, det.cy) - lateral(trk.cx, trk.cy))
-                if step < -p["back_tol_px"] or step > forward_limit or side > p["max_lateral_px"]:
+                pos = along(det.cx, det.cy)
+                side = abs(lateral(det.cx, det.cy) - lateral(sx, sy))
+                if pos - start < -p["back_tol_px"] or pos > high or pos < low - p["back_tol_px"] or side > p["max_lateral_px"]:
                     continue
-                cost[i, j] = float(np.hypot(along(det.cx, det.cy) - pred, side))
+                ratio = max(1.0, abs((det.box[2] - det.box[0]) * lx + (det.box[3] - det.box[1]) * ly)) / across
+                if ratio < p["size_ratio_min"] or ratio > 1.0 / p["size_ratio_min"]:
+                    continue
+                cost[i, j] = float(np.hypot(pos - pred, side)) + 40.0 * abs(ratio - 1.0)
 
         matched_tracks, matched_dets = set(), set()
         if cost.size:
@@ -128,10 +193,13 @@ class LaneTracker:
                 trk.seen_ms = trk.now_ms = t_ms
                 trk.hits += 1
                 trk.missed = False
+                trk.misses = 0
                 trk.path.append((t_ms, det.cx, det.cy))
                 lane = self.lane_speed
                 # A stuck or standing cashew must not pull the lane speed down.
-                if trk.hits >= 3 and trk.v > 0 and (len(self._speeds) < 5 or trk.v >= p["stuck_speed_fraction"] * lane):
+                travelled = abs(along(det.cx, det.cy) - along(*trk.path[0][1:]))
+                if trk.hits >= 3 and trk.v > 0 and travelled >= p["min_travel_px"] \
+                        and (len(self._speeds) < 5 or trk.v >= p["stuck_speed_fraction"] * lane):
                     self._speeds.append(trk.v)
                 if lane > 0 and trk.hits >= 3 and trk.v < p["stuck_speed_fraction"] * lane:
                     if trk.slow_since is None:
@@ -154,7 +222,8 @@ class LaneTracker:
                 continue
             # Not seen now: move it along at its speed so it can be found again (and still be decided).
             dt = max(0.0, t_ms - trk.now_ms)
-            step = (trk.v if trk.hits > 1 else self.lane_speed) * dt
+            step = self._speed_of(trk)[0] * dt
+            trk.misses += 1
             trk.cx += ax * step
             trk.cy += ay * step
             trk.box = [trk.box[0] + ax * step, trk.box[1] + ay * step, trk.box[2] + ax * step, trk.box[3] + ay * step]
@@ -168,6 +237,13 @@ class LaneTracker:
 
         for j, det in enumerate(detections):
             if j in matched_dets:
+                continue
+            if det.weak:                    # a faint detection alone is not a cashew
+                det.ignored = "weak"
+                continue
+            twin = self._covering(det, alive)
+            if twin is not None:            # a second box on a cashew that already has its ID: no second ID
+                det.ignored = f"duplicate of {twin.id}"
                 continue
             self._seq += 1
             trk = Track(id=f"R{self.roi_id}-{self._seq:06d}", roi=self.roi_id, cx=det.cx, cy=det.cy, box=list(det.box),

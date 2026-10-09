@@ -829,6 +829,60 @@ class Histogram(tk.Canvas):
             self.create_text(x, base + 11, text=f"{limit:.1f}", fill=WARN, font=(FONT, -11, "bold"))
 
 
+class DualHistogram(tk.Canvas):
+    """GSN_V21: two groups of values (e.g. WW and SW cashews) in one histogram, with a threshold line."""
+
+    def __init__(self, parent, height=150):
+        super().__init__(parent, bg=FIELD, height=height, highlightthickness=1, highlightbackground=BORDER, bd=0)
+        self._groups, self._threshold, self._title = [], None, ""
+        self.bind("<Configure>", lambda e: self._draw())
+
+    def show(self, groups, threshold=None, title=""):
+        """groups: [(name, colour, values)]."""
+        self._groups, self._threshold, self._title = [(n, c, list(v)) for n, c, v in groups], threshold, title
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w, h = max(120, self.winfo_width()), max(60, self.winfo_height())
+        self.create_text(10, 12, text=self._title, anchor="w", fill=MUTED, font=(FONT, -11, "bold"))
+        x = w - 10
+        for name, colour, values in reversed(self._groups):
+            label = f"{name} {len(values)}"
+            self.create_text(x, 12, text=label, anchor="e", fill=colour, font=(FONT, -11, "bold"))
+            x -= 9 * len(label) + 14
+        everything = [v for _, _, values in self._groups for v in values]
+        if self._threshold is not None:
+            everything = everything + [self._threshold]
+        if len(everything) < 2:
+            self.create_text(w / 2, h / 2, text="no samples yet", fill=MUTED, font=(FONT, F_SMALL))
+            return
+        lo, hi = min(everything), max(everything)
+        pad = max((hi - lo) * 0.08, 0.5)
+        lo, hi, bins = lo - pad, hi + pad, 32
+        x0, x1, base, top = 10, w - 10, h - 22, 28
+        bw = (x1 - x0) / bins
+        counts = []
+        for _, _, values in self._groups:
+            row = [0] * bins
+            for v in values:
+                row[min(bins - 1, max(0, int((v - lo) / (hi - lo) * bins)))] += 1
+            counts.append(row)
+        peak = max([max(row) for row in counts] + [1])
+        for (_, colour, _), row in zip(self._groups, counts):
+            for i, count in enumerate(row):
+                if count:
+                    self.create_rectangle(x0 + i * bw + 1, base - (base - top) * count / peak, x0 + (i + 1) * bw - 1, base,
+                                          fill=colour, outline="", stipple="gray50")
+        self.create_line(x0, base, x1, base, fill=BORDER)
+        for value in (lo + pad, hi - pad):
+            self.create_text(x0 + (value - lo) / (hi - lo) * (x1 - x0), base + 11, text=f"{value:.1f}", fill=MUTED, font=(FONT, -11))
+        if self._threshold is not None:
+            tx = x0 + (self._threshold - lo) / (hi - lo) * (x1 - x0)
+            self.create_line(tx, top - 6, tx, base + 2, fill="#FFFFFF", width=2)
+            self.create_text(tx, base + 11, text=f"{self._threshold:.1f}", fill="#FFFFFF", font=(FONT, -11, "bold"))
+
+
 class ProgressBar(tk.Canvas):
     """Thin progress bar, 0.0 - 1.0."""
 

@@ -50,6 +50,9 @@ CLASS_ALIASES = {"back cut oil": "OIL", "oil backcut": "OIL", "backcut oil": "OI
                  "double kernels": "DOUBLE", "double kernel": "DOUBLE", "double cashews": "DOUBLE"}
 DOUBLE_CLASS = "DOUBLE"         # CNN class "two cashews stuck together": always the reject ejector (besides the size rule)
 REJECT_CLASSES_DEFAULT = ["EDGECUT"]    # classes that always go to the reject ejector under their own name (owner, 2026-10-09)
+NOISE = "NOISE"                 # a tiny short-lived detection that was not a cashew: logged, never counted or fired
+MERGED = "MERGED"               # a fragment of another tracked cashew (broken ID, second box): logged, never decided or fired
+IGNORED_PREFIX = "IGNORED: "    # counter keys of MERGED / NOISE (not part of TOTAL)
 SIZE_NOT_READY = "SIZE_NOT_READY"       # GOOD while px per mm and the size grades are not taught yet: reject ejector
 
 

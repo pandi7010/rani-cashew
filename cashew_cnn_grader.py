@@ -42,6 +42,7 @@ import ejector_check
 import ejector_check_ui
 import production_capture
 import undefined_capture
+import colour_size
 import dataset_ops
 import relay_mapping
 import decision
@@ -563,9 +564,11 @@ class SharedState:
             self.line_pixel_callback(txt, pos)
 
     # ── grading: counters, decision details, belt colour teach ──
-    def add_decision(self, track_id: str, label: str, frames_txt: str, relay: int, count_keys, detail: str):
+    def add_decision(self, track_id: str, label: str, frames_txt: str, relay: int, count_keys, detail: str, row=None):
+        """row = (class, SW / WW, colour value, length mm, grade) for the RECENT RESULTS table."""
         with self.lock:
-            self.recent_fires.appendleft((time.strftime("%H:%M:%S"), track_id, label, frames_txt, f"R{relay}" if relay else "-"))
+            shown = row or (label, "-", "-", "-", "-")
+            self.recent_fires.appendleft((time.strftime("%H:%M:%S"), track_id) + tuple(shown) + (f"A{relay:02d}" if relay else "-",))
             for key in count_keys:
                 self.result_counts[key] = self.result_counts.get(key, 0) + 1
             self.recent_decisions[track_id] = detail
@@ -659,7 +662,7 @@ class SharedState:
     def add_fire_event(self, track: int, label: str, conf: float, act_id: int):
         with self.lock:
             ts = time.strftime("%H:%M:%S")
-            self.recent_fires.appendleft((ts, f"Trk {track}", label, f"{conf:.2f}", f"A{act_id}"))
+            self.recent_fires.appendleft((ts, f"Trk {track}", label, "-", "-", "-", "-", f"A{act_id}"))
 
     def get_recent_fires(self):
         with self.lock: return list(self.recent_fires)
@@ -931,6 +934,7 @@ class ProcessingThread(threading.Thread):
         self.capture = production_capture.ProductionCapture()     # inbox capture; its own saver thread
         # Every Undefined / lost / double cashew: all views + the full frame into captures/<undefined|double>/<date>/
         self.undefined_capture = undefined_capture.UndefinedCapture(app_paths.CAPTURES_DIR)
+        self._box_areas = {1: deque(maxlen=40), 2: deque(maxlen=40)}      # box size of real cashews per ROI (noise filter)
         self._clean_frame = None
         self.frame_time = time.time()
         self.ai_fps, self._ai_count, self._ai_since = 0.0, 0, time.time()   # frames graded per second
@@ -1282,7 +1286,9 @@ class ProcessingThread(threading.Thread):
                 if crops:
                     # One YOLO call for all ROIs: the crops are put into a single image.
                     combined_img, places = fg.stack_crops(crops)
-                    results = self.model.predict(combined_img, conf=state.get("target_conf", 0.30), verbose=False, device=self.device)[0]
+                    # Boxes below the normal confidence are kept as "weak": the tracker lets them continue a cashew it
+                    # already knows (a rolling cashew is often found with less confidence), never start a new ID.
+                    results = self.model.predict(combined_img, conf=min(self.WEAK_YOLO_CONF, state.get("target_conf", 0.30)), verbose=False, device=self.device)[0]
                     for box in results.boxes:
                         xy = box.xyxy[0].cpu().numpy().tolist()
                         i = fg.place_index(places, (xy[0] + xy[2]) / 2.0, (xy[1] + xy[3]) / 2.0)
@@ -1298,11 +1304,15 @@ class ProcessingThread(threading.Thread):
             boxes, classes, confs = merge_boxes_area_rule(*found[rid])
             detections = [self._measure_detection(clean_frame, box, cid, conf, roi, state, t_ms)
                           for box, cid, conf in zip(boxes, classes, confs)]
+            for det in detections:
+                det.weak = det.data["yolo_conf"] < float(state.get("target_conf", 0.30))
             tracker = self.trackers[rid]
             tracker.params = {**tracker.params, **grading.get("tracker", {})}
             tracks = tracker.update(detections, t_ms, flow, roi)
             for det in detections:
                 crop = det.data.pop("crop", None)
+                if det.track is None:           # a faint box alone, or a second box on a cashew that has its ID
+                    continue
                 if crop is not None and not det.track.decided:
                     self.capture.note_view(det.track.id, crop, decision.canonical(det.data["cnn"]), det.data["cnn_conf"])
                 if not det.track.decided:
@@ -1310,7 +1320,7 @@ class ProcessingThread(threading.Thread):
                     bx1, by1, bx2, by2 = det.data["box"]
                     self.undefined_capture.note_view(det.track.id, clean_frame[max(0, by1):by2, max(0, bx1):bx2])
                 det.track.info["last"] = det.data
-            live = next((d.data for d in detections if d.data.get("feat")), None)
+            live = next((d.data for d in detections if d.track is not None and d.data.get("feat")), None)
             for lost in tracker.dropped:        # disappeared before its line: LOST, nothing is fired
                 if not lost.decided:
                     self._log_lost(lost, rid)
@@ -1334,7 +1344,9 @@ class ProcessingThread(threading.Thread):
                 if progress is not None and progress < 0 and not trk.missed:
                     self._golden_capture(clean_frame, trk, state)
                 if progress is not None and progress >= 0 and not trk.decided:
-                    self._decide_track(trk, rid, line, state, t_ms)
+                    # One cashew = one decision = at most one fire: a fragment is closed without a decision.
+                    if not self._close_fragment(trk, rid, flow, "AT_LINE"):
+                        self._decide_track(trk, rid, line, state, t_ms)
                 self._draw_track(frame, trk, grading)
 
         # ROI boxes while RUNNING. The Home view shows only the ROI crops, so the frame is drawn just inside the ROI
@@ -1468,26 +1480,42 @@ class ProcessingThread(threading.Thread):
         length_px, width_px = med("length_px"), top("width_px")
         sw_votes = sum(n for name, n in d.votes.items() if normalize_name(name) == "sw")
 
+        # Step (c2). Size: median over the frames, in mm. Colour: median LAB value inside the mask over the frames.
+        mm_length = (med("length_px") or 0.0) / px_per_mm
+        mm_width = (med("width_px") or 0.0) / px_per_mm
+        mm_area = (med("area_px") or 0.0) / px_per_mm ** 2
+        size_cfg = state["size_config"]
+        colour_values = colour_size.track_colour(feats)
+        colour, colour_value = colour_size.colour_of(colour_values, size_cfg.get("colour"))
         relay, grade = None, ""
         if d.reject:
             relay = REJECT_RELAY[rid]
             label = d.result if d.result != decision.UNDEFINED else f"UNDEF {d.reason}"
+            colour = None
         elif d.result == decision.GOOD:
-            # Until step (c2): the old size table and mapping decide the relay of a GOOD cashew.
-            mm_length = (length_px or 0.0) / px_per_mm
-            mm_width = (width_px or 0.0) / px_per_mm
-            _, s_lbl = self._get_size_data(mm_length, mm_width, state["size_config"], rid)
-            prefix = "sw" if sw_votes * 2 > d.good_frames else "ww"
-            grade = relay_mapping.grade_name(prefix, s_lbl)
-            relay, assigned = relay_mapping.target_of(map_dict, rid, relay_mapping.grade_candidates(prefix, s_lbl), state.get("no_fire"))
-            label = f"GOOD {grade}" + (" (no fire)" if relay is None else "")
-            if not state["size_config"].get("size_ready", False):
-                # px per mm and the size grades are not taught yet: the grade is only what it WOULD have been.
+            # GOOD -> SW or WW -> size grade of that colour -> the grade's ejector (from the mapping).
+            colour_taught = colour is not None
+            if not colour_taught:           # no threshold yet: what the CNN voted, only to show a "would be"
+                colour = colour_size.SW if sw_votes * 2 > d.good_frames else colour_size.WW
+            size_grade, why = colour_size.grade_of(colour, mm_length, mm_width, mm_area, size_cfg.get("grades"))
+            grade = colour_size.would_be(colour, size_grade, why)
+            if not size_cfg.get("size_ready", False):
+                # SHADOW: colour and size are measured and logged ("would be SW210"); the cashew goes to the reject ejector.
                 d.reason, d.reject = f"{decision.SIZE_NOT_READY}:{grade}", True
                 relay, label, d.result = REJECT_RELAY[rid], f"UNDEF SIZE_NOT_READY (would be {grade})", decision.UNDEFINED
-            elif not assigned:      # a grade without an ejector goes to the reject ejector
-                d.reason, d.reject = f"{decision.NOT_MAPPED}:{grade}", True
-                label, d.result = f"UNDEF no ejector ({grade})", decision.UNDEFINED
+            elif not colour_taught:
+                d.reason, d.reject = colour_size.COLOUR_NOT_TAUGHT, True
+                relay, label, d.result = REJECT_RELAY[rid], "UNDEF colour not taught", decision.UNDEFINED
+            elif size_grade is None:        # outside every grade (or no grade of this colour taught): reject ejector
+                d.reason, d.reject = f"{why} {mm_length:.1f} x {mm_width:.1f} mm", True
+                relay, label, d.result = REJECT_RELAY[rid], f"UNDEF {grade}", decision.UNDEFINED
+                self.shared_state.count_engine("size")
+            else:
+                relay, assigned = relay_mapping.target_of(map_dict, rid, [grade, colour, "GOOD_CASHEW", "GOOD"], state.get("no_fire"))
+                label = f"GOOD {grade}" + (" (no fire)" if relay is None else "")
+                if not assigned:            # a grade without an ejector goes to the reject ejector
+                    d.reason, d.reject = f"{decision.NOT_MAPPED}:{grade}", True
+                    label, d.result = f"UNDEF no ejector ({grade})", decision.UNDEFINED
         else:
             relay, assigned = relay_mapping.target_of(map_dict, rid, [d.result])
             label = d.result
@@ -1516,6 +1544,7 @@ class ProcessingThread(threading.Thread):
         count_keys = [d.result] + ([f"UNDEFINED: {why}"] if d.result == decision.UNDEFINED else [])
         frame_rows = [{"t": round(f["t"] - trk.born_ms, 1), "cnn": f["cnn"], "cnn_conf": round(f["cnn_conf"], 3),
                        "yolo": f["yolo"], "yolo_conf": round(f["yolo_conf"], 3), "view": f["view"], "edge_cut": f["edge_cut"],
+                       "at": round(f["t"], 1), "box": f["box"],
                        "feat": {k: round(v, 3) for k, v in f["feat"].items()} if f["feat"] else None} for f in trk.frames]
         detail = [f"{trk.id}   {label}   relay {relay if relay else '-'}   {fire_result}",
                   f"result {d.result}, reason {d.reason}; frames {d.frames_used} used of {d.frames_total}; "
@@ -1526,7 +1555,11 @@ class ProcessingThread(threading.Thread):
             feat_txt = view_features.short_text(r["feat"]) + f" dark%{r['feat']['dark_pct']:.1f} red%{r['feat']['red_pct']:.1f}" if r["feat"] else "(no mask)"
             detail.append(f"+{r['t']:6.0f} ms  CNN {str(r['cnn']):<12} {r['cnn_conf']:.2f}  YOLO {str(r['yolo']):<12} {r['yolo_conf']:.2f}  "
                           f"{r['view']:<5}{' EDGE' if r['edge_cut'] else ''}  {feat_txt}")
-        self.shared_state.add_decision(trk.id, label, f"{d.frames_used}f", relay or 0, count_keys, "\n".join(detail))
+        shown_class = label.replace("UNDEF SIZE_NOT_READY ", "GOOD ") if d.reason.startswith(decision.SIZE_NOT_READY) else label
+        self.shared_state.add_decision(trk.id, label, f"{d.frames_used}f", relay or 0, count_keys, "\n".join(detail), row=(
+            shown_class, colour or "-", "-" if colour_value is None else f"{colour_value:.1f}", f"{mm_length:.1f}" if mm_length else "-", grade or "-"))
+        if len(trk.frames) >= 5:
+            self._box_areas[rid].append(abs(trk.box[2] - trk.box[0]) * abs(trk.box[3] - trk.box[1]))
         # Auto capture: Undefined (not the GOOD cashews held back only because the size grades are not ready) and double.
         if d.result == decision.DOUBLE:
             category = undefined_capture.DOUBLE
@@ -1539,40 +1572,91 @@ class ProcessingThread(threading.Thread):
             "frames_used": d.frames_used, "votes": d.votes, "views_seen": d.views, "box": [int(v) for v in trk.box]}, self._clean_frame)
         with self.shared_state.lock:
             self.shared_state.size_samples.append({
-                "id": trk.id, "t": time.time(), "l": (length_px or 0.0) / px_per_mm, "w": (width_px or 0.0) / px_per_mm,
-                "a": (med("area_px") or 0.0) / px_per_mm ** 2, "solidity": med("solidity") or 0.0,
-                "double": d.result == decision.DOUBLE or decision.DOUBLE in str(d.reason), "label": label})
+                "id": trk.id, "t": time.time(), "l": mm_length, "w": mm_width, "a": mm_area, "solidity": med("solidity") or 0.0,
+                "double": d.result == decision.DOUBLE or decision.DOUBLE in str(d.reason), "label": label,
+                "lab": colour_values, "colour": colour or "", "colour_value": colour_value, "grade": grade, "relay": relay or 0})
         self.cashew_log.write({
             "id": trk.id, "roi": rid, "frames": d.frames_total, "frames_used": d.frames_used, "result": d.result, "reason": d.reason,
             "reject": int(d.reject), "good_frames": d.good_frames, "neck_frames": d.neck_frames, "seen": d.seen, "votes": d.votes,
             "views": d.views, "cnn_sw_votes": sw_votes, "length_px": length_px, "width_px": width_px, "area_px": top("area_px"),
-            "length_mm": (length_px / px_per_mm) if length_px else "", "width_mm": (width_px / px_per_mm) if width_px else "",
+            "length_mm": mm_length or "", "width_mm": mm_width or "",
             "L": med("L"), "a": med("a"), "b": med("b"), "dark_pct_max": top("dark_pct"), "red_pct_max": top("red_pct"),
             "spots_max": top("spots"), "speed_px_ms": speed if speed is not None else "", "t_cross_ms": t_cross if t_cross is not None else "",
             "grade": grade, "relay": relay or "", "fire": fire_result, "late": "", "shadow": "; ".join(shadow),
         }, frames=frame_rows)
 
+    WEAK_YOLO_CONF = 0.10               # faint YOLO boxes down to this confidence may continue a known cashew
+    NOISE_MAX_HITS, NOISE_AREA_SHARE = 8, 0.25
+    FRAGMENT_MAX_HITS = 4               # a track seen at most this often can be a fragment of another cashew
+
+    def _usual_box_area(self, rid):
+        """Middle box area of the real cashews seen lately (this ROI, or both when this one has too few); 0 = unknown."""
+        own = list(self._box_areas[rid])
+        areas = own if len(own) >= 5 else own + list(self._box_areas[3 - rid])
+        return float(np.median(areas)) if len(areas) >= 5 else 0.0
+
+    def _fragment_kind(self, trk, rid, flow):
+        """(MERGED, the track it belongs to) / (NOISE, None) / (None, None) for a track that ends or reaches the line.
+        MERGED: another live cashew is at the same place, so this track is a piece of that cashew (a broken ID or a
+        second box). NOISE: a tiny box seen a few times (a mark on the belt, a reflection), not a cashew."""
+        other = self.trackers[rid].companion(trk, flow)
+        if other is not None and (trk.hits <= other.hits or trk.hits <= self.FRAGMENT_MAX_HITS):
+            return decision.MERGED, other
+        usual = self._usual_box_area(rid)
+        box_area = abs(trk.box[2] - trk.box[0]) * abs(trk.box[3] - trk.box[1])
+        if usual > 0 and trk.hits <= self.NOISE_MAX_HITS and box_area < self.NOISE_AREA_SHARE * usual:
+            return decision.NOISE, None
+        return None, None
+
+    def _track_note(self, trk, rid):
+        """Where a track was seen and what was next to it, for the log."""
+        try:
+            (t0, x0, y0), (t1, x1, y1) = trk.path[0], trk.path[-1]
+            others = [o for o in self.trackers[rid].tracks if o is not trk]
+            near = min(others, key=lambda o: abs(o.cx - trk.cx) + abs(o.cy - trk.cy)) if others else None
+            return (f"seen {trk.hits}x in {t1 - t0:.0f} ms from ({x0:.0f},{y0:.0f}) to ({x1:.0f},{y1:.0f}); "
+                    f"box {abs(trk.box[2] - trk.box[0]):.0f}x{abs(trk.box[3] - trk.box[1]):.0f} px; speed {trk.v:.2f} px/ms; longest gap {trk.max_gap_ms:.0f} ms; "
+                    + (f"nearest other cashew {near.id} at {abs(near.cx - trk.cx):.0f},{abs(near.cy - trk.cy):.0f} px" if near else "no other cashew in the ROI"))
+        except Exception:
+            return ""
+
+    def _frame_rows(self, trk):
+        """Per-frame positions of a track for the frames log (so a run can be replayed through the tracker)."""
+        return [{"t": round(f["t"] - trk.born_ms, 1), "at": round(f["t"], 1), "box": f["box"], "yolo": f["yolo"],
+                 "yolo_conf": round(f["yolo_conf"], 3)} for f in trk.frames]
+
+    def _close_fragment(self, trk, rid, flow, where) -> bool:
+        """True when the track was a fragment or noise: it is logged (MERGED / NOISE), never counted, decided or fired."""
+        kind, other = self._fragment_kind(trk, rid, flow)
+        if kind is None:
+            return False
+        trk.decided = True
+        trk.info["result"] = kind
+        if other is not None:
+            other.info.setdefault("merged", []).append(trk.id)
+            if not other.decided:           # what was seen on the fragment counts for the cashew it belongs to
+                other.frames = sorted(trk.frames + other.frames, key=lambda f: f["t"])
+        self.shared_state.count_result(f"{decision.IGNORED_PREFIX}{kind}")
+        self.cashew_log.write({"id": trk.id, "roi": rid, "frames": len(trk.frames), "result": kind,
+                               "reason": f"{where}:{other.id}" if other is not None else where, "fire": "NOT_FIRED",
+                               "shadow": self._track_note(trk, rid)}, frames=self._frame_rows(trk))
+        self.undefined_capture.forget(trk.id)
+        return True
+
     def _log_lost(self, trk, rid):
-        """A cashew that disappeared before its line (5-track: decision LOST). Counted and logged, never fired."""
+        """A cashew that disappeared before its line (5-track: decision LOST). Counted and logged, never fired.
+        A fragment of another cashew (MERGED) or a tiny short-lived box (NOISE) is logged but is not a lost cashew."""
+        flow = self.shared_state.flow_direction
+        if self._close_fragment(trk, rid, flow, "ENDED"):
+            return
         if trk.hits < 2:
             reason = decision.SEEN_ONLY_ONCE
         else:
             reason = decision.LEFT_ROI_UNDECIDED if trk.info.get("left_roi") else decision.LOST_BEFORE_LINE
         self.shared_state.count_result(decision.LOST)
-        # Where it was seen and what was next to it, so the cause can be read from the log afterwards:
-        # a second box on the same cashew (nearest track very close), a cashew that really vanished, or a broken ID.
-        note = ""
-        try:
-            (t0, x0, y0), (t1, x1, y1) = trk.path[0], trk.path[-1]
-            others = [o for o in self.trackers[rid].tracks if o is not trk]
-            near = min(others, key=lambda o: abs(o.cx - trk.cx) + abs(o.cy - trk.cy)) if others else None
-            note = (f"seen {trk.hits}x in {t1 - t0:.0f} ms from ({x0:.0f},{y0:.0f}) to ({x1:.0f},{y1:.0f}); "
-                    f"box {abs(trk.box[2] - trk.box[0]):.0f}x{abs(trk.box[3] - trk.box[1]):.0f} px; speed {trk.v:.2f} px/ms; "
-                    + (f"nearest other cashew {near.id} at {abs(near.cx - trk.cx):.0f},{abs(near.cy - trk.cy):.0f} px" if near else "no other cashew in the ROI"))
-        except Exception:
-            pass
+        note = self._track_note(trk, rid)
         self.cashew_log.write({"id": trk.id, "roi": rid, "frames": len(trk.frames), "result": decision.LOST, "reason": reason,
-                               "fire": "NOT_FIRED", "shadow": note})
+                               "fire": "NOT_FIRED", "shadow": note}, frames=self._frame_rows(trk))
         self.undefined_capture.on_result(trk.id, undefined_capture.UNDEFINED, f"LOST_{reason}", {
             "roi": rid, "result": decision.LOST, "fire": "NOT_FIRED", "frames": len(trk.frames), "where": note}, self._clean_frame)
 
@@ -2242,6 +2326,11 @@ class App(tk.Tk):
 
     def _set_engine(self, name, mode):
         """OFF / SHADOW / ACTIVE of one inspection engine. An engine that does not measure yet cannot be ACTIVE."""
+        if name in ("sw_ww", "size"):
+            messagebox.showinfo("Inspection engine", f"{engines.ENGINES[name][0]} is switched with SIZE GRADES READY on the Colour Size page:\n"
+                                                     "off = SHADOW (the grade is only logged), on = ACTIVE (GOOD cashews go to their grade ejector).")
+            self._engine_switches[name].set(self.shared_state.grading["engines"].get(name, engines.SHADOW))
+            return
         if mode == engines.ACTIVE and not engines.ENGINES[name][2]:
             messagebox.showinfo("Inspection engine", f"{engines.ENGINES[name][0]} does not measure yet in this version: NOT AVAILABLE as ACTIVE.\nIt stays in SHADOW.")
             return
@@ -2425,7 +2514,7 @@ class App(tk.Tk):
             g = copy.deepcopy(ss.grading)
             counts = dict(ss.result_counts)
             capture_on = bool(ss.capture_cfg.get("enabled"))
-        total = sum(n for k, n in counts.items() if not k.startswith("UNDEFINED: "))
+        total = sum(n for k, n in counts.items() if not k.startswith(("UNDEFINED: ", decision.IGNORED_PREFIX)))
         values = {
             "version": _software_version(), "program": self.active_program_name,
             "mode": "fire from grading only while RUNNING; manual buttons only while STOPPED",
@@ -2443,7 +2532,7 @@ class App(tk.Tk):
             "engines": ",  ".join(f"{engines.ENGINES[name][0]} {mode}" for name, mode in {**engines.ENGINE_DEFAULTS, **g.get('engines', {})}.items()),
             "tracking": "per ROI, cashew IDs R1-000001 ..., one decision at the Decision line",
             "logs": "logs/cashews_<date>.csv, frames_<date>.jsonl, manual_fire_<date>.csv, ejector_check_<date>.csv, admin_changes.log",
-            "counts": f"decided {total}:   " + (",  ".join(f"{k} {n}" for k, n in sorted(counts.items()) if not k.startswith("UNDEFINED: ")) or "-"),
+            "counts": f"decided {total}:   " + (",  ".join(f"{k} {n}" for k, n in sorted(counts.items()) if not k.startswith(("UNDEFINED: ", decision.IGNORED_PREFIX))) or "-"),
             "check": self.ejector_check.last_summary[0],
         }
         for key, text in values.items():
@@ -2510,7 +2599,7 @@ class App(tk.Tk):
         self.pills["check"].set(check_text, {"good": ui.GOOD, "warn": ui.WARN, "bad": ui.BAD}.get(check_level, ui.MUTED))
 
         counts = ss.get_result_counts()
-        total = sum(n for key, n in counts.items() if not key.startswith("UNDEFINED: "))
+        total = sum(n for key, n in counts.items() if not key.startswith(("UNDEFINED: ", decision.IGNORED_PREFIX)))
         good, undefined = counts.get(decision.GOOD, 0), counts.get(decision.UNDEFINED, 0)
         rejection = counts.get(decision.REJECTION, 0)
         self.kpi["total"].set(ui.thousands(total), f"detected {ui.thousands(ss.get_detected_count())}")
@@ -2529,7 +2618,10 @@ class App(tk.Tk):
             engine_counts = dict(ss.engine_counts)
         if engine_counts:
             parts.append("SHADOW would reject: " + ", ".join(f"{name} {n}" for name, n in sorted(engine_counts.items())))
-        parts += [f"{key} {n}" for key, n in sorted(counts.items()) if key not in shown + (decision.DOUBLE, decision.LOST) and not key.startswith("UNDEFINED: ")]
+        parts += [f"{key} {n}" for key, n in sorted(counts.items()) if key not in shown + (decision.DOUBLE, decision.LOST) and not key.startswith(("UNDEFINED: ", decision.IGNORED_PREFIX))]
+        ignored = sum(n for key, n in counts.items() if key.startswith(decision.IGNORED_PREFIX))
+        if ignored:
+            parts.append(f"FRAGMENTS / NOISE IGNORED {ignored}")
         self.lbl_kpi_more.config(text="     ".join(parts))
 
         # Alarms and the SAFETY pill (alarms.py decides, this only shows).
@@ -2674,13 +2766,13 @@ class App(tk.Tk):
         tree_frame = tk.Frame(p_prod, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
-        cols = ("time", "track", "label", "conf", "act")
+        cols = ("time", "track", "label", "colour", "value", "length", "grade", "act")
         self.fire_tree = ttk.Treeview(tree_frame, columns=cols, show='headings', height=8)
-        self.fire_tree.heading("time", text="TIME"); self.fire_tree.column("time", width=80, anchor='center')
-        self.fire_tree.heading("track", text="ID"); self.fire_tree.column("track", width=110, anchor='center')
-        self.fire_tree.heading("label", text="RESULT / CLASS"); self.fire_tree.column("label", width=280, anchor='w')
-        self.fire_tree.heading("conf", text="FRAMES"); self.fire_tree.column("conf", width=70, anchor='center')
-        self.fire_tree.heading("act", text="RELAY"); self.fire_tree.column("act", width=70, anchor='center')
+        for col, title, width, anchor in (("time", "TIME", 66, "center"), ("track", "ID", 84, "center"), ("label", "CLASS / RESULT", 170, "w"),
+                                          ("colour", "SW/WW", 52, "center"), ("value", "COLOUR", 58, "center"), ("length", "L mm", 50, "center"),
+                                          ("grade", "GRADE", 74, "center"), ("act", "EJECTOR", 64, "center")):
+            self.fire_tree.heading(col, text=title)
+            self.fire_tree.column(col, width=width, anchor=anchor, stretch=(col == "label"))
         self.fire_tree.bind("<Double-1>", self._show_decision_detail)     # frame-by-frame votes of that cashew
 
         tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.fire_tree.yview)
@@ -5769,7 +5861,7 @@ except Exception as e:
                 image = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)))
                 self._thumb_images[r], self._thumb_images[(r, "src")] = image, crop
                 self.lbl_view_thumb[r].config(image=image, width=image.width(), height=image.height())
-        total = sum(n for k, n in counts.items() if not k.startswith("UNDEFINED: "))
+        total = sum(n for k, n in counts.items() if not k.startswith(("UNDEFINED: ", decision.IGNORED_PREFIX)))
         self.lbl_result_counts.config(text=f"Decided: {total}   " + "   ".join(f"{k} {n}" for k, n in sorted(counts.items())))
         if teach_msg != self.lbl_teach_belt.cget("text"):
             self.lbl_teach_belt.config(text=teach_msg)
@@ -5796,15 +5888,18 @@ except Exception as e:
         box.pack(fill=tk.BOTH, expand=True)
 
     def _build_colour_size_page(self):
-        """Colour Size page in the 5-track layout: colour engines and the old OpenCV filter (left), size grades with
-        TEACH FROM CAMERA, shape limits and the last measured cashews (right). One SAVE button."""
+        """Colour Size page, step (c2). Left: SW / WW colour (metric, threshold, TEACH WW / TEACH SW with both
+        histograms and a suggested threshold) and the last measured cashews. Right: SIZE GRADES READY, the grade
+        tables W... / BUDDS / SW... with TEACH per grade, shape limits. One SAVE button."""
         import size_teach
         F = ui.FONT
         ss = self.shared_state
         page = tk.Frame(self.page_container, bg=ui.BG)
         self.pages["Colour Size"] = page
-        self.cs_vars, self.cs_engine = {}, {}
+        self.cs_vars = {}
         self._size_teach = None
+        self._colour_teach = {"active": None, "since": 0.0, colour_size.WW: {}, colour_size.SW: {}}      # colour -> {id: lab}
+        self._colour_suggestion = None
 
         bar = tk.Frame(page, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
         bar.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
@@ -5814,24 +5909,13 @@ except Exception as e:
         self.lbl_cs_unsaved = tk.Label(bar, text="", font=(F, ui.F_SMALL, "bold"), fg=ui.WARN, bg=ui.PANEL)
         self.lbl_cs_unsaved.pack(side=tk.RIGHT, padx=10)
 
-        def card(parent, title, note_text, engines_shown, **pack):
+        def card(parent, title, note_text, **pack):
             box = tk.Frame(parent, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
             box.pack(**pack)
             head = tk.Frame(box, bg=ui.PANEL)
-            head.pack(fill=tk.X, padx=16, pady=(12, 2))
+            head.pack(fill=tk.X, padx=16, pady=(12, 6))
             tk.Label(head, text=title, font=(F, ui.F_SMALL, "bold"), fg=ui.TEXT, bg=ui.PANEL).pack(side=tk.LEFT)
             tk.Label(head, text=note_text, font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT, padx=16)
-            for name in engines_shown:
-                row = tk.Frame(box, bg=ui.PANEL)
-                row.pack(fill=tk.X, padx=16, pady=2)
-                selector = ui.Segmented(row, engines.MODES, ss.grading["engines"].get(name, engines.SHADOW), lambda mode, n=name: self._set_engine(n, mode),
-                                        colours={engines.SHADOW: ui.WARN, engines.ACTIVE: ui.GOOD, engines.OFF: ui.IDLE})
-                selector.pack(side=tk.RIGHT)
-                tk.Label(row, text=engines.ENGINES[name][0], font=(F, ui.F_SMALL, "bold"), fg=ui.TEXT, bg=ui.PANEL).pack(side=tk.LEFT)
-                count = tk.Label(row, text="", font=(F, ui.F_SMALL), fg=ui.WARN, bg=ui.PANEL)
-                count.pack(side=tk.LEFT, padx=12)
-                self.cs_engine[name] = (selector, count)
-            tk.Frame(box, bg=ui.BORDER, height=1).pack(fill=tk.X, padx=16, pady=(8, 6))
             return box
 
         def text(parent, value, bold=False, colour=ui.TEXT, size=ui.F_SMALL, **kw):
@@ -5841,52 +5925,81 @@ except Exception as e:
             return tk.Entry(parent, textvariable=var, width=width, bg=ui.FIELD, fg=ui.TEXT, insertbackground=ui.TEXT, bd=0, justify="center",
                             font=(F, -14), highlightthickness=1, highlightbackground=ui.BORDER, highlightcolor=ui.ACCENT)
 
+        def row_of(parent, pady=4):
+            row = tk.Frame(parent, bg=ui.PANEL)
+            row.pack(fill=tk.X, padx=16, pady=pady)
+            return row
+
         def changed(*_):
             if hasattr(self, "lbl_cs_unsaved"):
                 self.lbl_cs_unsaved.config(text="●  UNSAVED CHANGES")
+        self._cs_changed = changed
 
-        def slider_row(parent, key, label, help_text, lo, hi, step, value, unit=""):
-            var = tk.StringVar(value=f"{value:g}")
-            self.cs_vars[key] = var
-            row = tk.Frame(parent, bg=ui.PANEL)
-            row.pack(fill=tk.X, padx=16, pady=(4, 0))
-            text(row, label, size=ui.F_BODY, width=22, anchor="w").pack(side=tk.LEFT)
-            text(row, unit, colour=ui.MUTED, width=6, anchor="w").pack(side=tk.RIGHT)
-            entry(row, var, 7).pack(side=tk.RIGHT, padx=8, ipady=5)
-            ui.Slider(row, var, lo, hi, step, ui.PANEL).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-            text(parent, help_text, colour=ui.MUTED, size=-11, anchor="w").pack(fill=tk.X, padx=16)
-            var.trace_add("write", changed)
+        def rule(parent):
+            tk.Frame(parent, bg=ui.BORDER, height=1).pack(fill=tk.X, padx=16, pady=(8, 4))
 
         body = tk.Frame(page, bg=ui.BG)
         body.pack(fill=tk.BOTH, expand=True)
 
-        # ── left: colour ──
-        left = card(body, "COLOUR", "dark, brown and scorched colour inside the cashew mask", ("colour", "sw_ww"),
-                    side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12))
-        text(left, "These two engines do not measure yet in this version (planned: step c2). They can be OFF or SHADOW; nothing is fired by them. "
-                   "The limits below belong to the old OpenCV filter of this machine and are kept and saved.",
-             colour=ui.WARN, size=-12, justify="left", anchor="w", wraplength=760).pack(fill=tk.X, padx=16, pady=(0, 6))
-        cv = ss.opencv_filter
-        slider_row(left, ("cv", "sw_color_thresh"), "SW colour threshold", "old filter: brightness below this counts as scorched (SW)", 0, 255, 1, cv.get("sw_color_thresh", 45))
-        slider_row(left, ("cv", "sw_defect_size_px"), "SW defect tolerance", "old filter: smaller marks are ignored", 0, 100, 1, cv.get("sw_defect_size_px", 20), "px")
-        slider_row(left, ("cv", "ww_color_thresh"), "WW colour threshold", "old filter: brightness below this is a mark on a white (WW) cashew", 0, 255, 1, cv.get("ww_color_thresh", 85))
-        slider_row(left, ("cv", "ww_defect_size_px"), "WW defect tolerance", "old filter: smaller marks are ignored", 0, 100, 1, cv.get("ww_defect_size_px", 16), "px")
-        slider_row(left, ("cv", "max_defect_px"), "Max defect area", "old filter: a larger dark area fails the view", 0, 5000, 10, cv.get("max_defect_px", 1200), "px")
-        tk.Frame(left, bg=ui.BORDER, height=1).pack(fill=tk.X, padx=16, pady=(12, 6))
-        head = tk.Frame(left, bg=ui.PANEL)
-        head.pack(fill=tk.X, padx=16)
+        # ───────────────────────────── left: colour ─────────────────────────────
+        left = card(body, "COLOUR  SW / WW", "median inside the cashew mask over all frames of the cashew", side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12))
+        colour_cfg = {**colour_size.COLOUR_DEFAULTS, **ss.size_config.get("colour", {})}
+        self._metric_names = {"b": "b*  YELLOW", "a": "a*  RED", "L": "L*  LIGHT"}
+        row = row_of(left)
+        text(row, "Value", size=ui.F_BODY, width=11, anchor="w").pack(side=tk.LEFT)
+        self.cs_metric = ui.Segmented(row, list(self._metric_names.values()), self._metric_names[colour_cfg["metric"]], self._cs_set_metric)
+        self.cs_metric.pack(side=tk.LEFT)
+        text(row, "SW is", size=ui.F_BODY).pack(side=tk.LEFT, padx=(24, 8))
+        self.cs_side = ui.Segmented(row, ("ABOVE", "BELOW"), "ABOVE" if colour_cfg["sw_above"] else "BELOW", lambda v: (self.cs_side.set(v), changed(), self._refresh_colour_size(force=True)))
+        self.cs_side.pack(side=tk.LEFT)
+        text(row, "the threshold", colour=ui.MUTED).pack(side=tk.LEFT, padx=8)
+        row = row_of(left)
+        text(row, "Threshold", size=ui.F_BODY, width=11, anchor="w").pack(side=tk.LEFT)
+        self.cs_threshold_var = tk.StringVar(value="" if colour_cfg["threshold"] is None else f"{float(colour_cfg['threshold']):g}")
+        self.cs_threshold_state = text(row, "", bold=True, colour=ui.WARN)
+        self.cs_threshold_state.pack(side=tk.RIGHT)
+        entry(row, self.cs_threshold_var, 7).pack(side=tk.RIGHT, padx=8, ipady=5)
+        ui.Slider(row, self.cs_threshold_var, -30, 100, 0.5, ui.PANEL).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        self.cs_threshold_var.trace_add("write", lambda *_: (changed(), self._refresh_colour_size(force=True)))
+        row = row_of(left, pady=(6, 2))
+        text(row, "CURRENT CASHEW", bold=True, colour=ui.MUTED).pack(side=tk.LEFT)
+        self.lbl_cs_live = text(row, "-", bold=True, size=ui.F_HEAD)
+        self.lbl_cs_live.pack(side=tk.LEFT, padx=16)
+        self.lbl_cs_live_all = text(row, "", colour=ui.MUTED)
+        self.lbl_cs_live_all.pack(side=tk.RIGHT)
+
+        rule(left)
+        row = row_of(left)
+        text(row, "TEACH COLOUR", bold=True, colour=ui.MUTED).pack(side=tk.LEFT)
+        text(row, "run only WW cashews, then only SW cashews (machine RUNNING)", colour=ui.MUTED, size=-11).pack(side=tk.LEFT, padx=12)
+        row = row_of(left)
+        self.btn_teach_ww = ui.FlatButton(row, "TEACH WW", lambda: self._colour_teach_toggle(colour_size.WW), height=34, width=150)
+        self.btn_teach_ww.pack(side=tk.LEFT)
+        self.btn_teach_sw = ui.FlatButton(row, "TEACH SW", lambda: self._colour_teach_toggle(colour_size.SW), height=34, width=150)
+        self.btn_teach_sw.pack(side=tk.LEFT, padx=8)
+        ui.FlatButton(row, "CLEAR", self._colour_teach_clear, kind="muted", height=34, width=80).pack(side=tk.LEFT)
+        self.btn_cs_colour_apply = ui.FlatButton(row, "APPLY SUGGESTION", self._colour_teach_apply, kind="primary", height=34, width=200)
+        self.btn_cs_colour_apply.pack(side=tk.RIGHT)
+        self.btn_cs_colour_apply.set_enabled(False)
+        self.cs_colour_hist = ui.DualHistogram(left, height=150)
+        self.cs_colour_hist.pack(fill=tk.X, padx=16, pady=(6, 0))
+        self.lbl_cs_suggest = text(left, "", colour=ui.MUTED, size=-12, justify="left", anchor="w", wraplength=780)
+        self.lbl_cs_suggest.pack(fill=tk.X, padx=16, pady=(6, 0))
+
+        rule(left)
+        head = row_of(left, pady=0)
         text(head, "LAST CASHEWS", bold=True, colour=ui.MUTED).pack(side=tk.LEFT)
-        text(head, "measured size of the cashews decided while RUNNING", colour=ui.MUTED, size=-11).pack(side=tk.LEFT, padx=12)
-        self.cs_last_tree = ttk.Treeview(left, columns=("id", "l", "w", "a", "sol", "result"), show="headings", style="Home.Treeview", height=9)
-        for col, title, width in (("id", "ID", 110), ("l", "L mm", 70), ("w", "W mm", 70), ("a", "AREA mm2", 90), ("sol", "SOLIDITY", 80), ("result", "DECISION", 300)):
+        text(head, "measured while RUNNING", colour=ui.MUTED, size=-11).pack(side=tk.LEFT, padx=12)
+        self.cs_last_tree = ttk.Treeview(left, columns=("id", "result", "colour", "value", "l", "w", "a", "grade", "relay"), show="headings", style="Home.Treeview", height=7)
+        for col, title, width in (("id", "ID", 96), ("result", "CLASS / RESULT", 230), ("colour", "SW/WW", 60), ("value", "COLOUR", 70), ("l", "L mm", 60),
+                                  ("w", "W mm", 60), ("a", "AREA", 60), ("grade", "GRADE", 110), ("relay", "EJECTOR", 70)):
             self.cs_last_tree.heading(col, text=title, anchor="w")
-            self.cs_last_tree.column(col, width=width, anchor="w")
+            self.cs_last_tree.column(col, width=width, anchor="w", stretch=(col == "result"))
         self.cs_last_tree.pack(fill=tk.BOTH, expand=True, padx=16, pady=(6, 14))
 
-        # ── right: size & shape ──
-        right = card(body, "SIZE & SHAPE", "size grade of a GOOD cashew, broken and split pieces", ("size", "shape"), side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ready = tk.Frame(right, bg=ui.PANEL)
-        ready.pack(fill=tk.X, padx=16)
+        # ───────────────────────────── right: size ─────────────────────────────
+        right = card(body, "SIZE GRADES", "length, width, area in mm from the contour, median over the frames", side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ready = row_of(right, pady=0)
         self.cs_ready_switch = ui.ToggleSwitch(ready, ui.PANEL, bool(ss.size_config.get("size_ready", False)), self._set_size_ready)
         self.cs_ready_switch.pack(side=tk.LEFT)
         self.lbl_cs_ready = text(ready, "", bold=True)
@@ -5894,89 +6007,198 @@ except Exception as e:
         self.lbl_cs_calibration = text(ready, "", colour=ui.MUTED)
         self.lbl_cs_calibration.pack(side=tk.RIGHT)
 
+        # The table is built from plain rows (pack), every cell with a fixed width: no grid spans or weights.
+        widths = (8, 7, 7, 7, 7, 7, 7)
         table = tk.Frame(right, bg=ui.PANEL)
         table.pack(fill=tk.X, padx=16, pady=(8, 0))
-        heads = ("GRADE", "L below", "W below", "L min", "L max", "W min", "W max", "AREA min", "AREA max", "TAUGHT", "")
-        for col, title in enumerate(heads):
-            text(table, title, bold=True, colour=ui.MUTED, size=-11, anchor="w").grid(row=0, column=col, sticky="w", padx=(0, 6))
-        text(table, "mm, used now", colour=ui.MUTED, size=-10).grid(row=1, column=1, columnspan=2, sticky="w")
-        text(table, "taught limits (stored; used from step c2)", colour=ui.MUTED, size=-10).grid(row=1, column=3, columnspan=6, sticky="w")
-        table.columnconfigure(9, weight=1)
+        header = tk.Frame(table, bg=ui.PANEL)
+        header.pack(fill=tk.X)
+        for title, width in zip(("GRADE", "L min", "L max", "W min", "W max", "AREA min", "AREA max"), widths):
+            text(header, title, bold=True, colour=ui.MUTED, size=-11, width=width + 1, anchor="w").pack(side=tk.LEFT)
+        text(header, "TAUGHT", bold=True, colour=ui.MUTED, size=-11, anchor="w").pack(side=tk.LEFT, padx=6)
         self.cs_grade_taught, self.cs_teach_buttons = {}, {}
         grades = ss.size_config.get("grades", {})
-        for r, grade in enumerate(size_teach.GRADES, start=2):
-            text(table, grade, bold=True, size=ui.F_BODY).grid(row=r, column=0, sticky="w", pady=3, padx=(0, 10))
-            for col, key in ((1, f"{grade}_L"), (2, f"{grade}_W")):
-                var = self.sz_vars.get(key) or tk.StringVar(value=str(ss.size_config.get(key, "")))
-                self.sz_vars[key] = var
-                self.cs_vars[("old", key)] = var
-                entry(table, var, 6).grid(row=r, column=col, padx=(0, 6), ipady=4)
-                var.trace_add("write", changed)
-            for col, key in enumerate(("l_min", "l_max", "w_min", "w_max", "a_min", "a_max"), start=3):
+        for grade in colour_size.WW_GRADES + (colour_size.BUDDS,) + colour_size.SW_GRADES:
+            if grade == colour_size.SW_GRADES[0]:
+                gap = tk.Frame(table, bg=ui.PANEL)
+                gap.pack(fill=tk.X, pady=(6, 2))
+                text(gap, "SW grades", bold=True, colour=ui.MUTED, size=-11).pack(side=tk.LEFT)
+                ui.FlatButton(gap, "COPY W LIMITS TO SW", self._copy_w_to_sw, kind="muted", height=24, width=190, font=(F, -11, "bold")).pack(side=tk.LEFT, padx=12)
+            line = tk.Frame(table, bg=ui.PANEL)
+            line.pack(fill=tk.X, pady=1)
+            text(line, grade, bold=True, size=ui.F_BODY, width=7, anchor="w").pack(side=tk.LEFT)
+            for key in colour_size.LIMIT_KEYS:
                 value = grades.get(grade, {}).get(key)
                 var = tk.StringVar(value="" if value is None else f"{value:g}")
                 self.cs_vars[("grade", grade, key)] = var
-                entry(table, var, 6).grid(row=r, column=col, padx=(0, 6), ipady=4)
+                entry(line, var, 6).pack(side=tk.LEFT, padx=(0, 6), ipady=3)
                 var.trace_add("write", changed)
-            self.cs_grade_taught[grade] = text(table, "", colour=ui.MUTED, anchor="w")
-            self.cs_grade_taught[grade].grid(row=r, column=9, sticky="w", padx=6)
-            button = ui.FlatButton(table, "TEACH", lambda g=grade: self._size_teach_toggle(g), height=28, width=76)
-            button.grid(row=r, column=10, sticky="e")
+            button = ui.FlatButton(line, "TEACH", lambda g=grade: self._size_teach_toggle(g), height=26, width=72)
+            button.pack(side=tk.RIGHT)
             self.cs_teach_buttons[grade] = button
+            self.cs_grade_taught[grade] = text(line, "", colour=ui.MUTED, anchor="w")
+            self.cs_grade_taught[grade].pack(side=tk.LEFT, padx=6)
+        text(right, "BUDDS: one row for both colours (no fire: end of belt). A cashew outside every grade of its colour goes to the reject ejector.",
+             colour=ui.MUTED, size=-11, anchor="w").pack(fill=tk.X, padx=16, pady=(4, 0))
 
-        teach = tk.Frame(right, bg=ui.PANEL)
-        teach.pack(fill=tk.X, padx=16, pady=(10, 0))
+        teach = row_of(right, pady=(8, 0))
         self.lbl_cs_teach = text(teach, "TEACH FROM CAMERA", bold=True, colour=ui.MUTED)
         self.lbl_cs_teach.pack(side=tk.LEFT)
         self.cs_k_var = tk.StringVar(value=f"{float(ss.size_config.get('teach_k', size_teach.K_DEFAULT)):g}")
-        entry(teach, self.cs_k_var, 5).pack(side=tk.RIGHT, ipady=4)
+        entry(teach, self.cs_k_var, 5).pack(side=tk.RIGHT, ipady=3)
         text(teach, "mean -/+ k x std,  k", colour=ui.MUTED).pack(side=tk.RIGHT, padx=8)
         histograms = tk.Frame(right, bg=ui.PANEL)
         histograms.pack(fill=tk.X, padx=16, pady=(6, 0))
         self.cs_histograms = {}
         for index, (key, title, unit) in enumerate(size_teach.KEYS):
-            histogram = ui.Histogram(histograms, title, unit, height=120)
-            histograms.columnconfigure(index, weight=1, uniform="hist")
-            histogram.config(width=120)
-            histogram.grid(row=0, column=index, sticky="ew", padx=(0, 8) if index < 2 else 0)
+            holder = tk.Frame(histograms, bg=ui.PANEL)
+            holder.place(relx=index / 3.0, rely=0, relwidth=1 / 3.0, relheight=1.0)
+            histogram = ui.Histogram(holder, title, unit, height=104)
+            histogram.pack(fill=tk.BOTH, expand=True, padx=(0, 6) if index < 2 else 0)
             self.cs_histograms[key] = histogram
-        apply_row = tk.Frame(right, bg=ui.PANEL)
-        apply_row.pack(fill=tk.X, padx=16, pady=(8, 0))
-        self.btn_cs_apply = ui.FlatButton(apply_row, "APPLY", self._size_teach_apply, kind="primary", height=32, width=170)
+        histograms.config(height=106)
+        apply_row = row_of(right, pady=(8, 0))
+        self.btn_cs_apply = ui.FlatButton(apply_row, "APPLY", self._size_teach_apply, kind="primary", height=30, width=170)
         self.btn_cs_apply.pack(side=tk.LEFT)
         self.btn_cs_apply.set_enabled(False)
-        text(apply_row, f"Run only cashews of that grade. Needs at least {size_teach.MIN_SAMPLES} cashews. Yellow lines = the min / max that will be set.",
+        text(apply_row, f"Run only cashews of that grade. At least {size_teach.MIN_SAMPLES} cashews. Yellow lines = the min / max that will be set.",
              colour=ui.MUTED, size=-11).pack(side=tk.LEFT, padx=12)
 
-        tk.Frame(right, bg=ui.BORDER, height=1).pack(fill=tk.X, padx=16, pady=(12, 4))
-        text(right, "SHAPE LIMITS      DOUBLE RULE", bold=True, colour=ui.MUTED, anchor="w").pack(fill=tk.X, padx=16)
+        rule(right)
+        text(right, "SHAPE LIMITS  (GOOD cashews only; SHADOW / ACTIVE on the Pneumatic page)      DOUBLE RULE", bold=True, colour=ui.MUTED, anchor="w").pack(fill=tk.X, padx=16)
         shape, double = ss.grading["shape"], ss.grading["double"]
-        slider_row(right, ("shape", "min_solidity"), "Min solidity", "below: SHAPE_BROKEN", 0.5, 1.0, 0.01, shape["min_solidity"])
-        slider_row(right, ("shape", "min_length_width"), "Min length / width", "below: SHAPE_SPLIT", 1.0, 2.0, 0.01, shape["min_length_width"])
-        slider_row(right, ("shape", "min_length_mm"), "Min length", "below: SHAPE_SPLIT", 5, 30, 0.5, shape["min_length_mm"], "mm")
-        slider_row(right, ("shape", "min_area_mm2"), "Min area", "below: SHAPE_TOO_SMALL", 20, 300, 5, shape["min_area_mm2"], "mm2")
-        slider_row(right, ("double", "max_single_length_mm"), "Longest single cashew", "longer in enough frames: DOUBLE (reject ejector)", 30, 70, 0.5,
-                   double["max_single_length_mm"], "mm")
+        limits = row_of(right, pady=(6, 12))
+        for key, label, value, unit in ((("shape", "min_solidity"), "Min solidity", shape["min_solidity"], ""),
+                                        (("shape", "min_length_width"), "Min L / W", shape["min_length_width"], ""),
+                                        (("shape", "min_length_mm"), "Min length", shape["min_length_mm"], "mm"),
+                                        (("shape", "min_area_mm2"), "Min area", shape["min_area_mm2"], "mm2"),
+                                        (("double", "max_single_length_mm"), "Longest single", double["max_single_length_mm"], "mm")):
+            var = tk.StringVar(value=f"{value:g}")
+            self.cs_vars[key] = var
+            text(limits, label, colour=ui.TEXT).pack(side=tk.LEFT)
+            entry(limits, var, 5).pack(side=tk.LEFT, padx=(6, 2), ipady=3)
+            text(limits, unit, colour=ui.MUTED, size=-11).pack(side=tk.LEFT, padx=(0, 12))
+            var.trace_add("write", changed)
         self.lbl_cs_unsaved.config(text="")
         self._refresh_colour_size(force=True)
 
+    # ── colour: metric, threshold, teach ──
+    def _cs_metric(self):
+        return next(k for k, v in self._metric_names.items() if v == self.cs_metric.value)
+
+    def _cs_set_metric(self, shown):
+        self.cs_metric.set(shown)
+        self._cs_changed()
+        self._refresh_colour_size(force=True)
+
+    def _cs_colour_cfg(self):
+        """Colour settings as shown on the page (threshold None while the field is empty or not a number)."""
+        try:
+            threshold = float(self.cs_threshold_var.get().strip().replace(",", "."))
+        except ValueError:
+            threshold = None
+        return {"metric": self._cs_metric(), "threshold": threshold, "sw_above": self.cs_side.value == "ABOVE"}
+
+    def _colour_teach_toggle(self, colour):
+        """TEACH WW / TEACH SW: collect the colour of every cashew measured from now on; a second press stops."""
+        teach = self._colour_teach
+        if teach["active"] == colour:
+            teach["active"] = None
+        else:
+            teach["active"], teach["since"] = colour, time.time()
+        self._refresh_colour_size(force=True)
+
+    def _colour_teach_clear(self):
+        self._colour_teach.update({"active": None, colour_size.WW: {}, colour_size.SW: {}})
+        self._colour_suggestion = None
+        self._refresh_colour_size(force=True)
+
+    def _colour_teach_collect(self):
+        teach = self._colour_teach
+        if not teach["active"]:
+            return
+        with self.shared_state.lock:
+            new = [s for s in self.shared_state.size_samples if s["t"] >= teach["since"] and s.get("lab") and not s["double"]]
+        for sample in new:
+            teach[teach["active"]][sample["id"]] = sample["lab"]
+
+    def _colour_teach_apply(self):
+        """APPLY SUGGESTION: the best metric, its threshold and side go into the fields and are saved at once."""
+        suggestion = self._colour_suggestion
+        if not suggestion:
+            return
+        if self.shared_state.phase == "RUNNING":
+            messagebox.showwarning("Stop first", "Stop the machine before applying the colour threshold.")
+            return
+        best = suggestion["metrics"][suggestion["best"]]
+        self.cs_metric.set(self._metric_names[suggestion["best"]])
+        self.cs_side.set("ABOVE" if best["sw_above"] else "BELOW")
+        self.cs_threshold_var.set(f"{best['threshold']:g}")
+        self._colour_teach["active"] = None
+        with self.shared_state.lock:
+            self.shared_state.size_config["colour"] = {**self._cs_colour_cfg(), "taught": f"{datetime.now():%d.%m.%Y %H:%M}",
+                                                       "ww": suggestion["ww"], "sw": suggestion["sw"], "wrong_pct": best["wrong_pct"]}
+        self.shared_state.save_to_config(CFG_PATH)
+        log.info("Colour threshold taught: %s", self.shared_state.size_config["colour"])
+        self._refresh_colour_size(force=True)
+
+    def _copy_w_to_sw(self):
+        """COPY W LIMITS TO SW: the fields of SW180 ... SW450 get the values of W180 ... W450 (saved with SAVE)."""
+        copied = []
+        for size in colour_size.SIZES:
+            values = [self.cs_vars[("grade", f"W{size}", key)].get().strip() for key in colour_size.LIMIT_KEYS]
+            if values[0] and values[1]:
+                for key, value in zip(colour_size.LIMIT_KEYS, values):
+                    self.cs_vars[("grade", f"SW{size}", key)].set(value)
+                self._size_taught_pending = getattr(self, "_size_taught_pending", {})
+                self._size_taught_pending[f"SW{size}"] = {"taught": f"copied from W{size}"}
+                copied.append(f"SW{size}")
+        if not copied:
+            messagebox.showinfo("Copy W limits", "No W grade has limits yet. Teach or type the W grades first.")
+        self._refresh_colour_size(force=True)
+
+    def _size_ready_blockers(self):
+        """What is still missing before SIZE GRADES READY may be switched on."""
+        size_config = self.shared_state.size_config
+        missing = []
+        if not size_config.get("roi_length_mm"):
+            missing.append("px per mm is not calibrated (Vision ROI page: ROI 1 length in mm, SAVE VISION SETTINGS)")
+        if size_config.get("colour", {}).get("threshold") is None:
+            missing.append("the SW / WW threshold is not set (TEACH WW, TEACH SW, APPLY SUGGESTION, or type it and SAVE)")
+        grades = size_config.get("grades", {})
+        for colour, names in ((colour_size.WW, colour_size.WW_GRADES), (colour_size.SW, colour_size.SW_GRADES)):
+            if not any(grades.get(n, {}).get("l_min") is not None for n in names):
+                missing.append(f"no {colour} grade has limits (TEACH a grade and SAVE" + ("; or COPY W LIMITS TO SW)" if colour == colour_size.SW else ")"))
+        return missing
+
     def _set_size_ready(self, on):
-        """SIZE GRADES READY: off = every GOOD cashew goes to the reject ejector (SIZE_NOT_READY)."""
+        """SIZE GRADES READY: off = SHADOW (every GOOD cashew goes to the reject ejector, the grade is only logged)."""
         ss = self.shared_state
         if on:
-            if not ss.size_config.get("roi_length_mm"):
-                messagebox.showwarning("Size grades", "Calibrate px per mm first: Vision ROI page, ROI length in mm, SAVE VISION SETTINGS.")
+            missing = self._size_ready_blockers()
+            if missing:
+                messagebox.showwarning("Size grades", "SIZE GRADES READY cannot be switched on yet:\n\n- " + "\n- ".join(missing))
                 self.cs_ready_switch.set(False)
                 return
-            if not messagebox.askyesno("Size grades", "Switch SIZE GRADES READY on?\n\nGOOD cashews will then go to the ejector of their size grade "
-                                       "(W180 ... SW450) from the 'L below / W below' table, instead of the reject ejector.\n\n"
-                                       "Do this only after the table was checked with real cashews.", icon="warning"):
+            if self.lbl_cs_unsaved.cget("text"):
+                messagebox.showwarning("Size grades", "There are unsaved changes on this page. Press SAVE COLOUR & SIZE first.")
+                self.cs_ready_switch.set(False)
+                return
+            taught = [n for n in colour_size.ALL_GRADES if ss.size_config.get("grades", {}).get(n, {}).get("l_min") is not None]
+            if not messagebox.askyesno("Size grades", "Switch SIZE GRADES READY on?\n\nGOOD cashews will then be fired by the ejector of their colour "
+                                       "and size grade instead of the reject ejector.\n\nGrades with limits: " + ", ".join(taught) +
+                                       "\nA GOOD cashew outside every grade of its colour goes to the reject ejector.\n\n"
+                                       "Do this only after the \"would be\" grades in RECENT RESULTS were checked with real cashews.", icon="warning"):
                 self.cs_ready_switch.set(False)
                 return
         with ss.lock:
             ss.size_config["size_ready"] = bool(on)
-        ss.save_to_config(CFG_PATH)
+        g = copy.deepcopy(ss.grading)
+        for name in ("sw_ww", "size"):
+            g["engines"][name] = engines.ACTIVE if on else engines.SHADOW
+        ss.set_grading(g)                           # also writes the settings file
         log.info("SIZE GRADES READY -> %s", bool(on))
+        self._refresh_pneumatic()
         self._refresh_colour_size(force=True)
 
     def _size_teach_toggle(self, grade):
@@ -6015,7 +6237,7 @@ except Exception as e:
         result = size_teach.limits(self._size_teach_samples(), self._size_teach_k())
         if not result:
             return
-        for key in ("l_min", "l_max", "w_min", "w_max", "a_min", "a_max"):
+        for key in colour_size.LIMIT_KEYS:
             self.cs_vars[("grade", grade, key)].set(f"{result[key]:g}")
         self._size_taught_pending = getattr(self, "_size_taught_pending", {})
         self._size_taught_pending[grade] = {"n": result["n"], "k": result["k"], "taught": f"{datetime.now():%d.%m %H:%M}"}
@@ -6023,39 +6245,50 @@ except Exception as e:
         self._refresh_colour_size(force=True)
 
     def _save_colour_size(self):
-        """SAVE COLOUR & SIZE: old filter limits, size tables, shape limits and the double length."""
+        """SAVE COLOUR & SIZE: colour metric / threshold / side, grade limits, shape limits and the double length."""
         ss = self.shared_state
         if ss.phase == "RUNNING":
             messagebox.showwarning("Stop first", "Stop the machine before saving colour and size settings.")
             return False
-        import size_teach
         try:
             number = lambda var: float(var.get().strip().replace(",", "."))
-            cv = {key[1]: int(number(var)) for key, var in self.cs_vars.items() if key[0] == "cv"}
-            old = {key[1]: number(var) for key, var in self.cs_vars.items() if key[0] == "old"}
             shape = {key[1]: number(var) for key, var in self.cs_vars.items() if key[0] == "shape"}
             double_length = number(self.cs_vars[("double", "max_single_length_mm")])
             grades = {}
-            for grade in size_teach.GRADES:
-                row = {key: self.cs_vars[("grade", grade, key)].get().strip() for key in ("l_min", "l_max", "w_min", "w_max", "a_min", "a_max")}
+            for grade in colour_size.ALL_GRADES:
+                row = {key: self.cs_vars[("grade", grade, key)].get().strip() for key in colour_size.LIMIT_KEYS}
                 if any(row.values()):
                     grades[grade] = {key: float(value.replace(",", ".")) for key, value in row.items() if value}
         except ValueError:
-            messagebox.showerror("Colour & Size", "Please check the numbers: one field is empty or not a number.")
+            messagebox.showerror("Colour & Size", "Please check the numbers: one field is not a number.")
             return False
-        if any(v <= 0 for v in old.values()) or double_length <= 0:
+        for grade, row in grades.items():
+            if "l_min" not in row or "l_max" not in row:
+                messagebox.showerror("Colour & Size", f"{grade}: L min and L max are needed (width and area limits are optional).")
+                return False
+            for low, high in (("l_min", "l_max"), ("w_min", "w_max"), ("a_min", "a_max")):
+                if low in row and high in row and row[low] >= row[high]:
+                    messagebox.showerror("Colour & Size", f"{grade}: {low.replace('_', ' ')} must be below {high.replace('_', ' ')}.")
+                    return False
+        if double_length <= 0:
             messagebox.showerror("Colour & Size", "Sizes must be above 0.")
+            return False
+        colour_cfg = self._cs_colour_cfg()
+        if self.cs_threshold_var.get().strip() and colour_cfg["threshold"] is None:
+            messagebox.showerror("Colour & Size", "The SW / WW threshold is not a number.")
+            return False
+        if ss.size_config.get("size_ready") and (colour_cfg["threshold"] is None or not grades):
+            messagebox.showerror("Colour & Size", "SIZE GRADES READY is on: the threshold and the grade limits cannot be emptied. Switch it off first.")
             return False
         pending = getattr(self, "_size_taught_pending", {})
         with ss.lock:
-            ss.opencv_filter.update(cv)
-            ss.size_config.update(old)
-            stored = ss.size_config.setdefault("grades", {})
-            for grade in size_teach.GRADES:
-                if grade in grades:
-                    stored[grade] = {**{k: v for k, v in stored.get(grade, {}).items() if k in ("n", "k", "taught")}, **grades[grade], **pending.get(grade, {})}
-                else:
-                    stored.pop(grade, None)
+            old_colour = ss.size_config.get("colour", {})
+            keep = {k: v for k, v in old_colour.items() if k in ("taught", "ww", "sw", "wrong_pct")} \
+                if all(old_colour.get(k) == colour_cfg[k] for k in colour_cfg) else {}
+            ss.size_config["colour"] = {**colour_cfg, **keep}
+            stored = ss.size_config.get("grades", {})
+            ss.size_config["grades"] = {grade: {**{k: v for k, v in stored.get(grade, {}).items() if k in ("n", "k", "taught") and grade not in pending},
+                                                **row, **pending.get(grade, {})} for grade, row in grades.items()}
             ss.size_config["teach_k"] = self._size_teach_k()
         self._size_taught_pending = {}
         g = copy.deepcopy(ss.grading)
@@ -6073,22 +6306,55 @@ except Exception as e:
             return
         ss = self.shared_state
         with ss.lock:
-            modes, counts = dict(ss.grading["engines"]), dict(ss.engine_counts)
-            samples = list(ss.size_samples)[-9:]
+            samples = list(ss.size_samples)[-7:]
             size_config = copy.deepcopy(ss.size_config)
-        for name, (selector, count) in self.cs_engine.items():
-            selector.set(modes.get(name, engines.SHADOW))
-            measuring = engines.ENGINES[name][2]
-            count.config(text=("not measuring yet" if not measuring else "off" if modes.get(name) == engines.OFF
-                               else f"{'rejected' if modes.get(name) == engines.ACTIVE else 'would reject'} today: {counts.get(name, 0)}"),
-                         fg=ui.MUTED if not measuring else ui.WARN)
+        cfg = self._cs_colour_cfg()
+        metric, star = cfg["metric"], {"b": "b*", "a": "a*", "L": "L*"}
+        # colour: state of the threshold, the current cashew, the teach histograms and the suggestion
+        saved = {**colour_size.COLOUR_DEFAULTS, **size_config.get("colour", {})}
+        if cfg["threshold"] is None:
+            state, colour = "NOT SET", ui.WARN
+        elif any(saved.get(k) != cfg[k] for k in cfg):
+            state, colour = "not saved yet", ui.WARN
+        else:
+            state, colour = (f"taught {saved['taught']}" if saved.get("taught") else "saved"), ui.GOOD
+        self.cs_threshold_state.config(text=state, fg=colour)
+        last = next((s for s in reversed(samples) if s.get("lab")), None)
+        if last:
+            name, value = colour_size.colour_of(last["lab"], cfg)
+            self.lbl_cs_live.config(text=f"{star[metric]} {value:.1f}" + (f"   ->  {name}" if name else "   (no threshold)"),
+                                    fg=ui.TEXT if name is None else (ui.WARN if name == colour_size.SW else ui.ACCENT))
+            self.lbl_cs_live_all.config(text=f"{last['id']}     L* {last['lab']['L']:.1f}   a* {last['lab']['a']:.1f}   b* {last['lab']['b']:.1f}")
+        self._colour_teach_collect()
+        teach = self._colour_teach
+        ww, sw = list(teach[colour_size.WW].values()), list(teach[colour_size.SW].values())
+        for button, name, group in ((self.btn_teach_ww, colour_size.WW, ww), (self.btn_teach_sw, colour_size.SW, sw)):
+            button.set_text(f"STOP {name}  ({len(group)})" if teach["active"] == name else f"TEACH {name}  ({len(group)})")
+            button.set_kind("danger" if teach["active"] == name else "outline")
+        self.cs_colour_hist.show([("WW", ui.ACCENT, [s[metric] for s in ww]), ("SW", ui.WARN, [s[metric] for s in sw])], cfg["threshold"],
+                                 f"{star[metric]} OF THE TAUGHT CASHEWS      white line = threshold")
+        self._colour_suggestion = colour_size.suggest(ww, sw)
+        self.btn_cs_colour_apply.set_enabled(self._colour_suggestion is not None)
+        if self._colour_suggestion:
+            rows = self._colour_suggestion["metrics"]
+            best = self._colour_suggestion["best"]
+            lines = [f"{star[m]}: threshold {rows[m]['threshold']:g}, SW {'above' if rows[m]['sw_above'] else 'below'}, "
+                     f"{rows[m]['wrong_pct']:g} % of the taught cashews on the wrong side" + ("   <- BEST" if m == best else "") for m in ("b", "a", "L")]
+            self.lbl_cs_suggest.config(text="Suggestion from the taught cashews:\n" + "\n".join(lines), fg=ui.TEXT)
+        else:
+            need = colour_size.MIN_COLOUR_SAMPLES
+            self.lbl_cs_suggest.config(text=f"A suggestion needs at least {need} WW and {need} SW cashews (now {len(ww)} and {len(sw)}). "
+                                            "The three values L*, a*, b* are compared and the one that separates your cashews best is proposed.", fg=ui.MUTED)
+        # size
         ready, calibrated = bool(size_config.get("size_ready")), bool(size_config.get("roi_length_mm"))
         self.cs_ready_switch.set(ready)
-        self.lbl_cs_ready.config(text="SIZE GRADES READY: GOOD goes to its grade ejector" if ready else "SIZE GRADES NOT READY: every GOOD cashew goes to the reject ejector",
-                                 fg=ui.GOOD if ready else ui.WARN)
+        self.lbl_cs_ready.config(text="SIZE GRADES READY: GOOD goes to its grade ejector" if ready
+                                 else "SHADOW: grade is logged (\"would be\"), GOOD goes to the reject ejector", fg=ui.GOOD if ready else ui.WARN)
         self.lbl_cs_calibration.config(text=f"{float(size_config.get('px_per_mm', 0)):.2f} px per mm" if calibrated else "px per mm NOT CALIBRATED (Vision ROI)",
                                        fg=ui.MUTED if calibrated else ui.BAD)
-        rows = [(s["id"], f"{s['l']:.1f}", f"{s['w']:.1f}", f"{s['a']:.0f}", f"{s['solidity']:.2f}", s["label"]) for s in reversed(samples)]
+        rows = [(s["id"], s["label"].replace("UNDEF SIZE_NOT_READY ", "GOOD "), s.get("colour") or "-",
+                 "-" if s.get("colour_value") is None else f"{s['colour_value']:.1f}", f"{s['l']:.1f}", f"{s['w']:.1f}", f"{s['a']:.0f}",
+                 s.get("grade") or "-", f"A{s['relay']:02d}" if s.get("relay") else "-") for s in reversed(samples)]
         if rows != getattr(self, "_cs_last_rows", None):
             self._cs_last_rows = rows
             self.cs_last_tree.delete(*self.cs_last_tree.get_children())
@@ -6097,14 +6363,14 @@ except Exception as e:
         pending = getattr(self, "_size_taught_pending", {})
         teaching = self._size_teach["grade"] if self._size_teach else None
         taught = self._size_teach_samples()
-        for grade in size_teach.GRADES:
+        for grade in colour_size.ALL_GRADES:
             info = pending.get(grade) or size_config.get("grades", {}).get(grade, {})
             if grade == teaching:
                 label, colour = f"{len(taught)} / {size_teach.TARGET_SAMPLES} teaching now", ui.ACCENT
             elif grade in pending:
-                label, colour = f"{info['n']} cashews, not saved yet", ui.WARN
+                label, colour = (f"{info['n']} cashews" if info.get("n") else info.get("taught", "")) + ", not saved yet", ui.WARN
             elif info.get("taught"):
-                label, colour = f"{info.get('n', '?')} cashews, {info['taught']}", ui.MUTED
+                label, colour = (f"{info['n']} cashews, " if info.get("n") else "") + str(info["taught"]), ui.MUTED
             else:
                 label, colour = ("typed" if info else "not taught"), ui.MUTED
             self.cs_grade_taught[grade].config(text=label, fg=colour)

@@ -15,8 +15,8 @@ ENGINES = {
     "view":   ("View (rolled / NECK seen)", "GOOD only when the NECK view was seen in M frames", True),
     "shape":  ("Contour & Shape", "broken, too small, split pieces", True),
     "colour": ("OpenCV Colour", "dark, brown, reddish spots and dark area inside the mask", False),
-    "sw_ww":  ("SW / WW colour", "scorched (SW) or white (WW) from the colour inside the mask", False),
-    "size":   ("Size grade", "length / width / area outside every grade", False),
+    "sw_ww":  ("SW / WW colour", "scorched (SW) or white (WW) from the colour inside the mask", True),
+    "size":   ("Size grade", "length / width / area outside every grade", True),
 }
 ENGINE_DEFAULTS = {name: SHADOW for name in ENGINES}
 SHAPE_DEFAULTS = {"min_solidity": 0.75, "min_area_mm2": 100.0, "min_length_mm": 16.0, "min_length_width": 1.15}
