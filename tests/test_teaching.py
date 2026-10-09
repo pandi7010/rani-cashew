@@ -53,7 +53,7 @@ class DatasetImportTest(unittest.TestCase):
             before = sorted(os.listdir(os.path.join(src, "GOOD")))
 
             report = di.build([("old", src)], data, test)
-            self.assertEqual(sorted(os.listdir(data))[:3], ["BROWN", "DW1", "DW2"])           # every final class has a folder
+            self.assertEqual(sorted(os.listdir(data))[:3], ["BROWN", "DOUBLE", "DW1"])        # every final class has a folder
             self.assertEqual(report["after"]["GOOD_CASHEW"], (12, 1))                        # 12 GOOD + 1 SW; the 10th went to the test set
             self.assertEqual(report["after"]["DOUBLE"], (1, 0))                              # DOUBLE_KERNELS is the class DOUBLE
             self.assertNotIn("SW", report["after"])

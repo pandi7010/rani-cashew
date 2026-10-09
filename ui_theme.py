@@ -685,6 +685,11 @@ class ToggleSwitch(tk.Label):
         if self.command:
             self.command(self.on)
 
+    def set(self, on):
+        """Show a state without calling the command (for a change that was refused or made elsewhere)."""
+        self.on = bool(on)
+        tk.Label.config(self, image=self._images[self.on])
+
 
 class Chip(tk.Frame):
     """Class chip: green PASS or red FIRE, click to switch. A fixed chip cannot be switched."""

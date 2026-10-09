@@ -2983,16 +2983,16 @@ class App(tk.Tk):
         self.shared_state.save_to_config(CFG_PATH)
         log.info("Production capture %s", "ON" if on else "OFF")
 
-    def _ask_supervisor_password(self, title):
-        """True when the supervisor password was entered correctly. The first time, the supervisor sets it
-        (only a salted hash is stored in machine_config.json)."""
+    def _ask_password(self, title, key, who):
+        """True when the password of `who` (supervisor / admin) was entered correctly. The first time, it is set here;
+        only a salted hash is stored in machine_config.json. A password is never written to a log."""
         import supervisor
         from tkinter import simpledialog
         path = app_paths.MACHINE_CONFIG_PATH
-        if not supervisor.is_set(path):
-            if not messagebox.askyesno(title, "No supervisor password has been set on this machine yet.\n\nSet it now?"):
+        if not supervisor.is_set(path, key):
+            if not messagebox.askyesno(title, f"No {who} password has been set on this machine yet.\n\nSet it now?"):
                 return False
-            first = simpledialog.askstring(title, "New supervisor password (at least 4 characters):", show="*", parent=self)
+            first = simpledialog.askstring(title, f"New {who} password (at least 4 characters):", show="*", parent=self)
             if first is None:
                 return False
             second = simpledialog.askstring(title, "The same password again:", show="*", parent=self)
@@ -3000,19 +3000,69 @@ class App(tk.Tk):
                 messagebox.showerror(title, "The two entries are different. No password was set.")
                 return False
             try:
-                supervisor.set_password(path, first)
+                supervisor.set_password(path, first, key)
             except ValueError as e:
                 messagebox.showerror(title, str(e))
                 return False
-            log.info("Supervisor password set")
+            log.info("%s password set", who.capitalize())
             return True
-        password = simpledialog.askstring(title, "Supervisor password:", show="*", parent=self)
+        password = simpledialog.askstring(title, f"{who.capitalize()} password:", show="*", parent=self)
         if password is None:
             return False
-        if not supervisor.check(path, password):
+        if not supervisor.check(path, password, key):
             messagebox.showerror(title, "Wrong password. Nothing was changed.")
             return False
         return True
+
+    def _ask_supervisor_password(self, title):
+        import supervisor
+        return self._ask_password(title, supervisor.KEY, "supervisor")
+
+    def _ask_admin_password(self, title):
+        import supervisor
+        return self._ask_password(title, supervisor.ADMIN_KEY, "admin")
+
+    # ── AUTO LEARNING switch (auto_learning.py has the rules; the learning itself is a later phase) ──
+    def _auto_learning_status(self):
+        """(enabled, samples, target). The sample count is read from disk at most every 10 s."""
+        import auto_learning
+        now = time.time()
+        if now - getattr(self, "_samples_at", 0.0) > 10.0:
+            self._samples = auto_learning.sample_count(app_paths.CLEAN_DATASET_DIR, app_paths.TESTSET_DIR)
+            self._samples_at = now
+        cfg = auto_learning.settings(app_paths.MACHINE_CONFIG_PATH)
+        return cfg["enabled"], self._samples, cfg["target"]
+
+    def _auto_learning_toggle(self, want):
+        import auto_learning
+        enabled, samples, _ = self._auto_learning_status()
+        page = getattr(self, "teach_page", None)
+        if not self._ask_admin_password("AUTO LEARNING"):
+            if page is not None:
+                page.auto_switch.set(enabled)
+            return
+        self._samples_at = 0.0
+        _, samples, _ = self._auto_learning_status()
+        new, message = auto_learning.set_enabled(app_paths.MACHINE_CONFIG_PATH, bool(want), samples, app_paths.LOGS_DIR)
+        if page is not None:
+            page.auto_switch.set(new)
+            page.lbl_auto_note.config(text=message, fg=ui.WARN if new != bool(want) else ui.MUTED)
+        messagebox.showinfo("AUTO LEARNING", message)
+
+    def _auto_learning_target(self):
+        import auto_learning
+        from tkinter import simpledialog
+        if not self._ask_admin_password("AUTO LEARNING target"):
+            return
+        enabled, samples, target = self._auto_learning_status()
+        value = simpledialog.askinteger("AUTO LEARNING target", "Samples needed before AUTO LEARNING can be turned ON:", initialvalue=target,
+                                        minvalue=1, maxvalue=100_000_000, parent=self)
+        if value is None:
+            return
+        try:
+            auto_learning.set_target(app_paths.MACHINE_CONFIG_PATH, value, samples, app_paths.LOGS_DIR)
+        except ValueError as e:
+            messagebox.showerror("AUTO LEARNING target", str(e))
 
     def _begin_training(self, kind, epochs, work):
         """Run work(progress, stop) in a thread and show the live window. work returns the result dict."""
