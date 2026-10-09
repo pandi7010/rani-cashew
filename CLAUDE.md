@@ -22,6 +22,8 @@
 - All relay firing goes through `relay_output.py`. Only relays 1-40 may be fired. It never calls the PLC's
   `fire_all()` / `sequence_all()` (they pulse 48 coils, including conveyor M140 and feeder M141).
 - Grading logic never touches relay 41 (conveyor, M140) or 42 (feeder, M141).
+- Class / grade -> ejector comes only from the mapping (`relay_mapping.py`): never tie a class name to an ejector
+  number in code. Several classes per ejector are allowed; a class is on one ejector per ROI; none -> reject 1 / 21.
 - Do not change `innovance_plc.py` without asking first.
 - Every manual fire button is `RelayOutput.test_fire()` (DRY-RUN checked, logged in `logs/manual_fire_*.csv`).
   The PLC diagnostics tool (`innovance_plc.py` run as a program) writes directly to the PLC; the grader only

@@ -4,6 +4,46 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-09 (10): Combined ejectors - several classes per ejector, one ejector per class, summary before save
+
+### What changed
+
+| Area | Change |
+|---|---|
+| `relay_mapping.py` (new) | All rules in one place, no GUI: several classes / grades per ejector; a class on only one ejector per ROI; ejectors 1 / 21 take no class; a class or grade without an ejector goes to the reject ejector; an empty ejector is free; ROI 2 mirror (+20). |
+| Grading | `_decide_track` asks only this mapping for the ejector. No class name is tied to an ejector number anywhere in the code (a test uses invented class names on arbitrary ejectors). |
+| GOOD grades | A GOOD cashew looks for its grade name (`W180` for WW, `SW180` for SW, `BUDDS`, `SW_BUDDS`), then its colour group (`WW` / `SW`), then `GOOD_CASHEW`. With none of them assigned it goes to the reject ejector as "UNDEF no ejector (W240)". Before, a GOOD cashew without an ejector was simply not fired, and an SW grade silently used the W ejector; that hidden fallback is gone (tick both on one ejector instead). |
+| Picker (gear button of a row) | Check boxes for all defect classes, the good groups, the WW and SW grades. Each shows where it is now ("on A07"). Ticking a class that is on another ejector asks **"Move it here?"**; NO leaves it where it was. "The same for ROI 2: ejector A26" is ticked by default. FREE THIS EJECTOR unticks everything. |
+| Row text | `REJECT - FIXED` for 1 / 21, the classes for the others, `(free)` for an empty one. A free ejector is never fired by grading (manual tests still work). |
+| Not assigned | Yellow list under the tables, per ROI: "ROI 1 -> reject ejector A01: UPW". |
+| Duplicate | Cannot be made in the picker. If the settings file has one (edited by hand), a red "SAVE IS BLOCKED ... TESTA is on ejectors A03 and A08" appears and SAVE PNEUMATICS refuses until it is repaired. |
+| SAVE PNEUMATICS | First shows the final table CLASS -> ROI 1 EJECTOR / ROI 2 EJECTOR (with "REJECT A01" and "A11 (via SW)" where that applies) and the free ejectors; CONFIRM AND SAVE writes, CANCEL writes nothing. |
+
+### Tested
+
+- `ast` check; **153 unit tests pass** (10 new in `tests/test_relay_mapping.py`): combined DW1 + DW2 and W180 + SW180; combining PKW1 + PKW2 frees the old ejector; moving a class between ejectors; duplicate found (names ignore case and underscores); unassigned -> reject ejector 1 / 21; reject ejectors take no class; ROI 2 mirror (+20) with a combined row, and ROI 1 only; the summary table; any invented combination; the stored config has no duplicate.
+- Real window off-screen, fake PLC, temporary config: PKW2 ticked on A06 asked "PKW2 is on ejector A05 now. Move it here to A06?" -> A06 = PKW2, PKW1, A05 (free), the same on A26 / A25, grading tables point PKW2 to 6 / 26; answering NO moved nothing; W180 + SW180 combined on A12 for ROI 1 only; an injected duplicate blocked the save (file unchanged); the summary showed 22 rows and saved after CONFIRM; CANCEL left the file unchanged.
+  Screenshots: `design/ejector_picker_combined.png`, `design/pneumatic_combined_mapping.png`, `design/mapping_summary_before_save.png`.
+
+### Not tested
+
+- On the machine with real cashews and valves.
+
+### To know
+
+- The mapping you set in the picker is used by grading at once (in memory). It is written to the settings file by SAVE PNEUMATICS; other save buttons of the program also write the whole settings file, so treat a picker change as live.
+- With the config as it is: UPW is the only class without an ejector. `SW_BUDDS` and any unlisted SW grade use A11 / A31 through the group `SW`.
+- A02 / A22 still list REJECTION, but REJECTION always goes to A01 / A21 (open question from before). You can now free A02 / A22 in the picker.
+- The Pneumatic page is still the old layout; (e2b) rebuilds it and keeps this picker, list and summary.
+
+### How to test
+
+1. Pneumatic page, gear button of A06: tick PKW2, answer YES, OK. A05 shows (free), A06 "PKW2, PKW1", A25 / A26 the same.
+2. The yellow list shows UPW. Give UPW an ejector (for example a free one): the list changes to "Every class and grade has an ejector."
+3. SAVE PNEUMATICS: read the table, CONFIRM AND SAVE. Close and start the program: the mapping is still there.
+
+---
+
 ## 2026-10-09 (9): Teaching CNN page rebuilt like the 5-track machine; clean dataset; production capture (INBOX)
 
 Reference: `TCM_CASHEWXAI_2026-10-06/source` (the five files are identical in `CNN/CNN/app`) and manual B8 / B9.

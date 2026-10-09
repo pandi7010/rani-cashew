@@ -42,6 +42,7 @@ import ejector_check
 import ejector_check_ui
 import production_capture
 import dataset_ops
+import relay_mapping
 import decision
 import grading_config
 from lane_tracker import LaneTracker, Detection, crossing_time, track_speed
@@ -814,16 +815,15 @@ class SharedState:
             log.exception("Could not save the config %s", cfg_path)
 
     def _rebuild_processing_map(self):
-        self.mapping_t1, self.mapping_t2 = {}, {}
-        for act_id, class_list in self.mapping_by_act.items():
-            try:
-                aid = int(act_id)
-            except (ValueError, TypeError):
-                continue
-            for c in class_list:
-                norm_c = normalize_name(c)
-                if 1 <= aid <= 20: self.mapping_t1[norm_c] = aid
-                elif 21 <= aid <= 40: self.mapping_t2[norm_c] = aid
+        """Class -> ejector tables of both ROIs, from the mapping alone (relay_mapping.py). Reject ejectors carry nothing."""
+        tables = relay_mapping.lookup(self.mapping_by_act)
+        self.mapping_t1, self.mapping_t2 = tables[1], tables[2]
+
+    def set_mapping(self, mapping):
+        """Replace the whole class -> ejector mapping (already checked by relay_mapping.assign)."""
+        with self.lock:
+            self.mapping_by_act = relay_mapping.clean(mapping)
+            self._rebuild_processing_map()
 
     def get_processing_state(self) -> Dict[str, Any]:
         with self.lock:
@@ -1440,17 +1440,18 @@ class ProcessingThread(threading.Thread):
             mm_width = (width_px or 0.0) / px_per_mm
             _, s_lbl = self._get_size_data(mm_length, mm_width, state["size_config"], rid)
             prefix = "sw" if sw_votes * 2 > d.good_frames else "ww"
-            names = ([f"sw{s_lbl[1:]}" if s_lbl.startswith("W") else f"sw_{s_lbl}"] if prefix == "sw" else []) + \
-                    [s_lbl, f"{prefix}_{s_lbl}", prefix, "good_cashew", "good"]
-            relay = next((map_dict[normalize_name(n)] for n in names if normalize_name(n) in map_dict), None)
-            grade = f"{prefix.upper()}_{s_lbl}"
+            grade = relay_mapping.grade_name(prefix, s_lbl)
+            relay, assigned = relay_mapping.target_of(map_dict, rid, relay_mapping.grade_candidates(prefix, s_lbl))
             label = f"GOOD {grade}"
+            if not assigned:        # a grade without an ejector goes to the reject ejector
+                d.reason, d.reject = f"{decision.NOT_MAPPED}:{grade}", True
+                label, d.result = f"UNDEF no ejector ({grade})", decision.UNDEFINED
         else:
-            relay = map_dict.get(normalize_name(d.result))
+            relay, assigned = relay_mapping.target_of(map_dict, rid, [d.result])
             label = d.result
-            if relay is None:       # a class without a relay cannot be sorted: reject it
+            if not assigned:        # a class without an ejector goes to the reject ejector
                 d.reason, d.reject = f"{decision.NOT_MAPPED}:{d.result}", True
-                relay, label = REJECT_RELAY[rid], f"UNDEF no relay ({d.result})"
+                label = f"UNDEF no ejector ({d.result})"
                 d.result = decision.UNDEFINED
 
         fire_result = ""
@@ -2880,6 +2881,16 @@ class App(tk.Tk):
             dist2.trace_add("write", lambda *_, ii=i2: self._on_distance_changed(ii))
             d2.trace_add("write", lambda *_, ii=i2: self._update_act_timing(ii))
             
+        notes = tk.Frame(act_grid, bg=self.colors["surface"])
+        notes.grid(row=30, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        tk.Label(notes, text="Gear button of a row: choose its classes / grades (several per ejector). An ejector without a class is (free) and stays OFF.",
+                 font=("Roboto", 10), fg=self.colors["text_muted"], bg=self.colors["surface"], anchor="w", justify="left").pack(fill=tk.X)
+        self.lbl_map_unassigned = tk.Label(notes, text="", font=("Roboto", 11, "bold"), fg=self.colors["warning"], bg=self.colors["surface"],
+                                           anchor="w", justify="left", wraplength=1250)
+        self.lbl_map_unassigned.pack(fill=tk.X, pady=(6, 0))
+        self.lbl_map_problem = tk.Label(notes, text="", font=("Roboto", 11, "bold"), fg=self.colors["danger"], bg=self.colors["surface"],
+                                        anchor="w", justify="left", wraplength=1250)
+        self.lbl_map_problem.pack(fill=tk.X, pady=(6, 0))
         self._update_all_map_labels()
 
         p_net = tk.Frame(self.page_container, bg=self.colors["surface"], padx=15, pady=15)
@@ -4479,6 +4490,12 @@ except Exception as e:
             pass
 
     def _save_pneumatics(self):
+        problems = self._mapping_problems()
+        if problems:
+            messagebox.showerror("SAVE PNEUMATICS", "NOT saved. Repair the class -> ejector mapping first:\n\n" + "\n".join(problems))
+            return
+        if not self._confirm_mapping_summary():
+            return
         try:
             with self.shared_state.lock:
                 for act_id in range(1, NUM_ACTUATORS + 1):
@@ -4511,7 +4528,8 @@ except Exception as e:
                     except Exception:
                         pass
             self.shared_state.save_to_config(CFG_PATH)
-            messagebox.showinfo("Saved", "Pneumatic Delays, Distances, and Configuration Saved Successfully!")
+            self._mapping_dirty = False
+            messagebox.showinfo("Saved", "Pneumatic delays, distances and the class -> ejector mapping are saved.")
         except Exception as e:
             messagebox.showerror("Save Error", f"Failed to save pneumatics: {e}")
 
@@ -4567,131 +4585,211 @@ except Exception as e:
             self.shared_state.priority_rules = rules
         self.shared_state.save_to_config(CFG_PATH)
 
+    # ------------------------------------------------------------------ class / grade -> ejector (relay_mapping.py has the rules)
+    def _mapping_names(self):
+        """(classes, grades) that need an ejector: the defect classes of the priority list, then the size grades."""
+        fixed = {normalize_name(n) for n in (decision.REJECTION, decision.DOUBLE, decision.UNDEFINED)}
+        classes = [c for c in self.shared_state.grading.get("priority", []) if normalize_name(c) not in fixed]
+        return classes, relay_mapping.GRADES_WW + relay_mapping.GRADES_SW
+
     def _update_all_map_labels(self):
-        for i in range(1, NUM_ACTUATORS + 1): 
-            cls_lst = self.shared_state.get_mapping_for_actuator(i)
-            text = ", ".join(cls_lst) if cls_lst else "(Unmapped)"
-            fg_color = self.colors["success"] if cls_lst else self.colors["text_muted"]
+        with self.shared_state.lock:
+            mapping = relay_mapping.clean(self.shared_state.mapping_by_act)
+        for i in range(1, NUM_ACTUATORS + 1):
+            text = relay_mapping.label(mapping, i)
+            if relay_mapping.is_reject(i):
+                fg_color = self.colors["warning"]
+            else:
+                fg_color = self.colors["success"] if mapping[i] else self.colors["text_muted"]
             if i in self.map_lbls:
                 self.map_lbls[i].config(text=text, foreground=fg_color)
             if hasattr(self, 'pn_map_lbls') and i in self.pn_map_lbls:
                 self.pn_map_lbls[i].config(text=text, foreground=fg_color)
             if hasattr(self, 'pn_leds') and i in self.pn_leds:
                 self.pn_leds[i].config(fg=self.colors["surface_light"]) # LED is always OFF until fired
+        if hasattr(self, 'lbl_map_unassigned'):
+            classes, grades = self._mapping_names()
+            lines = []
+            for roi in (1, 2):
+                missing = relay_mapping.unassigned(mapping, classes, grades, roi)
+                if missing:
+                    lines.append(f"ROI {roi} -> reject ejector A{relay_mapping.REJECT_RELAY[roi]:02d}:  " + ", ".join(missing))
+            self.lbl_map_unassigned.config(text=("NOT ASSIGNED (these go to the reject ejector)\n" + "\n".join(lines)) if lines
+                                           else "Every class and grade has an ejector.",
+                                           fg=self.colors["warning"] if lines else self.colors["success"])
+            problems = self._mapping_problems(mapping)
+            self.lbl_map_problem.config(text=("SAVE IS BLOCKED\n" + "\n".join(problems)) if problems else "")
+
+    def _dialog(self, title):
+        """A modal dialog window in the theme. In the self-screenshot mode it is placed outside the visible screen."""
+        win = tk.Toplevel(self)
+        if os.environ.get("GSN_UI_OFFSCREEN"):
+            win.overrideredirect(True)
+            win.geometry(f"+{self.winfo_screenwidth() + 4200}+0")
+        win.title(title)
+        win.configure(bg=ui.BG)
+        win.transient(self)
+        win.grab_set()
+        return win
+
+    def _mapping_problems(self, mapping=None):
+        """Texts of what must be repaired before the mapping can be saved (duplicates, a class on a reject ejector)."""
+        if mapping is None:
+            with self.shared_state.lock:
+                mapping = relay_mapping.clean(self.shared_state.mapping_by_act)
+        out = []
+        for roi, found in relay_mapping.duplicates(mapping).items():
+            for name, relays in found.items():
+                out.append(f"ROI {roi}: {name} is on ejectors " + " and ".join(f"A{r:02d}" for r in relays) + " (only one is allowed)")
+        for relay, names in relay_mapping.wrongly_on_reject(mapping).items():
+            out.append(f"A{relay:02d} is the reject ejector but has {', '.join(names)}")
+        return out
 
     def _popup_mapper(self, act_id):
-        win = tk.Toplevel(self)
-        win.title(f"A{act_id} Assignment")
-        win.configure(bg=self.colors["bg"])
-        win.transient(self); win.grab_set() 
-        
-        track_num = 1 if act_id <= 20 else 2
-        
-        used_map = {}
-        start_a, end_a = (1, 20) if track_num == 1 else (21, 40)
-        for a in range(start_a, end_a + 1):
-            if a != act_id:
-                for c in self.shared_state.get_mapping_for_actuator(a):
-                    used_map[c] = f"A{a:02d}"
-        
-        base_classes = [c.upper() for c in self.all_class_names if not c.startswith("ww_") and not c.startswith("sw_")]
-        size_classes = [
-            "SW", "WW",
-            "SW180", "SW210", "SW240", "SW320", "SW450",
-            "W180", "W210", "W240", "W320", "W450",
-            "BUDDS"
-        ]
-        
-        # Deduplicate while preserving order
-        options = []
-        for opt in base_classes + size_classes:
-            if opt not in options and opt != "CAPTURE_ONLY_MODE":
-                options.append(opt)
-                
-        vars_map = {}
-        opts_frame = tk.Frame(win, bg=self.colors["bg"])
-        opts_frame.pack(padx=10, pady=10)
-        
-        for idx, name in enumerate(options):
-            is_current = name in self.shared_state.get_mapping_for_actuator(act_id)
-            is_in_other = name in used_map
-            
-            var = tk.BooleanVar(value=is_current)
-            vars_map[name] = var
-            
-            if is_current:
-                fg_col = "#FFFF00" # Bright Yellow
-                txt = name
-                fnt = ("Roboto", 10, "bold")
-            elif is_in_other:
-                fg_col = self.colors["warning"] # Orange warning text showing where it's currently mapped
-                txt = f"{name} ({used_map[name]})"
-                fnt = ("Roboto", 10)
+        """Multi-select picker of one ejector: several classes / grades may share it; a class that is on another
+        ejector of the ROI is moved here only after the question "move it here?"."""
+        if relay_mapping.is_reject(act_id):
+            messagebox.showinfo(f"A{act_id:02d}", f"A{act_id:02d} is the reject ejector of ROI {relay_mapping.roi_of(act_id)} (Double, Undefined, "
+                                "REJECTION and every class without an ejector).\n\nNo class can be assigned to it.")
+            return
+        roi, mirror_id = relay_mapping.roi_of(act_id), relay_mapping.mirror(act_id)
+        with self.shared_state.lock:
+            mapping = relay_mapping.clean(self.shared_state.mapping_by_act)
+        win = self._dialog(f"Ejector A{act_id:02d}")
+        F = ui.FONT
+        tk.Label(win, text=f"EJECTOR A{act_id:02d}   (ROI {roi})", font=(F, ui.F_HEAD, "bold"), fg=ui.TEXT, bg=ui.BG).pack(anchor="w", padx=20, pady=(16, 2))
+        tk.Label(win, text="Tick every class and grade this ejector takes. One ejector can take several.\n"
+                           "A class can be on only one ejector per ROI: ticking one that is elsewhere asks to move it here.",
+                 font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.BG, justify="left").pack(anchor="w", padx=20, pady=(0, 10))
+
+        classes, grades = self._mapping_names()
+        known = {normalize_name(n) for n in classes + grades + relay_mapping.GROUPS}
+        extra = [n for r in relay_mapping.ALL_RELAYS for n in mapping[r] if normalize_name(n) not in known]     # names already in the mapping
+        seen, options = set(), []
+        for title, names in (("DEFECT CLASSES", classes), ("GOOD GROUPS (catch every grade without its own ejector)", relay_mapping.GROUPS),
+                             ("WW GRADES", relay_mapping.GRADES_WW), ("SW GRADES", relay_mapping.GRADES_SW), ("OTHER NAMES IN THE MAPPING", extra)):
+            group = [n for n in names if normalize_name(n) not in seen and not seen.add(normalize_name(n))]
+            if group:
+                options.append((title, group))
+
+        current = {normalize_name(n) for n in mapping[act_id]}
+        vars_map, labels = {}, {}
+        moved = {}                      # class -> the ejector it will be taken from
+
+        def paint(name):
+            other = relay_mapping.owner(mapping, roi, name)
+            ticked = vars_map[name].get()
+            if ticked and name in moved:
+                text, colour = f"{name}   (moves here from A{moved[name]:02d})", ui.WARN
+            elif ticked:
+                text, colour = name, ui.GOOD
+            elif other is not None and other != act_id:
+                text, colour = f"{name}   (on A{other:02d})", ui.MUTED
             else:
-                fg_col = self.colors["success"]
-                txt = name
-                fnt = ("Roboto", 10)
-                
-            chk = tk.Checkbutton(opts_frame, text=txt, variable=var, bg=self.colors["bg"], 
-                                 fg=fg_col, activeforeground=fg_col, disabledforeground=fg_col, 
-                                 selectcolor=self.colors["surface"], font=fnt)
-                
-            row = idx // 2
-            col = idx % 2
-            chk.grid(row=row, column=col, sticky="w", padx=10, pady=2)
-            
-        def on_save():
-            sel = {name for name, var in vars_map.items() if var.get()}
-            start_a, end_a = (1, 20) if track_num == 1 else (21, 40)
-            other_act_id = act_id + 20 if act_id <= 20 else act_id - 20
-            start_a2, end_a2 = (21, 40) if track_num == 1 else (1, 20)
+                text, colour = name, ui.TEXT
+            labels[name].config(text=text, fg=colour, activeforeground=colour)
 
-            # Auto-transfer selected classes from old actuators to current actuator
+        def on_tick(name):
+            if vars_map[name].get():
+                other = relay_mapping.owner(mapping, roi, name)
+                if other is not None and other != act_id:
+                    if messagebox.askyesno("Move it here?", f"{name} is on ejector A{other:02d} now.\n\nMove it here to A{act_id:02d}?\n"
+                                           f"(A{other:02d} keeps its other classes; with none left it becomes free.)", parent=win):
+                        moved[name] = other
+                    else:
+                        vars_map[name].set(False)
+            else:
+                moved.pop(name, None)
+            paint(name)
+
+        body = tk.Frame(win, bg=ui.BG)
+        body.pack(fill=tk.BOTH, padx=20)
+        for title, names in options:
+            tk.Label(body, text=title, font=(F, ui.F_SMALL, "bold"), fg=ui.ACCENT, bg=ui.BG, anchor="w").pack(fill=tk.X, pady=(8, 2))
+            grid = tk.Frame(body, bg=ui.BG)
+            grid.pack(fill=tk.X)
+            for idx, name in enumerate(names):
+                var = tk.BooleanVar(value=normalize_name(name) in current)
+                vars_map[name] = var
+                chk = tk.Checkbutton(grid, text=name, variable=var, command=lambda n=name: on_tick(n), bg=ui.BG, selectcolor=ui.FIELD,
+                                     activebackground=ui.BG, font=(F, ui.F_BODY), anchor="w", width=30, bd=0, highlightthickness=0)
+                chk.grid(row=idx // 3, column=idx % 3, sticky="w", padx=(0, 10), pady=1)
+                labels[name] = chk
+                paint(name)
+
+        mirror_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(win, text=f"The same for ROI {relay_mapping.roi_of(mirror_id)}: ejector A{mirror_id:02d}", variable=mirror_var, bg=ui.BG, fg=ui.TEXT,
+                       selectcolor=ui.FIELD, activebackground=ui.BG, activeforeground=ui.TEXT, font=(F, ui.F_BODY)).pack(anchor="w", padx=20, pady=(12, 0))
+        note = tk.Label(win, text="", font=(F, ui.F_SMALL), fg=ui.BAD, bg=ui.BG, justify="left", wraplength=820)
+        note.pack(anchor="w", padx=20)
+
+        def on_ok():
+            chosen = [name for name, var in vars_map.items() if var.get()]
             with self.shared_state.lock:
-                for a in range(start_a, end_a + 1):
-                    if a != act_id and a in self.shared_state.mapping_by_act:
-                        self.shared_state.mapping_by_act[a] = [c for c in self.shared_state.mapping_by_act[a] if c not in sel]
-                        
-                for a in range(start_a2, end_a2 + 1):
-                    if a != other_act_id and a in self.shared_state.mapping_by_act:
-                        self.shared_state.mapping_by_act[a] = [c for c in self.shared_state.mapping_by_act[a] if c not in sel]
-
-            self.shared_state.set_mapping_for_actuator(act_id, list(sel))
-            self.shared_state.set_mapping_for_actuator(other_act_id, list(sel))
-            
+                now = relay_mapping.clean(self.shared_state.mapping_by_act)
+            if mirror_var.get():        # classes that are elsewhere in the OTHER ROI move as well; say so first
+                elsewhere = relay_mapping.conflicts(now, mirror_id, chosen)
+                if elsewhere and not messagebox.askyesno("Move it here?", f"In ROI {relay_mapping.roi_of(mirror_id)}: " +
+                                                         ", ".join(f"{n} is on A{r:02d}" for n, r in elsewhere.items()) +
+                                                         f".\n\nMove to A{mirror_id:02d} as well?", parent=win):
+                    return
+            try:
+                new = relay_mapping.assign(now, act_id, chosen, move=True, mirror_roi=mirror_var.get())
+            except ValueError as e:
+                note.config(text=str(e))
+                return
+            self.shared_state.set_mapping(new)
+            self._mapping_dirty = True
             self._update_all_map_labels()
-            self.shared_state.save_to_config(CFG_PATH)
             win.destroy()
 
-        # Select All / Deselect All Action Row
-        btn_row = tk.Frame(win, bg=self.colors["bg"])
-        btn_row.pack(fill=tk.X, padx=20, pady=(5, 10))
-        btn_row.columnconfigure(0, weight=1)
-        btn_row.columnconfigure(1, weight=1)
+        buttons = tk.Frame(win, bg=ui.BG)
+        buttons.pack(fill=tk.X, padx=20, pady=16)
+        ui.FlatButton(buttons, "OK", command=on_ok, kind="primary", height=40, width=160, font=(F, ui.F_BODY, "bold")).pack(side=tk.RIGHT)
+        ui.FlatButton(buttons, "CANCEL", command=win.destroy, kind="muted", height=40, width=120).pack(side=tk.RIGHT, padx=(0, 8))
+        ui.FlatButton(buttons, "FREE THIS EJECTOR", command=lambda: [v.set(False) for v in vars_map.values()] + [moved.clear()] + [paint(n) for n in vars_map],
+                      kind="danger", height=40, width=200).pack(side=tk.LEFT)
+        tk.Label(win, text="Not saved to the settings file until SAVE PNEUMATICS (it shows the whole table first).", font=(F, ui.F_SMALL), fg=ui.MUTED,
+                 bg=ui.BG).pack(anchor="w", padx=20, pady=(0, 14))
+        self._mapper_window = (win, vars_map, on_tick, on_ok, mirror_var)      # for the self-test
 
-        def select_all():
-            for v in vars_map.values():
-                v.set(True)
+    def _confirm_mapping_summary(self) -> bool:
+        """The final class -> ejector table. True when the operator confirms it."""
+        with self.shared_state.lock:
+            mapping = relay_mapping.clean(self.shared_state.mapping_by_act)
+        classes, grades = self._mapping_names()
+        rows = relay_mapping.summary(mapping, classes, grades)
+        win = self._dialog("Class -> ejector")
+        F = ui.FONT
+        tk.Label(win, text="CLASS  ->  EJECTOR", font=(F, ui.F_HEAD, "bold"), fg=ui.TEXT, bg=ui.BG).pack(anchor="w", padx=20, pady=(16, 2))
+        tk.Label(win, text="Check the table. REJECT = no ejector assigned: it goes to the reject ejector. REJECTION, DOUBLE and Undefined always go to A01 / A21.",
+                 font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.BG, wraplength=640, justify="left").pack(anchor="w", padx=20, pady=(0, 8))
+        style = ttk.Style(self)
+        style.configure("Summary.Treeview", rowheight=22, font=(F, -13), background=ui.PANEL, fieldbackground=ui.PANEL, foreground=ui.TEXT, borderwidth=0)
+        style.layout("Summary.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+        tree = ttk.Treeview(win, columns=("name", "roi1", "roi2"), show="headings", height=min(26, len(rows) + 2), style="Summary.Treeview")
+        for col, text, width in (("name", "CLASS / GRADE", 220), ("roi1", "ROI 1 EJECTOR", 210), ("roi2", "ROI 2 EJECTOR", 210)):
+            tree.heading(col, text=text)
+            tree.column(col, width=width, anchor="w")
+        tree.tag_configure("reject", foreground=ui.WARN)
+        tree.tag_configure("ok", foreground=ui.GOOD)
+        for name, roi1, roi2 in rows:
+            tree.insert("", "end", values=(name, roi1, roi2), tags=("reject" if "REJECT" in roi1 + roi2 else "ok",))
+        free = "   ".join(f"ROI {roi}: " + (", ".join(f"A{r:02d}" for r in relay_mapping.free_relays(mapping, roi)) or "none") for roi in (1, 2))
+        tree.pack(padx=20)
+        tk.Label(win, text=f"Free ejectors (stay OFF):   {free}", font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.BG, wraplength=640, justify="left").pack(anchor="w", padx=20, pady=(8, 0))
+        answer = {"ok": False}
 
-        def deselect_all():
-            for v in vars_map.values():
-                v.set(False)
-
-        tk.Button(
-            btn_row, text="SELECT ALL", font=("Roboto", 9, "bold"),
-            bg=self.colors["surface_light"], fg=self.colors["info"],
-            activebackground=self.colors["info"], activeforeground="white",
-            bd=0, pady=6, cursor="hand2", command=select_all
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 5))
-
-        tk.Button(
-            btn_row, text="DESELECT ALL", font=("Roboto", 9, "bold"),
-            bg=self.colors["surface_light"], fg=self.colors["text_muted"],
-            activebackground=self.colors["danger"], activeforeground="white",
-            bd=0, pady=6, cursor="hand2", command=deselect_all
-        ).grid(row=0, column=1, sticky="ew", padx=(5, 0))
-            
-        ttk.Button(win, text="Confirm", style="Primary.TButton", command=on_save).pack(pady=(0, 15), padx=20, fill=tk.X)
+        def confirm():
+            answer["ok"] = True
+            win.destroy()
+        buttons = tk.Frame(win, bg=ui.BG)
+        buttons.pack(fill=tk.X, padx=20, pady=16)
+        ui.FlatButton(buttons, "CONFIRM AND SAVE", command=confirm, kind="primary", height=40, width=220, font=(F, ui.F_BODY, "bold")).pack(side=tk.RIGHT)
+        ui.FlatButton(buttons, "CANCEL", command=win.destroy, kind="muted", height=40, width=120).pack(side=tk.RIGHT, padx=(0, 8))
+        self._summary_window = (win, rows, confirm)
+        self.wait_window(win)
+        return answer["ok"]
 
     def _toggle_conv(self):
         self.shared_state.is_conveyor_on = not self.shared_state.is_conveyor_on
