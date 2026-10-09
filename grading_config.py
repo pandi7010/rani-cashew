@@ -2,6 +2,7 @@
 import copy
 
 import decision
+import engines
 import lane_tracker
 import segmentation
 import view_features
@@ -18,6 +19,12 @@ def defaults() -> dict:
         "segmentation": dict(segmentation.DEFAULTS),
         "tracker": dict(lane_tracker.DEFAULTS),
         "frame_log": {"enabled": True, "keep_days": 7},
+        # Inspection engines (OFF / SHADOW / ACTIVE) and the fixed rules of the 5-track machine.
+        "engines": dict(engines.ENGINE_DEFAULTS),
+        "shape": dict(engines.SHAPE_DEFAULTS),
+        "double": dict(engines.DOUBLE_DEFAULTS),
+        "rules": dict(engines.RULE_DEFAULTS),
+        "avg_cashew_weight_g": 1.8,         # for kg/hr only (5-track default); sorting is not affected
     }
 
 

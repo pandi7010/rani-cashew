@@ -41,6 +41,7 @@ class RelayOutput:
         self.sent = {r: 0 for r in range(FIRST_EJECTOR, LAST_EJECTOR + 1)}     # pulses really given to the PLC
         self.not_sent = {DRY_RUN: 0, MASTER_OFF: 0, PLC_OFFLINE: 0, REFUSED: 0}
         self.events = deque(maxlen=500)     # (time, relay, delay_ms, pulse_ms, result, source)
+        self._pending = deque(maxlen=2000)  # (time the pulse starts, relay, source) of pulses given to the PLC
 
     # ------------------------------------------------------------------ status
     def is_connected(self) -> bool:
@@ -71,6 +72,14 @@ class RelayOutput:
                 for key in table:
                     table[key] = 0
 
+    def pending(self):
+        """Pulses already given to the PLC whose valve has not opened yet: [(start time, relay, source)]."""
+        now = time.time()
+        with self._lock:
+            while self._pending and self._pending[0][0] <= now:
+                self._pending.popleft()
+            return [p for p in self._pending if p[0] > now]
+
     def recent_events(self):
         with self._lock:
             return list(self.events)
@@ -96,7 +105,10 @@ class RelayOutput:
                     self.sent[relay] += 1
             if result != SENT:
                 self.not_sent[result] += 1
-            self.events.appendleft((time.time(), relay, delay_ms, pulse_ms, result, source))
+            now = time.time()
+            self.events.appendleft((now, relay, delay_ms, pulse_ms, result, source))
+            if result == SENT and delay_ms > 0:
+                self._pending.append((now + delay_ms / 1000.0, relay, source))
         if result == DRY_RUN:
             log.info("[DRY-RUN] would fire relay %s after %.0f ms for %.0f ms (%s)", relay, delay_ms, pulse_ms, source)
         elif result == SENT:

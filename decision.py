@@ -22,7 +22,14 @@ NECK = "NECK"
 
 # Reasons for UNDEFINED
 NOT_ROLLED, NO_FRAMES, TOO_FEW_FRAMES, LOW_CONFIDENCE = "not_rolled", "no_frames", "too_few_frames", "low_confidence"
-SINGLE_DEFECT_FRAME, NOT_IN_PRIORITY, NOT_MAPPED, MISSED_LINE = "single_defect_frame", "class_not_in_priority_list", "not_mapped", "first_seen_after_line"
+SINGLE_DEFECT_FRAME, NOT_IN_PRIORITY, NOT_MAPPED = "single_defect_frame", "class_not_in_priority_list", "not_mapped"
+# Always-reject reasons of the 5-track machine (manual B14). They come before every class rule.
+APPEARED_AFTER_LINE, STUCK, DOUBLE_OR_TOUCHING = "APPEARED_AFTER_LINE", "STUCK", "DOUBLE_OR_TOUCHING"
+MISSED_LINE = APPEARED_AFTER_LINE
+# A cashew that disappeared before its line: decision LOST, nothing is fired, it is counted.
+LOST, SEEN_ONLY_ONCE, LOST_BEFORE_LINE, LEFT_ROI_UNDECIDED = "LOST", "SEEN_ONLY_ONCE", "LOST_BEFORE_LINE", "LEFT_ROI_UNDECIDED"
+OFF, SHADOW, ACTIVE = "OFF", "SHADOW", "ACTIVE"        # inspection engine switch
+VIEW_NOT_ROLLED = "VIEW_NOT_ROLLED"
 
 # Start values given by the owner (FINAL_PROMPT section 4 and the answers of 2026-10-09).
 VOTING_DEFAULTS = {
@@ -74,6 +81,7 @@ class Decision:
     seen: Dict[str, float] = field(default_factory=dict)        # class -> weighted qualifying frames
     votes: Dict[str, int] = field(default_factory=dict)         # class -> frames of any confidence
     views: Dict[str, int] = field(default_factory=dict)
+    shadow: List[str] = field(default_factory=list)             # "would reject" notes of engines in SHADOW
 
 
 def _blank(name) -> bool:
@@ -81,7 +89,10 @@ def _blank(name) -> bool:
 
 
 def decide(votes: List[FrameVote], voting: Optional[dict] = None, priority: Optional[List[str]] = None,
-           good_classes=None, skin_classes=None, combination_rules=None, double: bool = False) -> Decision:
+           good_classes=None, skin_classes=None, combination_rules=None, double: bool = False,
+           appeared_after_line: bool = False, stuck: bool = False, lost_ms: float = 0.0, max_lost_ms: float = 300.0,
+           view_engine: str = ACTIVE) -> Decision:
+    """view_engine: ACTIVE = GOOD needs the NECK view; SHADOW = it is only noted in `shadow`; OFF = not checked."""
     v = {**VOTING_DEFAULTS, **(voting or {})}
     priority = [normalize_name(c) for c in (priority if priority is not None else PRIORITY_DEFAULT)]
     display = {normalize_name(c): c for c in (PRIORITY_DEFAULT + GOOD_CLASSES_DEFAULT)}
@@ -122,8 +133,14 @@ def decide(votes: List[FrameVote], voting: Optional[dict] = None, priority: Opti
         d.result, d.reason, d.reject = result, reason, reject
         return d
 
+    if appeared_after_line:
+        return done(UNDEFINED, APPEARED_AFTER_LINE, True)
     if double:
-        return done(DOUBLE, "double", True)
+        return done(DOUBLE, DOUBLE_OR_TOUCHING, True)
+    if stuck:
+        return done(UNDEFINED, STUCK, True)
+    if lost_ms > max_lost_ms:
+        return done(UNDEFINED, f"LOST_{lost_ms:.0f}MS", True)
     if rejection_frames >= v["rejection_min_frames"]:
         return done(REJECTION, "rejection_seen", True)
 
@@ -150,7 +167,10 @@ def decide(votes: List[FrameVote], voting: Optional[dict] = None, priority: Opti
     if weighted and v["single_defect_blocks_good"]:
         return done(UNDEFINED, SINGLE_DEFECT_FRAME, True)
     if d.good_frames >= v["good_min_frames"]:
-        if d.neck_frames >= v["neck_min_frames"]:
+        if d.neck_frames >= v["neck_min_frames"] or view_engine == OFF:
+            return done(GOOD, "good", False)
+        if view_engine == SHADOW:
+            d.shadow.append(VIEW_NOT_ROLLED)
             return done(GOOD, "good", False)
         return done(UNDEFINED, NOT_ROLLED, True)
     return done(UNDEFINED, TOO_FEW_FRAMES if len(used) < v["good_min_frames"] else LOW_CONFIDENCE, True)

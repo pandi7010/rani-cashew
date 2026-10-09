@@ -35,6 +35,9 @@ from collections import OrderedDict
 import segmentation
 import view_features
 import ui_theme as ui
+import engines
+import alarms
+import fire_timing
 import decision
 import grading_config
 from lane_tracker import LaneTracker, Detection, crossing_time, track_speed
@@ -457,6 +460,10 @@ class SharedState:
         self.teach_belt_requested = False
         self.teach_belt_message = ""
         self.decision_times = deque(maxlen=5000)            # for pcs/min on the Home page
+        self.good_times = deque(maxlen=5000)                # ... and kg/hr of the good output
+        self.engine_counts: Dict[str, int] = {}             # engine -> "would reject" (SHADOW) or rejected (ACTIVE)
+        self.belt_stopped = {1: False, 2: False}            # from the trackers
+        self.missed_rejects: List[str] = []                 # fires that were on their way when the conveyor stopped
         self.last_result = {}                               # ROI -> (time, was GOOD), for the lane LEDs
         self.opencv_filter = {
             "sw_color_thresh": 45,
@@ -553,6 +560,8 @@ class SharedState:
             self.recent_decisions[track_id] = detail
             now = time.time()
             self.decision_times.append(now)
+            if label.startswith("GOOD"):
+                self.good_times.append(now)
             if track_id[:1] == "R" and track_id[1:2].isdigit():
                 self.last_result[int(track_id[1])] = (now, label.startswith("GOOD"))
             while len(self.recent_decisions) > 300:
@@ -563,11 +572,26 @@ class SharedState:
         with self.lock:
             return sum(1 for t in self.decision_times if t >= limit)
 
+    def good_last_minute(self) -> int:
+        limit = time.time() - 60.0
+        with self.lock:
+            return sum(1 for t in self.good_times if t >= limit)
+
+    def count_engine(self, name: str):
+        with self.lock:
+            self.engine_counts[name] = self.engine_counts.get(name, 0) + 1
+
+    def count_result(self, key: str):
+        with self.lock:
+            self.result_counts[key] = self.result_counts.get(key, 0) + 1
+
     def get_result_counts(self) -> Dict[str, int]:
         with self.lock: return dict(self.result_counts)
 
     def reset_result_counts(self):
-        with self.lock: self.result_counts = {}
+        with self.lock:
+            self.result_counts = {}
+            self.engine_counts = {}
 
     def set_grading(self, grading: dict):
         with self.lock: self.grading = grading_config.merged(grading)
@@ -1244,8 +1268,12 @@ class ProcessingThread(threading.Thread):
                     det.track.frames.append(det.data)
                 det.track.info["last"] = det.data
             live = next((d.data for d in detections if d.data.get("feat")), None)
+            for lost in tracker.dropped:        # disappeared before its line: LOST, nothing is fired
+                if not lost.decided:
+                    self._log_lost(lost, rid)
             with self.shared_state.lock:
                 self.shared_state.lane_speed[rid] = tracker.lane_speed
+                self.shared_state.belt_stopped[rid] = tracker.stopped
                 if live is not None:
                     self.shared_state.view_live[rid] = f"{live['view']}  {view_features.short_text(live['feat'])}"
 
@@ -1349,22 +1377,37 @@ class ProcessingThread(threading.Thread):
         grading, flow = state["grading"], state["flow"]
         map_dict = state["mapping_t1"] if rid == 1 else state["mapping_t2"]
 
-        first = trk.path[0]
-        if fg.progress(flow, line, first[1], first[2]) >= 0:
-            # First seen when already past the line: there is nothing to vote on and no crossing time.
-            d = decision.Decision(decision.UNDEFINED, decision.MISSED_LINE, True, frames_total=len(trk.frames))
-            fire_allowed = False
-        else:
-            votes = [decision.FrameVote(f["t"], f["cnn"], f["cnn_conf"], f["yolo"], f["yolo_conf"], f["view"], not f["edge_cut"])
-                     for f in trk.frames]
-            d = decision.decide(votes, grading.get("voting"), grading.get("priority"), grading.get("good_classes"),
-                                grading.get("skin_classes"), state.get("priority_rules"))
-            fire_allowed = True
-
+        engine_mode = {**engines.ENGINE_DEFAULTS, **grading.get("engines", {})}
+        px_per_mm = float(state["size_config"].get("px_per_mm", 10.0)) or 10.0
         feats = [f["feat"] for f in trk.frames if f["feat"]]
+        first = trk.path[0]
+        past_at_first = fg.progress(flow, line, first[1], first[2])
+        votes = [decision.FrameVote(f["t"], f["cnn"], f["cnn_conf"], f["yolo"], f["yolo_conf"], f["view"], not f["edge_cut"])
+                 for f in trk.frames]
+        d = decision.decide(votes, grading.get("voting"), grading.get("priority"), grading.get("good_classes"),
+                            grading.get("skin_classes"), state.get("priority_rules"),
+                            double=engines.is_double([x["length_px"] for x in feats], px_per_mm, grading.get("double")),
+                            appeared_after_line=past_at_first >= 0, stuck=trk.stuck, lost_ms=trk.max_gap_ms,
+                            max_lost_ms=float(grading.get("rules", {}).get("max_lost_ms", 300.0)),
+                            view_engine=engine_mode["view"])
+        # Time already gone since the line (only for a cashew first seen after it): taken off the delay.
+        late_ms = (past_at_first / self.trackers[rid].lane_speed) if (past_at_first >= 0 and self.trackers[rid].lane_speed > 0) else 0.0
+
+        # Engines can only ADD a reject to an accepted cashew. SHADOW: noted as "would reject", nothing changes.
+        shadow = list(d.shadow)
+        if d.result == decision.GOOD and engine_mode["shape"] != engines.OFF:
+            why = engines.shape_check(feats, px_per_mm, grading.get("shape"))
+            if why and engine_mode["shape"] == engines.ACTIVE:
+                d.result, d.reason, d.reject = decision.UNDEFINED, why, True
+                self.shared_state.count_engine("shape")
+            elif why:
+                shadow.append(why)
+        for note in shadow:
+            self.shared_state.count_engine("view" if note == decision.VIEW_NOT_ROLLED else "shape")
+        if d.reason == decision.NOT_ROLLED:
+            self.shared_state.count_engine("view")
         med = lambda key: float(np.median([x[key] for x in feats])) if feats else None
         top = lambda key: float(max(x[key] for x in feats)) if feats else None
-        px_per_mm = float(state["size_config"].get("px_per_mm", 10.0)) or 10.0
         length_px, width_px = med("length_px"), top("width_px")
         sw_votes = sum(n for name, n in d.votes.items() if normalize_name(name) == "sw")
 
@@ -1392,27 +1435,28 @@ class ProcessingThread(threading.Thread):
                 d.result = decision.UNDEFINED
 
         fire_result = ""
-        if relay is not None and fire_allowed and 1 <= relay <= NUM_ACTUATORS:
+        if relay is not None and 1 <= relay <= NUM_ACTUATORS:
             d_ms, p_ms = self.shared_state.get_timing(relay)
-            fire_result = self.controller.fire(relay, d_ms, p_ms, source=f"{trk.id} {label}")
+            fire_result = self.controller.fire(relay, max(0.0, d_ms - late_ms), p_ms, source=f"{trk.id} {label}")
             cid = self.registry.id_for(d.result)
             if cid is not None:
                 with self.fire_lock:
                     self.fire_counts[int(cid)] = self.fire_counts.get(int(cid), 0) + 1
-        elif not fire_allowed:
-            relay, fire_result = None, "NOT_FIRED"
 
         speed = track_speed(trk.path, flow)
         t_cross = crossing_time(trk.path, flow, line)
         trk.info.update(label=label, relay=relay, result=d.result)
-        count_keys = [d.result] + ([f"UNDEFINED: {d.reason.split(':')[0]}"] if d.result == decision.UNDEFINED else [])
+        why = d.reason.split(":")[0].split(" ")[0]
+        why = "LOST_OVER_LIMIT" if why.startswith("LOST_") else why
+        count_keys = [d.result] + ([f"UNDEFINED: {why}"] if d.result == decision.UNDEFINED else [])
         frame_rows = [{"t": round(f["t"] - trk.born_ms, 1), "cnn": f["cnn"], "cnn_conf": round(f["cnn_conf"], 3),
                        "yolo": f["yolo"], "yolo_conf": round(f["yolo_conf"], 3), "view": f["view"], "edge_cut": f["edge_cut"],
                        "feat": {k: round(v, 3) for k, v in f["feat"].items()} if f["feat"] else None} for f in trk.frames]
         detail = [f"{trk.id}   {label}   relay {relay if relay else '-'}   {fire_result}",
                   f"result {d.result}, reason {d.reason}; frames {d.frames_used} used of {d.frames_total}; "
                   f"GOOD frames {d.good_frames}, NECK frames {d.neck_frames}",
-                  f"seen (weighted frames): {d.seen or '-'}", f"views: {d.views or '-'}", ""]
+                  f"seen (weighted frames): {d.seen or '-'}", f"views: {d.views or '-'}",
+                  f"engines in SHADOW would reject: {', '.join(shadow) or '-'}", ""]
         for r in frame_rows:
             feat_txt = view_features.short_text(r["feat"]) + f" dark%{r['feat']['dark_pct']:.1f} red%{r['feat']['red_pct']:.1f}" if r["feat"] else "(no mask)"
             detail.append(f"+{r['t']:6.0f} ms  CNN {str(r['cnn']):<12} {r['cnn_conf']:.2f}  YOLO {str(r['yolo']):<12} {r['yolo_conf']:.2f}  "
@@ -1425,8 +1469,18 @@ class ProcessingThread(threading.Thread):
             "length_mm": (length_px / px_per_mm) if length_px else "", "width_mm": (width_px / px_per_mm) if width_px else "",
             "L": med("L"), "a": med("a"), "b": med("b"), "dark_pct_max": top("dark_pct"), "red_pct_max": top("red_pct"),
             "spots_max": top("spots"), "speed_px_ms": speed if speed is not None else "", "t_cross_ms": t_cross if t_cross is not None else "",
-            "grade": grade, "relay": relay or "", "fire": fire_result, "late": "",
+            "grade": grade, "relay": relay or "", "fire": fire_result, "late": "", "shadow": "; ".join(shadow),
         }, frames=frame_rows)
+
+    def _log_lost(self, trk, rid):
+        """A cashew that disappeared before its line (5-track: decision LOST). Counted and logged, never fired."""
+        if trk.hits < 2:
+            reason = decision.SEEN_ONLY_ONCE
+        else:
+            reason = decision.LEFT_ROI_UNDECIDED if trk.info.get("left_roi") else decision.LOST_BEFORE_LINE
+        self.shared_state.count_result(decision.LOST)
+        self.cashew_log.write({"id": trk.id, "roi": rid, "frames": len(trk.frames), "result": decision.LOST, "reason": reason,
+                               "fire": "NOT_FIRED"})
 
     def _draw_track(self, frame, trk, grading):
         x1, y1, x2, y2 = [int(v) for v in trk.box]
@@ -1764,7 +1818,7 @@ class App(tk.Tk):
 
         self.pills = {}
         self._pill_bar = top
-        for key, name, short in (("camera", "CAMERA", "CAM"), ("plc", "PLC", "PLC"), ("master", "MASTER EJECTOR", "EJECTOR"),
+        for key, name, short in (("camera", "CAMERA", "CAM"), ("plc", "PLC", "PLC"), ("safety", "SAFETY", "SAFETY"), ("master", "MASTER EJECTOR", "EJECTOR"),
                                  ("mode", "MODE", "MODE"), ("conveyor", "CONVEYOR", "CONV"), ("state", "STATE", "STATE")):
             pill = ui.Pill(top, name, "—", ui.MUTED, short=short)
             pill.pack(side=tk.LEFT, padx=3, pady=13)
@@ -1845,6 +1899,12 @@ class App(tk.Tk):
             if sum(child.winfo_reqwidth() + 16 for child in bar.winfo_children()) <= bar.winfo_width() or level == 3:
                 break
 
+    def _acknowledge_alarms(self):
+        """ACKNOWLEDGE: the operator has removed the cashews that were between the line and the valves."""
+        log.info("Alarm acknowledged: conveyor stopped with pending rejects %s", self.shared_state.missed_rejects)
+        with self.shared_state.lock:
+            self.shared_state.missed_rejects = []
+
     def _on_exit(self):
         if messagebox.askyesno("Exit", "Close the grader program?"):
             self._on_close()
@@ -1877,14 +1937,52 @@ class App(tk.Tk):
         good, undefined = counts.get(decision.GOOD, 0), counts.get(decision.UNDEFINED, 0)
         rejection = counts.get(decision.REJECTION, 0)
         self.kpi["total"].set(ui.thousands(total), f"detected {ui.thousands(ss.get_detected_count())}")
-        self.kpi["good"].set(ui.thousands(good), f"{100.0 * good / total:.1f} %" if total else "")
+        weight_g = float(ss.grading.get("avg_cashew_weight_g", 1.8))
+        kg_hr = lambda pieces_per_min: pieces_per_min * 60.0 * weight_g / 1000.0
+        self.kpi["good"].set(ui.thousands(good), (f"{100.0 * good / total:.1f} %   " if total else "") + f"{kg_hr(ss.good_last_minute()):.1f} kg/hr")
         self.kpi["undefined"].set(ui.thousands(undefined), f"{100.0 * undefined / total:.1f} %" if total else "")
         self.kpi["rejection"].set(ui.thousands(rejection), f"{100.0 * rejection / total:.1f} %" if total else "")
-        self.kpi["throughput"].set(str(ss.decisions_last_minute()), "pcs/min")
+        per_min = ss.decisions_last_minute()
+        self.kpi["throughput"].set(f"{kg_hr(per_min):.1f}", f"kg/hr   •   {per_min} pcs/min")
         shown = (decision.GOOD, decision.UNDEFINED, decision.REJECTION)
-        parts = [f"NOT ROLLED {counts.get('UNDEFINED: ' + decision.NOT_ROLLED, 0)}", f"DOUBLE {counts.get(decision.DOUBLE, 0)}", "LATE: step (c3)", "kg/hr: NOT AVAILABLE (no cashew weight yet)"]
-        parts += [f"{key} {n}" for key, n in sorted(counts.items()) if key not in shown and key != decision.DOUBLE and not key.startswith("UNDEFINED: ")]
+        parts = [f"NOT ROLLED {counts.get('UNDEFINED: ' + decision.NOT_ROLLED, 0)}", f"DOUBLE {counts.get(decision.DOUBLE, 0)}", f"LOST {counts.get(decision.LOST, 0)}", "LATE: step (c3)", f"kg/hr at {weight_g:g} g per cashew"]
+        with ss.lock:
+            engine_counts = dict(ss.engine_counts)
+        if engine_counts:
+            parts.append("SHADOW would reject: " + ", ".join(f"{name} {n}" for name, n in sorted(engine_counts.items())))
+        parts += [f"{key} {n}" for key, n in sorted(counts.items()) if key not in shown + (decision.DOUBLE, decision.LOST) and not key.startswith("UNDEFINED: ")]
         self.lbl_kpi_more.config(text="     ".join(parts))
+
+        # Alarms and the SAFETY pill (alarms.py decides, this only shows).
+        with ss.lock:
+            stopped = any(ss.belt_stopped.values())
+            lane_px_s = max(ss.lane_speed.values()) * 1000.0
+        if running and stopped:
+            for _, relay, source in self.relay_output.pending():
+                text = f"{source.split(' ')[0]} (R{relay})"
+                if text not in ss.missed_rejects:
+                    ss.missed_rejects.append(text)
+        try:
+            free_gb = shutil.disk_usage(str(app_paths.BASE_DIR)).free / 1e9
+        except OSError:
+            free_gb = None
+        max_step = float(ss.grading.get("tracker", {}).get("max_step_px", 160.0))
+        active = alarms.collect(cam.is_connected, str(cam.state), plc_ok, running, self.processing_thread.ai_fps,
+                                alarms.min_safe_fps(lane_px_s, max_step), free_gb, list(ss.missed_rejects), dry)
+        self.pills["safety"].set("FAULT" if active else "OK", ui.BAD if active else ui.GOOD)
+        if active != self._alarms_shown:
+            self._alarms_shown = list(active)
+            self.lbl_alarms.config(text="\n".join(active))
+            if active:
+                self.alarm_box.pack(fill=tk.X, pady=(ui.GRID, 0), before=self._tiles_frame)
+            else:
+                self.alarm_box.pack_forget()
+        if bool(ss.missed_rejects) != self._ack_shown:
+            self._ack_shown = bool(ss.missed_rejects)
+            if self._ack_shown:
+                self.btn_acknowledge.pack(anchor="e", padx=12, pady=(0, 8))
+            else:
+                self.btn_acknowledge.pack_forget()
 
         now = time.time()
         for rid, led in self.lane_leds.items():
@@ -1939,7 +2037,16 @@ class App(tk.Tk):
         self.golden_pneumatic_btn = ui.FlatButton(ops, "Auto Capture", command=toggle_golden, height=32, width=165)
         self.golden_pneumatic_btn.pack(anchor="w")
 
+        self.alarm_box = tk.Frame(p_prod, bg=ui.mix(ui.PANEL, ui.BAD, 0.18), highlightthickness=1, highlightbackground=ui.BAD)
+        tk.Label(self.alarm_box, text="ALARMS", font=(F, ui.F_SMALL, "bold"), fg=ui.BAD, bg=self.alarm_box.cget("bg")).pack(anchor="w", padx=12, pady=(8, 0))
+        self.lbl_alarms = tk.Label(self.alarm_box, text="", font=(F, ui.F_SMALL), fg=ui.TEXT, bg=self.alarm_box.cget("bg"),
+                                   justify="left", anchor="w", wraplength=ui.RIGHT_W - 40)
+        self.lbl_alarms.pack(fill=tk.X, padx=12, pady=(2, 8))
+        self.btn_acknowledge = ui.FlatButton(self.alarm_box, "ACKNOWLEDGE", command=self._acknowledge_alarms, kind="danger", height=30)
+        self._alarms_shown, self._ack_shown = None, False
+
         tiles = tk.Frame(p_prod, bg=ui.BG)
+        self._tiles_frame = tiles
         tiles.pack(fill=tk.X, pady=(ui.GRID, 0))
         for col in range(3):
             tiles.columnconfigure(col, weight=1, uniform="kpi")
@@ -4305,29 +4412,13 @@ except Exception as e:
             speed = float(getattr(self.shared_state, 'conveyor_speed_mm_s', 300.0))
             if speed <= 0:
                 speed = 300.0
-            
-            # ROI 1 (1..20)
-            for act_id in range(1, 21):
-                dist = self.shared_state.distances_mm[act_id - 1]
-                if dist > 0:
-                    if act_id == 1:
-                        d = int(round((dist / speed) * 1000.0))
-                    else:
-                        d = self.shared_state.delays_ms[act_id - 2] + int(round((dist / speed) * 1000.0))
-                    self.act_vars[act_id].set(str(d))
-                    self.shared_state.set_delay(act_id, d)
-            
-            # ROI 2 (21..40)
-            for act_id in range(21, 41):
-                dist = self.shared_state.distances_mm[act_id - 1]
-                if dist > 0:
-                    if act_id == 21:
-                        d = int(round((dist / speed) * 1000.0))
-                    else:
-                        d = self.shared_state.delays_ms[act_id - 2] + int(round((dist / speed) * 1000.0))
-                    self.act_vars[act_id].set(str(d))
-                    self.shared_state.set_delay(act_id, d)
-            messagebox.showinfo("Recalculate", f"All Delays Recalculated for Speed {speed:.1f} mm/s!")
+            pulse = float(self.shared_state.common_pulse_ms)
+            # delay = distance from the Decision line / speed - pulse / 2 (fire_timing.py), distances added up per ROI
+            spacing = {i + 1: self.shared_state.distances_mm[i] for i in range(NUM_ACTUATORS)}
+            for act_id, d in fire_timing.delays_from_distances(spacing, speed, pulse).items():
+                self.act_vars[act_id].set(str(d))
+                self.shared_state.set_delay(act_id, d)
+            messagebox.showinfo("Recalculate", f"All delays recalculated: distance / {speed:.1f} mm/s - pulse {pulse:.0f} ms / 2.")
         except Exception as e:
             messagebox.showerror("Recalculate Error", str(e))
         finally:

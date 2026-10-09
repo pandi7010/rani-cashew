@@ -4,6 +4,102 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-09 (5): Step (e2a) done - delay table fixed, always-reject rules, shadow engines, alarms
+
+Feature reference read: 5-track user manual v4.2 (`docs/CASHEW_X_AI_Manual_English.pdf`; it was not in `docs/`,
+I copied it from `CNN/CNN/app/manual/` on the drive; not committed because it is 15 MB).
+Step (e2) is split: **(e2a)** the logic behind the Pneumatic and Home pages (this entry), **(e2b)** the
+Pneumatic page itself and the PLC diagnostics window (next).
+
+### Delay bug
+
+Formula now used everywhere (`fire_timing.py`, also by RECALCULATE FROM DISTANCES):
+`delay = distance from the Decision line / speed - pulse / 2`, distances added up along each ROI.
+Recalculated with the config values speed 300 mm/s and pulse 50 ms. Before: A16 and A36 were lower than the
+relay before them. After: every delay rises along its ROI.
+
+| Relay | Distance mm | Old ms | New ms | Change | Relay | Distance mm | Old ms | New ms | Change |
+|---|---|---|---|---|---|---|---|---|---|
+| A01 | 393.7 | 1312 | 1287 | -25 | A21 | 395.0 | 1317 | 1292 | -25 |
+| A02 | 588.7 | 1962 | 1937 | -25 | A22 | 599.0 | 1992 | 1972 | -20 |
+| A03 | 784.7 | 2815 | 2591 | -224 | A23 | 779.0 | 2700 | 2572 | -128 |
+| A04 | 970.7 | 3435 | 3211 | -224 | A24 | 973.0 | 3437 | 3218 | -219 |
+| A05 | 1165.7 | 4185 | 3861 | -324 | A25 | 1172.0 | 4200 | 3882 | -318 |
+| A06 | 1359.7 | 4920 | 4507 | -413 | A26 | 1367.0 | 4950 | 4532 | -418 |
+| A07 | 1557.7 | 5700 | 5167 | -533 | A27 | 1560.0 | 5793 | 5175 | -618 |
+| A08 | 1753.7 | 6400 | 5821 | -579 | A28 | 1755.0 | 6543 | 5825 | -718 |
+| A09 | 1946.7 | 7280 | 6464 | -816 | A29 | 1948.0 | 7486 | 6468 | -1018 |
+| A10 | 2141.7 | 8038 | 7114 | -924 | A30 | 2141.0 | 8129 | 7112 | -1017 |
+| A11 | 2336.7 | 8688 | 7764 | -924 | A31 | 2336.0 | 8950 | 7762 | -1188 |
+| A12 | 2530.7 | 9435 | 8411 | -1024 | A32 | 2530.0 | 9682 | 8408 | -1274 |
+| A13 | 2725.7 | 10385 | 9061 | -1324 | A33 | 2727.0 | 10383 | 9065 | -1318 |
+| A14 | 2919.7 | 11100 | 9707 | -1393 | A34 | 2921.0 | 11730 | 9712 | -2018 |
+| A15 | 3116.7 | 11850 | 10364 | -1486 | A35 | 3117.0 | 12020 | 10365 | -1655 |
+| A16 | 3310.7 | 5500 | 11011 | +5511 | A36 | 3310.0 | 11026 | 11008 | -18 |
+| A17 | 3504.7 | 11683 | 11657 | -26 | A37 | 3511.0 | 11696 | 11678 | -18 |
+| A18 | 3698.7 | 12330 | 12304 | -26 | A38 | 3704.0 | 12339 | 12322 | -17 |
+| A19 | 3893.7 | 12980 | 12954 | -26 | A39 | 3897.0 | 12982 | 12965 | -17 |
+| A20 | 4088.7 | 13630 | 13604 | -26 | A40 | 4093.0 | 13635 | 13618 | -17 |
+
+**Please read before using the new values on real valves.** The old delays were of two kinds:
+
+- A01, A02, A17-A20, A21, A22, A36-A40: exactly distance / 300 mm/s (calculated, never tuned).
+- A03-A15 and A23-A35: they correspond to a belt speed of **260-289 mm/s**, falling with distance. They look
+  **hand-tuned on the machine**. A16 (5500 ms) was simply wrong.
+
+So the real belt speed is probably nearer 265-280 mm/s than the 300 mm/s in the config, and the new table
+(calculated at 300) may fire up to about 1.4 s early at the far relays. The old values are kept in the table
+above and in git (`git show 1babfd8:pneumatic_config.json`). Tell me the real speed (or let the vision speed
+measure it after px per mm is calibrated) and I recalculate; or say "restore the tuned delays".
+
+Also: your grader was running while I wrote the config. When that program is closed it saves its own (old)
+values again. Close it, then tell me and I apply the table again, or press RECALCULATE FROM DISTANCES.
+
+### What changed
+
+| Area | Change |
+|---|---|
+| Always-reject reasons (manual B14) | Checked before every class rule, all to the reject relay: `APPEARED_AFTER_LINE` (now fired, with the time since the line taken off the delay), `DOUBLE_OR_TOUCHING` (mask longer than 45 mm in at least 2 frames and half of its frames; switch in the config, ON), `STUCK` (slower than 30 % of the lane speed for 700 ms), `LOST_nnnMS` (not seen for more than 300 ms before the line). |
+| LOST | A cashew that disappears before its line (`SEEN_ONLY_ONCE`, `LOST_BEFORE_LINE`, `LEFT_ROI_UNDECIDED`) is counted and logged as LOST and never fired. |
+| Inspection engines | `engines.py`: OFF / SHADOW / ACTIVE per engine, all start in **SHADOW**. Working now: **View** (NECK seen) and **Shape** (solidity 0.75, area 100 mm2, length 16 mm, length / width 1.15). Listed but not measuring yet: Colour (e3), SW/WW and Size (c2). SHADOW writes "would reject" into the new CSV column `shadow`, the history detail and the Home line; it never fires. ACTIVE can only turn a GOOD into a reject. |
+| NECK rule | It is the View engine now, in SHADOW: **a clean cashew is GOOD again**; "not rolled" is only logged until you switch View to ACTIVE. |
+| Home | **ALARMS** box (only while something is wrong) and **SAFETY** pill: camera offline, PLC not connected, AI fps too low for the lane speed, disk below 20 GB, conveyor stopped with pending rejects (with ACKNOWLEDGE). kg/hr from the average cashew weight **1.8 g** (GOOD tile and THROUGHPUT tile). LOST count and "SHADOW would reject" counts in the line under the tiles. |
+| Tracker | Measures the longest gap of each cashew, marks stuck cashews, reports ended tracks, knows when the conveyor stands; a stuck cashew no longer pulls the lane speed down. A missed cashew keeps its ID for 600 ms (was 250) so the 300 ms LOST rule can judge it. |
+| Relay output | Remembers pulses that are still on their way (for the conveyor-stopped alarm). |
+| Log | `cashews_*.csv` has a new last column `shadow`; a file of the same day with the old columns is kept as `..._old_HHMMSS.csv`. |
+
+### Relay mapping against the grading rules (kept as it is)
+
+| Mapping | Conflict | Today |
+|---|---|---|
+| A02 / A22 = REJECTION | The rules send REJECTION to relay 1 / 21 | A02 / A22 never fire. Say if REJECTION should use A02 / A22. |
+| UPW has no relay | UPW is the top defect | goes to the reject relay |
+| A11 / A31 = SW | CNN SW is a "no defect" vote; colour decides in (c2) | practically never fires |
+| A12-A16 = "SW180, W180" ... | SW and WW of one size share a relay | no SW / WW split until (c2) |
+| A10 / A30 = DW1 + DW2 | none | works |
+| EDGECUT, DOUBLE | no relay, intended | reject relay |
+
+### Tested
+
+- `ast` check; **98 unit tests pass** (14 new: delay formula with the manual's example, always-reject order,
+  view engine OFF / SHADOW / ACTIVE, shape limits, double rule, gap / stuck / stopped tracking, every alarm).
+- Whole program off-screen with a fake PLC and the simulated belt: SAFETY OK at start; PLC offline gives the
+  ALARMS box and SAFETY FAULT and clears again; kg/hr shown; 0 pulses to the PLC.
+  Screenshot: `design/e2a_home_alarm_simulated.png`.
+
+### Not tested / to know
+
+- Real cashews and valves. The 45 mm double rule, the shape limits in mm and kg/hr all depend on px per mm,
+  which is still the uncalibrated 10.0 from the config. **If that value is wrong, DOUBLE can reject good
+  cashews.** It can be switched off (`grading.double.enabled`) until the calibration of (e3).
+- AI-fps alarm limit here = lane speed in px/s / largest tracker step (160 px), not the 5-track pitch formula
+  (I do not know this machine's cashew pitch).
+- The conveyor-stopped alarm counts only real pulses (not DRY-RUN) and was tested only in unit tests.
+- Password for SAVE MAPPING: the 5-track password is written in that project's source. I will not copy it
+  into this code; in (e2b) the program asks you to set the supervisor password once and stores only a hash.
+
+---
+
 ## 2026-10-09 (4): Step (e1) done - 5-track look: theme, top bar, left menu, Home
 
 ### What changed

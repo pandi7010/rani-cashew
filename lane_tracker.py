@@ -25,7 +25,10 @@ DEFAULTS = {
     "speed_factor": 1.5,        # ... plus this much of the predicted step (speed changes, rolling)
     "back_tol_px": 25.0,        # centroid jitter of a rolling cashew; more than this backwards = another cashew
     "max_lateral_px": 100.0,    # sideways limit (same roller channel)
-    "hold_ms": 250.0,           # how long a missed cashew keeps its ID
+    "hold_ms": 600.0,           # how long a missed cashew keeps its ID (longer than max_lost_ms, so a gap can be judged)
+    "stuck_speed_fraction": 0.30,   # slower than this share of the lane speed ...
+    "stuck_time_ms": 700.0,         # ... for this long = STUCK (values of the 5-track machine)
+    "stopped_speed_fraction": 0.10, # all cashews slower than this share of the lane speed = conveyor stopped
 }
 _FAR = 1e6
 
@@ -52,6 +55,9 @@ class Track:
     v: float = 0.0              # px/ms along the flow
     hits: int = 1
     missed: bool = False        # True while the position is only predicted
+    max_gap_ms: float = 0.0     # longest time without a detection (LOST rule)
+    stuck: bool = False         # much slower than the lane for stuck_time_ms
+    slow_since: Optional[float] = None
     decided: bool = False
     counted: bool = False
     frames: list = field(default_factory=list)      # per-frame records, filled by the caller
@@ -71,10 +77,14 @@ class LaneTracker:
         self.tracks: List[Track] = []
         self._seq = 0
         self._speeds = deque(maxlen=30)     # recent speeds of well-tracked cashews
+        self.dropped: List[Track] = []      # tracks that ended in the last update()
+        self.stopped = False                # True while every tracked cashew stands (almost) still
 
     def clear(self):
         """Forget the tracks (stop, new model). The ID counter goes on, so IDs stay unique in the logs."""
         self.tracks = []
+        self.dropped = []
+        self.stopped = False
         self._speeds.clear()
 
     @property
@@ -110,6 +120,7 @@ class LaneTracker:
                     continue
                 trk, det = self.tracks[i], detections[j]
                 dt = t_ms - trk.seen_ms
+                trk.max_gap_ms = max(trk.max_gap_ms, dt)
                 if dt > 0:
                     v_now = max(0.0, (along(det.cx, det.cy) - along(*trk.path[-1][1:])) / dt)
                     trk.v = v_now if trk.hits == 1 else 0.7 * trk.v + 0.3 * v_now
@@ -118,18 +129,28 @@ class LaneTracker:
                 trk.hits += 1
                 trk.missed = False
                 trk.path.append((t_ms, det.cx, det.cy))
-                if trk.hits >= 3 and trk.v > 0:
+                lane = self.lane_speed
+                # A stuck or standing cashew must not pull the lane speed down.
+                if trk.hits >= 3 and trk.v > 0 and (len(self._speeds) < 5 or trk.v >= p["stuck_speed_fraction"] * lane):
                     self._speeds.append(trk.v)
+                if lane > 0 and trk.hits >= 3 and trk.v < p["stuck_speed_fraction"] * lane:
+                    if trk.slow_since is None:
+                        trk.slow_since = t_ms
+                    elif t_ms - trk.slow_since > p["stuck_time_ms"]:
+                        trk.stuck = True
+                else:
+                    trk.slow_since = None
                 matched_tracks.add(i)
                 matched_dets.add(j)
                 det.track = trk
 
-        alive = []
+        alive, self.dropped = [], []
         for i, trk in enumerate(self.tracks):
             if i in matched_tracks:
                 alive.append(trk)
                 continue
             if t_ms - trk.seen_ms > p["hold_ms"]:
+                self.dropped.append(trk)
                 continue
             # Not seen now: move it along at its speed so it can be found again (and still be decided).
             dt = max(0.0, t_ms - trk.now_ms)
@@ -140,6 +161,8 @@ class LaneTracker:
             trk.now_ms = t_ms
             trk.missed = True
             if roi is not None and not (roi[0] <= trk.cx <= roi[2] and roi[1] <= trk.cy <= roi[3]):
+                trk.info["left_roi"] = True
+                self.dropped.append(trk)
                 continue
             alive.append(trk)
 
@@ -154,6 +177,9 @@ class LaneTracker:
             alive.append(trk)
 
         self.tracks = alive
+        seen = [t for t in alive if not t.missed and t.hits >= 5]
+        lane = self.lane_speed
+        self.stopped = bool(seen) and lane > 0 and all(t.v < p["stopped_speed_fraction"] * lane for t in seen)
         return alive
 
 

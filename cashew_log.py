@@ -18,7 +18,7 @@ log = logging.getLogger("cashew_log")
 CSV_FIELDS = ["time", "id", "roi", "frames", "frames_used", "result", "reason", "reject", "good_frames", "neck_frames",
               "seen", "votes", "views", "cnn_sw_votes", "length_px", "width_px", "area_px", "length_mm", "width_mm",
               "L", "a", "b", "dark_pct_max", "red_pct_max", "spots_max", "speed_px_ms", "t_cross_ms",
-              "grade", "relay", "fire", "late"]
+              "grade", "relay", "fire", "late", "shadow"]
 
 
 class CashewLog:
@@ -81,6 +81,12 @@ class CashewLog:
     @staticmethod
     def _write_csv(path, when, row):
         new = not path.exists()
+        if not new:     # columns changed since this day's file was started: keep the old file, start a new one
+            with open(path, "r", encoding="utf-8") as f:
+                header = f.readline().strip()
+            if header != ",".join(CSV_FIELDS):
+                path.rename(path.with_name(f"{path.stem}_old_{when.strftime('%H%M%S')}.csv"))
+                new = True
         out = {k: row.get(k, "") for k in CSV_FIELDS}
         out["time"] = when.strftime("%H:%M:%S.%f")[:-3]
         for key, value in out.items():
