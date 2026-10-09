@@ -50,8 +50,13 @@
   `TCM_CASHEWXAI_2026-10-06/` (the owner's UI reference; theme in `source/home_ui.py`, screenshots in
   `source/design/`) and `CNN/CNN/app/` (the same project, 11 commits newer). Also
   `/home/phoenix/Documents/RaniVision_Latest`, `v2_snapshot/`. Never modify any of them.
-- px per mm comes from the Vision ROI calibration (`size_config.roi_length_mm`); 10.0 is only a placeholder. Taught size
-  limits (`size_config.grades`) are stored but not used by the decision until step (c2).
+- px per mm comes from the Vision ROI calibration (`size_config.roi_length_mm`); 10.0 is only a placeholder.
+- Step (c2) is built: `colour_size.py` (SW / WW from a LAB value with a taught threshold in `size_config.colour`; grade from
+  the taught limits in `size_config.grades`). SHADOW until `size_config.size_ready`; that switch is the owner's.
+- Tracking rule: one cashew = one ID = one decision = at most one fire. Fragments are MERGED, tiny boxes are NOISE
+  (`lane_tracker.py`, `_close_fragment`). `tests/test_tracking_replay.py` must stay green; real runs can be replayed with
+  `tools/replay_tracks.py`.
+- EXIT ends the process directly after stopping and saving (`App.HARD_EXIT`); do not go back to `destroy()` only.
 - Plan: `PLAN.md` (English, current). Owner's requirements: `FINAL_PROMPT.txt`. Step order: (c1) done, then
   (e) UI, (c2), (c3), (d), (f).
 - `external_tools/` holds unmodified copies of the TCM tools; do not edit them.

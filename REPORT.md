@@ -4,6 +4,138 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-10 (5): Step (c2) - SW / WW colour and size grades; machine instructions
+
+### What works now
+
+| Part | How |
+|---|---|
+| Colour value | Inside the cashew mask (blue belt removed, after FFC / colour gain), per frame; one value per cashew = **median over its frames**. |
+| Which value | **Selectable: b\* (yellow), a\* (red) or L\* (lightness).** Default b\* as you asked. See "Why not only b\*" below. |
+| SW / WW | Threshold + side (SW is ABOVE / BELOW). Colour Size page: slider, live value of the current cashew (also L\*, a\*, b\*), TEACH WW, TEACH SW, both histograms in one picture, suggestion for all three values with "% of the taught cashews on the wrong side", APPLY SUGGESTION (saves at once). |
+| Size | Length, width, area from the contour, **median over the frames**, in mm with the px per mm of the Vision ROI calibration. |
+| Grades | W180, W210, W240, W320, W450, BUDDS, SW180 ... SW450. Per grade L / W / AREA min-max; TEACH = mean -/+ k x std (k = 3, histograms, 30 cashews minimum). COPY W LIMITS TO SW. A cashew that fits two overlapping grades gets the one whose middle is nearest. |
+| Flow | GOOD -> SW or WW -> grade of that colour -> ejector of that grade **from the ejector mapping** (W180 = A11 / A31 ... SW450 = A20 / A40 in your mapping). Outside every grade of its colour -> reject ejector 1 / 21 (`SIZE_OUT_OF_RANGE`). BUDDS size -> no fire. |
+| SHADOW | While SIZE GRADES READY is off: everything is measured and logged as "would be SW210"; the GOOD cashew still goes to 1 / 21. |
+| SIZE GRADES READY | Refused until px per mm is calibrated, the threshold is set and at least one W and one SW grade has limits; asks before switching on. |
+| RECENT RESULTS (Home) | TIME, ID, CLASS / RESULT, SW/WW, COLOUR value, L mm, GRADE, EJECTOR. |
+| Log | `logs/cashews_*.csv`: columns `L`, `a`, `b` (medians), `length_mm`, `width_mm`, `grade` (also the "would be"), `relay`. |
+
+The old "L below / W below" table and the old OpenCV filter sliders are no longer on the page (the old table is not used
+any more; their values stay in the settings file).
+
+### Why not only b\*
+
+I measured your own dataset (65 SW images, 400 GOOD_CASHEW images) with the same mask and colour code: b\* hardly separates
+them (SW 22.4 +/- 2.9, GOOD 24.8 +/- 9.8), a\* (SW -4.0, GOOD -5.7) and L\* (SW 59.6, GOOD 65.2) do better, none is clean.
+That folder is mixed (old images, other lighting), so it does not decide the question. Therefore TEACH compares all three on
+the cashews you run and marks the best one; you can still choose b\* yourself.
+
+### Tested (fake PLC, simulated belt, temporary settings; nothing real was touched)
+
+- `ast` check, **194 unit tests pass** (`tests/test_colour_size.py`: median colour, threshold and side, suggestion, grade from
+  limits per colour, overlap, out of range, BUDDS, copy W to SW).
+- Self-test `tools/selftest_pages.py`: READY refused with the 4 missing things named; calibration saved; SHADOW run: all GOOD to
+  1 / 21 with "would be"; TEACH WW / SW with simulated values -> suggestion -> APPLY saved; TEACH W320, COPY, SAVE; READY on:
+  every cashew fired by the ejector of its grade in the mapping (coils M110, M118 ... written). Pictures: `design/pages/04_*`, `01_home_running.png`.
+- In that run the test forces every cashew to GOOD (the simulated cashews are otherwise REJECTION).
+
+### Not tested
+
+- Real cashews: whether one LAB value separates your SW from your WW, and whether taught grade ranges overlap too much.
+  This can only be seen on the machine (the suggestion shows the "wrong side" percentage; the SHADOW run shows the grades).
+
+### Machine instructions
+
+**A. px per mm (once, and again whenever the camera or the ROI is moved)**
+1. Machine STOPPED. Vision ROI page. ROI 1 must be drawn.
+2. Put a ruler on the rollers inside ROI 1, along the direction the cashews travel. Read the real distance between the two
+   ends of the yellow ROI 1 box (its long side for your right-to-left belt), in mm.
+3. Type it into "ROI 1 length", check the "px per mm" shown, press SAVE VISION SETTINGS. The yellow NOT CALIBRATED text goes away.
+4. Check: put a cashew of known length under the camera, START, read "L mm" in RECENT RESULTS. If it is off by the same
+   factor for every cashew, correct the ROI length by that factor.
+
+**B. TEACH the SW / WW colour** (machine RUNNING: GOOD cashews go to the reject ejectors 1 / 21 during teaching)
+1. Colour Size page. Press CLEAR, then TEACH WW. START. Run only WW cashews (at least 20; 50-100 is better). The counter on
+   the button rises. Press the button again (STOP WW).
+2. Press TEACH SW. Run only SW cashews. Press STOP SW.
+3. Look at the histogram (WW blue, SW yellow) and at the three suggestion lines. Use the value buttons b\* / a\* / L\* to see each
+   histogram. The best line has the smallest "% on the wrong side"; if that number is high (say above 10 %), colour alone will
+   mix the two - tell me the three numbers.
+4. STOP the machine. APPLY SUGGESTION (it sets value, threshold and side and saves). Or type a threshold and SAVE COLOUR & SIZE.
+5. Check: START, run a few known WW and SW cashews, watch SW/WW and COLOUR in RECENT RESULTS.
+
+**C. TEACH each size grade** (px per mm must be calibrated first)
+1. Colour Size page, row W180: press TEACH. START. Run only W180 cashews, 50 if possible (30 minimum). The three histograms
+   fill; the yellow lines are the limits that will be set.
+2. STOP the machine. APPLY TO W180. The six limit fields of the row are filled ("not saved yet").
+3. Repeat for W210, W240, W320, W450 and BUDDS (BUDDS = pieces that must NOT be fired).
+4. SW grades: either teach SW180 ... SW450 the same way with SW cashews, or press COPY W LIMITS TO SW.
+5. SAVE COLOUR & SIZE. k = 3 gives wide limits; if neighbouring grades overlap a lot, set k to 2 and APPLY again, or edit the fields.
+
+**D. Check in SHADOW, then switch on**
+1. With SIZE GRADES READY still off: START and run known cashews of each grade. RECENT RESULTS shows
+   "GOOD (would be W240)" etc. All of them still go to 1 / 21. Check that the "would be" is right.
+2. Check the ejector mapping (Pneumatic page): W180 ... SW450 on the ejectors you want; BUDDS / SW_BUDDS in "no fire".
+3. STOP. Colour Size: switch SIZE GRADES READY on and confirm. From now on GOOD cashews are fired by their grade ejector.
+4. First run with few cashews and watch the EJECTOR column. The delays of the grade ejectors (A11 ... A20) were calculated for
+   300 mm/s and are not verified: check that the right valve blows at the right place.
+
+---
+
+## 2026-10-10 (4): URGENT tracking fix - one cashew = one ID = one decision = at most one fire
+
+### Analysis of the 03:15 run (20 cashews, all in ROI 2; from `logs/cashews_20261010.csv`)
+
+No camera recording of that run exists and the frames log had no positions then, so the analysis is from the cashew log and
+the LOST notes (first / last position, box, speed) that were added before that run.
+
+| What the log shows | IDs | Explanation |
+|---|---|---|
+| 20 tracks with 10-23 frames, decided | the 20 real cashews (two of them carried a second ID, see below) | |
+| Seen 2x at the ROI entry (x 2319-2420, edge at 2447), full-size box, measured speed 0.94-1.48 px/ms, then LOST; a normal track follows | R2-53, 65, 69, 71, 74 | **Entry split.** While a cashew is only partly inside the ROI its box centre moves at about half the belt speed (2.46). The track predicted with that speed; after 1-2 missed YOLO frames the cashew was outside its gate -> new ID. |
+| The same in the middle of the ROI | R2-54 (53 -> 54 -> 55: one cashew, three IDs), R2-61 (14 frames, lost at x 1143; R2-63 continues 10 px away), R2-76 (5 detections in 275 ms = every second frame missed; R2-78 continues) | **Mid-ROI split** after missed frames with a speed estimate that was too low. YOLO did miss frames while the cashew rolled: 5 detections in 275 ms instead of about 9. |
+| Tiny boxes (19x57, 22x55, 45x27 px; a cashew is about 160x250), speed 0.2-0.6, 1-4 frames | R2-46, 64, 79, 80 and others, also every 46 s while the belt was empty | **Not cashews**: a mark that comes round with the belt / rollers. Counted as LOST. |
+| 1-2 frame tracks decided at the line and FIRED | R1-14, R2-45, R2-47, R2-66 (length 3.2 mm), R2-78 | Fragments and tiny boxes got their own decision and fired the reject valve. |
+
+So: 20 cashews + 8 fragment IDs + tiny boxes = the TOTAL 33 / LOST 12 you saw.
+
+### Fix
+
+| # | Your point | Done |
+|---|---|---|
+| 2 | Prediction along the lane, bridge missed frames, re-attach near the predicted position, belt speed | A detection is matched from where the cashew was **last seen**, with the **lane (belt) speed** for a track seen fewer than 4 times, and a tolerance that grows with the time since it was seen (up to the 600 ms hold time). The lane speed is kept over STOP and is no longer taken from marks that hardly move. First cashew after program start (no lane speed yet): allowance for the half-speed entry. |
+| 2 | ByteTrack-style low confidence | YOLO boxes down to confidence 0.10 are kept as "weak": they may continue a cashew that already has an ID, never start one. |
+| 3 | Fragments are merged | A second box lying inside a tracked cashew's box gets no ID. A track that ends or reaches the line at the same place as another live cashew is **MERGED**: its frames go to that cashew, it is not counted, decided or fired. A tiny short-lived box (under a quarter of the usual cashew box, at most 8 detections) is **NOISE**: logged only. A box much narrower across the lane cannot take over a cashew's ID. |
+| 4 | One cashew = one decision = one fire | Follows from 2 and 3; Home shows `FRAGMENTS / NOISE IGNORED n` separately, TOTAL and LOST no longer contain them. |
+| 5 | Replay test | **A replay of the real run is not possible** (no recording, no positions in the old frames log). Instead: `tests/replay_model.py` builds runs with the measured numbers of the 03:15 run (2.46 px/ms, frames 26-53 ms apart, 165x250 boxes, half-speed entry, misses after the entry and while rolling, tiny slow boxes); `tests/test_tracking_replay.py` checks 20 in -> 20 IDs on 40 such runs and that the tracker of commit `3618f26` splits the same frames. From now on the frames log holds time and box of every detection (also of LOST / MERGED tracks), and `python3 tools/replay_tracks.py logs/frames_<date>.jsonl 03:15:00 03:16:00` replays a real run through the tracker. |
+
+### Before / after
+
+| | Before (`3618f26`) | After |
+|---|---|---|
+| Real run 03:15, 20 cashews | TOTAL 33, LOST 12 | not measured yet - needs your run |
+| Modelled run, 60 x 20 = 1,200 cashews | 1,587 IDs (about 26 per 20) | 1,200 IDs |
+| Modelled run, 200 x 20 = 4,000 cashews | - | 4,000 IDs, no ID shared by two cashews (also with no weak boxes at all) |
+| Simulated belt in the program (fake PLC) | - | every cashew one ID, no LOST, no error |
+
+**Honest limit:** the model is built from the log, not from pictures. Please repeat the 20-cashew test. If TOTAL is still
+not 20, send nothing by hand: the new frames log has the positions, and `tools/replay_tracks.py` shows it. For a full
+picture replay press RECORD on the Vision ROI page (10 s) during such a run.
+
+### Also in this commit range
+
+- **EXIT freeze:** closing could stall while Tk destroyed widgets of pages that were never shown. EXIT / SHUTDOWN now stop
+  everything, save, hide the window and end the process directly. Tested: closes in all three cases that stalled before.
+  The cause inside Tk was not found; this goes around it.
+  **Open risk:** in my self-test (no Tk main loop) destroying a tool window (PLC mapping, ejector check) also stalled a few
+  times. I could not reproduce it on purpose. If closing one of those windows ever freezes the program on the machine, tell me.
+- Assumptions: weak boxes from confidence 0.10; "tiny" = under 25 % of the usual box area and at most 8 detections; fragment =
+  within 0.6 box lengths of another live cashew; a cashew seen only 1-2 times, full size, alone, still gets "too few frames"
+  -> reject (so a real cashew cannot slip through).
+
+---
+
 ## HANDOFF - paused 2026-10-10 about 03:00 on your instruction
 
 ### Done and committed

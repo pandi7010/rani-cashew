@@ -162,19 +162,20 @@ if not os.environ.get("GSN_SELFTEST_QUICK"):
     pump(0.5)
     print("  mapping window lightning A05:", win.row_status[5].cget("text"), "|", win.lbl_result.cget("text"))
     shot(win, "20_window_plc_mapping")
-    win.destroy()
+    win.withdraw()          # not destroyed: without a Tk main loop that can stall
     app._open_ejector_check()
     w = app._ejector_check_window
     w.overrideredirect(True)
     w.geometry(f"1180x980+{app.winfo_screenwidth() + 4500}+0")
     shot(w, "21_window_ejector_check")
-    w.destroy()
+    w.withdraw()          # not destroyed: without a Tk main loop that can stall
     app._popup_mapper(7)
     shot(app._mapper_window[0], "22_window_ejector_picker")
-    app._mapper_window[0].destroy()
+    app._mapper_window[0].withdraw()          # not destroyed: without a Tk main loop that can stall
 if len(sys.argv) > 2:
     exec(open(sys.argv[2]).read())          # extra checks of a development step
 print("  menu:", list(app.nav_buttons))
+g.App.HARD_EXIT = False
 app.destroy = lambda: None          # without a Tk main loop, destroying the window can stall; the process ends below
 app._on_close()
 shutil.rmtree(T, ignore_errors=True)

@@ -77,7 +77,10 @@ app._switch_page("Home")
 before = len(plc.writes)
 app._on_start_stop(); pump(7.0)
 shot(app, "01_home_running")
+waiting = len(app.relay_output.pending())
+pump(6.0)                                    # the grade ejectors are far down the belt: let their delays run out
 app._on_start_stop(); pump(0.8)
+print("  pulses waiting after 7 s:", waiting, "| after 13 s the coils written:", sorted({plc.get_relay_address(r) for r, _ in plc.writes[before:]}))
 with app.shared_state.lock:
     live = [s for s in app.shared_state.size_samples if s.get("lab")]
 for s in live[:6]:

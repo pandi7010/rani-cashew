@@ -1503,9 +1503,10 @@ class ProcessingThread(threading.Thread):
                 # SHADOW: colour and size are measured and logged ("would be SW210"); the cashew goes to the reject ejector.
                 d.reason, d.reject = f"{decision.SIZE_NOT_READY}:{grade}", True
                 relay, label, d.result = REJECT_RELAY[rid], f"UNDEF SIZE_NOT_READY (would be {grade})", decision.UNDEFINED
-            elif not colour_taught:
-                d.reason, d.reject = colour_size.COLOUR_NOT_TAUGHT, True
-                relay, label, d.result = REJECT_RELAY[rid], "UNDEF colour not taught", decision.UNDEFINED
+            elif not colour_taught:         # no threshold, or no frame of this cashew had a mask to measure the colour in
+                why_colour = colour_size.COLOUR_NOT_TAUGHT if colour_values else "COLOUR_NOT_MEASURED"
+                d.reason, d.reject = why_colour, True
+                relay, label, d.result = REJECT_RELAY[rid], f"UNDEF {why_colour.replace('_', ' ').lower()}", decision.UNDEFINED
             elif size_grade is None:        # outside every grade (or no grade of this colour taught): reject ejector
                 d.reason, d.reject = f"{why} {mm_length:.1f} x {mm_width:.1f} mm", True
                 relay, label, d.result = REJECT_RELAY[rid], f"UNDEF {grade}", decision.UNDEFINED
@@ -2568,9 +2569,8 @@ class App(tk.Tk):
 
     def _on_shutdown(self):
         if messagebox.askyesno("Shutdown", "Close the grader and SWITCH OFF this computer?"):
-            self._on_close()
             import subprocess
-            subprocess.Popen(["systemctl", "poweroff"])
+            self._on_close(then=lambda: subprocess.Popen(["systemctl", "poweroff"]))
 
     def _refresh_status(self):
         """Top bar pills, Home tiles and lane LEDs (called a few times per second)."""
@@ -6541,7 +6541,10 @@ except Exception as e:
             log.exception("Could not delete classes %s", names_str)
             messagebox.showerror("Error", f"Could not delete classes: {e}")
 
-    def _on_close(self):
+    HARD_EXIT = True            # False in the self-test, which must go on after closing
+
+    def _on_close(self, then=None):
+        """Stop everything, save, end the program. `then` runs after everything is stopped (SHUTDOWN: power off)."""
         print("[SYSTEM] Initiating shutdown...")
         self.stop_event.set()
         self.controller.stop()
@@ -6564,6 +6567,24 @@ except Exception as e:
             self.relay_output.stop()
             
         print("[SYSTEM] Shutdown complete.")
+        if then is not None:
+            try:
+                then()
+            except Exception:
+                log.exception("The step after closing failed")
+        if self.HARD_EXIT:
+            # Everything is stopped and saved above. Tk can stall while it destroys the widgets of pages that were
+            # never shown (seen in the self-test, 2026-10-10), which would leave a frozen window after EXIT. So the
+            # window is hidden and the process ends here instead of taking the window apart widget by widget.
+            try:
+                self.withdraw()
+                self.update_idletasks()
+            except tk.TclError:
+                pass
+            import logging
+            logging.shutdown()
+            sys.stdout.flush()
+            os._exit(0)
         self.destroy()
 
 
