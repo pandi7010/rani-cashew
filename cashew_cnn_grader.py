@@ -40,6 +40,8 @@ import alarms
 import fire_timing
 import ejector_check
 import ejector_check_ui
+import production_capture
+import dataset_ops
 import decision
 import grading_config
 from lane_tracker import LaneTracker, Detection, crossing_time, track_speed
@@ -463,6 +465,7 @@ class SharedState:
         self.teach_belt_requested = False
         self.teach_belt_message = ""
         self.decision_times = deque(maxlen=5000)            # for pcs/min on the Home page
+        self.capture_cfg = production_capture.merged_config()    # automatic production capture into the inbox
         self.good_times = deque(maxlen=5000)                # ... and kg/hr of the good output
         self.engine_counts: Dict[str, int] = {}             # engine -> "would reject" (SHADOW) or rejected (ACTIVE)
         self.belt_stopped = {1: False, 2: False}            # from the trackers
@@ -743,6 +746,7 @@ class SharedState:
                 self.link_lines = bool(cfg.get("link_lines", True))
                 self.line2_x_full, self.line2_y_full = cfg.get("line2_x_full"), cfg.get("line2_y_full")
                 self.grading = grading_config.merged(cfg.get("grading"))
+                self.capture_cfg = production_capture.merged_config(cfg.get("production_capture"))
                 self.flow_direction = fg.valid_flow(cfg.get("flow_direction", fg.RIGHT_TO_LEFT))
                 if "camera_source" in cfg:
                     self.camera_settings = CameraSettings.from_dict(cfg["camera_source"])
@@ -792,6 +796,7 @@ class SharedState:
                     "line2_x_full": self.line2_x_full,
                     "line2_y_full": self.line2_y_full,
                     "grading": self.grading,
+                    "production_capture": self.capture_cfg,
                     "flow_direction": self.flow_direction,
                     "camera_source": self.camera_settings.to_dict(),
                     "capture_classes": self.capture_classes,
@@ -908,6 +913,7 @@ class ProcessingThread(threading.Thread):
         self.model = None
         self.model_lock = threading.Lock()
         self.trackers = {1: LaneTracker(1), 2: LaneTracker(2)}    # one tracker and one ID series per ROI
+        self.capture = production_capture.ProductionCapture()     # inbox capture; its own saver thread
         self.frame_time = time.time()
         self.ai_fps, self._ai_count, self._ai_since = 0.0, 0, time.time()   # frames graded per second
         frame_log = shared_state.grading.get("frame_log", {})
@@ -1267,6 +1273,9 @@ class ProcessingThread(threading.Thread):
             tracker.params = {**tracker.params, **grading.get("tracker", {})}
             tracks = tracker.update(detections, t_ms, flow, roi)
             for det in detections:
+                crop = det.data.pop("crop", None)
+                if crop is not None and not det.track.decided:
+                    self.capture.note_view(det.track.id, crop, decision.canonical(det.data["cnn"]), det.data["cnn_conf"])
                 if not det.track.decided:
                     det.track.frames.append(det.data)
                 det.track.info["last"] = det.data
@@ -1355,6 +1364,8 @@ class ProcessingThread(threading.Thread):
                         cnn_name = "GOOD_CASHEW"
                 self.registry.id_for(cnn_name, register=True)
                 data["cnn"], data["cnn_conf"] = cnn_name, float(cnn_conf)
+                if not edge_cut and self.capture.wanted():
+                    data["crop"] = crop.copy()      # only while production capture is on; handed over right after tracking
         return Detection(cx, cy, data["box"], data)
 
     def _golden_capture(self, clean_frame, trk, state):
@@ -1451,6 +1462,9 @@ class ProcessingThread(threading.Thread):
                 with self.fire_lock:
                     self.fire_counts[int(cid)] = self.fire_counts.get(int(cid), 0) + 1
 
+        # Production capture: uncertain cashews, rejects and a few good ones go to the inbox (never waits).
+        self.capture.on_decision(trk.id, rid, "ACCEPT" if d.result == decision.GOOD else "REJECT", d.reason,
+                                 {"would": "; ".join(shadow), "result": d.result, "relay": relay})
         speed = track_speed(trk.path, flow)
         t_cross = crossing_time(trk.path, flow, line)
         trk.info.update(label=label, relay=relay, result=d.result)
@@ -1599,8 +1613,14 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Newton Automation | Industrial HMI")
-        self.geometry("1800x900+10+10")
-        self.attributes("-zoomed", True)
+        if os.environ.get("GSN_UI_OFFSCREEN"):
+            # Self-screenshot tests (ui_debug.py): a fixed 1920 x 1080 window outside the visible screen, set before the
+            # window is first shown so the window manager never maximises or moves it.
+            self.overrideredirect(True)
+            self.geometry(f"1920x1080+{self.winfo_screenwidth() + 2000}+0")
+        else:
+            self.geometry("1800x900+10+10")
+            self.attributes("-zoomed", True)
         self.configure(bg=ui.BG)
         
         self.colors = {     # the palette of ui_theme.py under the names the older pages use
@@ -1825,7 +1845,7 @@ class App(tk.Tk):
         prog.pack(side=tk.LEFT, padx=(12, 8), pady=13)
         tk.Label(prog, text="PROGRAM", font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT, padx=(10, 6), pady=8)
         tk.Label(prog, text="Default", font=(F, ui.F_SMALL, "bold"), fg=ui.TEXT, bg=ui.PANEL).pack(side=tk.LEFT)
-        tk.Label(prog, text="NEW / COPY: NOT AVAILABLE", font=(F, -10), fg=ui.IDLE, bg=ui.PANEL).pack(side=tk.LEFT, padx=(8, 10))
+        tk.Frame(prog, bg=ui.PANEL, width=10).pack(side=tk.LEFT)      # NEW / COPY / DELETE come with the programs (step e3)
 
         self.pills = {}
         self._pill_bar = top
@@ -1903,13 +1923,31 @@ class App(tk.Tk):
     def _fit_pills(self):
         """Keep the status pills inside the top bar: tighter padding, then short names, then a smaller font."""
         bar = self._pill_bar
-        bar.update_idletasks()
-        for level in (0, 1, 2, 3):
+        if bar.winfo_width() < 400:         # the window has not been laid out yet
+            return
+        level = getattr(self, "_pill_level", 0)
+        while True:     # values change while running (and get longer), so the fit is checked again and again; it only tightens
+            bar.update_idletasks()
+            if level >= 3 or sum(child.winfo_reqwidth() + 14 for child in bar.winfo_children()) <= bar.winfo_width():
+                break
+            level += 1
             for pill in self.pills.values():
                 pill.set_level(level)
-            bar.update_idletasks()
-            if sum(child.winfo_reqwidth() + 16 for child in bar.winfo_children()) <= bar.winfo_width() or level == 3:
-                break
+        self._pill_level = level
+
+    def _refresh_teaching(self):
+        """Production capture settings to its thread; Teaching CNN page redrawn while it is shown."""
+        try:
+            self.processing_thread.capture.configure(self.shared_state.capture_cfg, self.active_program_name, app_paths.INBOX_DIR,
+                                                     {"cnn": Path(self._active_cnn_path()).name,
+                                                      "yolo": os.path.basename(str(self.shared_state.yolo_model_path or ""))})
+        except Exception:
+            _throttle.exception("capture_cfg", "Production capture could not be configured")
+        page = getattr(self, "teach_page", None)
+        if page is not None and self.pages["Teaching CNN"].winfo_ismapped():
+            capturing = self.shared_state.is_golden_capture_active()
+            self.tcm_auto_cap_btn.config(text="STOP AUTO CAPTURE" if capturing else "START AUTO CAPTURE")
+            page.refresh()
 
     def _acknowledge_alarms(self):
         """ACKNOWLEDGE: the operator has removed the cashews that were between the line and the valves."""
@@ -1986,6 +2024,12 @@ class App(tk.Tk):
         active = alarms.collect(cam.is_connected, str(cam.state), plc_ok, running, self.processing_thread.ai_fps,
                                 alarms.min_safe_fps(lane_px_s, max_step), free_gb, list(ss.missed_rejects), dry)
         self.pills["safety"].set("FAULT" if active else "OK", ui.BAD if active else ui.GOOD)
+        # Production capture: not a machine fault (the SAFETY pill is not changed), shown in the same box.
+        capture_state = self.processing_thread.capture.blocking_reason()
+        if capture_state == production_capture.INBOX_FULL:
+            active = active + ["INBOX FULL - review or clear to continue (Teaching CNN page). Production capture is stopped; nothing was deleted."]
+        elif capture_state == production_capture.DISK_LOW:
+            active = active + ["DISK SPACE LOW - production capture is stopped."]
         if active != self._alarms_shown:
             self._alarms_shown = list(active)
             self.lbl_alarms.config(text="\n".join(active))
@@ -2031,6 +2075,7 @@ class App(tk.Tk):
 
         # PAGE: Home (5-track layout: machine button, KPI tiles, recent results)
         F = ui.FONT
+        self.toggle_golden = toggle_golden
         p_prod = tk.Frame(self.page_container, bg=ui.BG)
         self.pages["Home"] = p_prod
 
@@ -2904,86 +2949,167 @@ class App(tk.Tk):
         self._build_annotate_page()
 
     def _build_tcm_studio_page(self):
-        p_tcm = tk.Frame(self.page_container, bg=self.colors["surface"], padx=15, pady=15)
+        """TEACHING CNN page as on the 5-track machine: capture, label, train, production inbox. See teach_ui.py."""
+        import teach_ui
+        p_tcm = tk.Frame(self.page_container, bg=ui.BG)
         self.pages["Teaching CNN"] = p_tcm
-        
-        ttk.Label(p_tcm, text="TCM STUDIO - AUTO DATASET & TRAIN", style="Title.TLabel").pack(anchor="w", pady=(0, 20))
-        
+        self.teach_page = teach_ui.TeachPage(self, p_tcm, GOLDEN_DIR, MODEL_ROOT)
 
-        
-        # Section 1: Manage Golden Images
-        rev_frm = tk.Frame(p_tcm, bg=self.colors["bg"], padx=10, pady=10)
-        rev_frm.pack(fill=tk.X, pady=(0, 20))
-        ttk.Label(rev_frm, text="1. Manage Golden Images", style="Header.TLabel").pack(anchor="w", pady=(0,10))
-        
-        row2 = tk.Frame(rev_frm, bg=self.colors["bg"])
-        row2.pack(fill=tk.X, pady=5)
-        
-        def open_dataset_folders():
-            import subprocess
-            import os
-            os.makedirs(GOLDEN_DIR, exist_ok=True)
-            os.makedirs(DATASET_DIR, exist_ok=True)
-            subprocess.Popen(["xdg-open", GOLDEN_DIR])
-            subprocess.Popen(["xdg-open", DATASET_DIR])
-            
-        def launch_auto_labeler():
-            import subprocess
+    # ── Training (training.py does the work; training_ui.py shows it) ──
+    active_program_name = app_paths.PROGRAM_NAME
+
+    def _active_dataset_dir(self):
+        """The clean dataset of the active program: one folder per final class name."""
+        return str(app_paths.CLEAN_DATASET_DIR)
+
+    def _active_cnn_path(self):
+        """The CNN checkpoint the grader is using now."""
+        return CNN_MODEL_PATH
+
+    def _set_production_capture(self, on):
+        with self.shared_state.lock:
+            self.shared_state.capture_cfg["enabled"] = bool(on)
+        self.shared_state.save_to_config(CFG_PATH)
+        log.info("Production capture %s", "ON" if on else "OFF")
+
+    def _ask_supervisor_password(self, title):
+        """True when the supervisor password was entered correctly. The first time, the supervisor sets it
+        (only a salted hash is stored in machine_config.json)."""
+        import supervisor
+        from tkinter import simpledialog
+        path = app_paths.MACHINE_CONFIG_PATH
+        if not supervisor.is_set(path):
+            if not messagebox.askyesno(title, "No supervisor password has been set on this machine yet.\n\nSet it now?"):
+                return False
+            first = simpledialog.askstring(title, "New supervisor password (at least 4 characters):", show="*", parent=self)
+            if first is None:
+                return False
+            second = simpledialog.askstring(title, "The same password again:", show="*", parent=self)
+            if first != second:
+                messagebox.showerror(title, "The two entries are different. No password was set.")
+                return False
             try:
-                subprocess.Popen([sys.executable, str(app_paths.AUTO_LABELER_SCRIPT)], cwd=str(app_paths.BASE_DIR))
-            except Exception as e:
-                log.exception("Could not start the AI Auto-Labeler")
-                messagebox.showerror("Launch Error", f"Failed to start AI Auto-Labeler: {e}")
-                
-        ttk.Button(row2, text="Open Dataset Folders", style="Primary.TButton", command=open_dataset_folders).pack(side=tk.LEFT, padx=(0,10))
-        ttk.Button(row2, text="Cross Check Labels (TCM)", style="Warning.TButton", command=self._launch_tcm_studio).pack(side=tk.LEFT, padx=(0,10))
-        ttk.Button(row2, text="AI Auto-Label (Fast Review)", style="Success.TButton", command=launch_auto_labeler).pack(side=tk.LEFT, padx=(0,10))
-        ttk.Label(row2, text="Run AI Auto-Label to sort Golden crops quickly.", style="Surface.TLabel").pack(side=tk.LEFT, padx=(10,0))
-        
-        # Section 2: Training Setup
-        trn_frm = tk.Frame(p_tcm, bg=self.colors["bg"], padx=10, pady=10)
-        trn_frm.pack(fill=tk.X, pady=(0, 20))
-        ttk.Label(trn_frm, text="2. Train Model", style="Header.TLabel").pack(anchor="w", pady=(0,10))
-        
-        t_row = tk.Frame(trn_frm, bg=self.colors["bg"])
-        t_row.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(t_row, text="Model Architecture:").pack(side=tk.LEFT, padx=(0,5))
-        self.tcm_arch_var = tk.StringVar(value="CNN (MobileNet)")
-        arch_combo = ttk.Combobox(t_row, textvariable=self.tcm_arch_var, values=["CNN (MobileNet)", "YOLOv8-Classifier", "YOLO11-Classifier"], state="readonly", width=18)
-        arch_combo.pack(side=tk.LEFT, padx=(0,15))
-        
-        ttk.Label(t_row, text="Epochs:").pack(side=tk.LEFT, padx=(0,5))
-        self.tcm_epochs = tk.IntVar(value=100)
-        tk.Entry(t_row, textvariable=self.tcm_epochs, width=5).pack(side=tk.LEFT, padx=(0,15))
-        
-        self.tcm_train_btn = ttk.Button(t_row, text="START TRAINING", style="Primary.TButton", command=self._start_training_router)
-        self.tcm_train_btn.pack(side=tk.LEFT)
-        
-        self.is_training = False
-        
-        # Section 3: Verify Mismatches
-        ver_frm = tk.Frame(p_tcm, bg=self.colors["bg"], padx=10, pady=10)
-        ver_frm.pack(fill=tk.X, pady=(0, 20))
-        ttk.Label(ver_frm, text="3. Verify Confusion Images", style="Header.TLabel").pack(anchor="w", pady=(0,10))
-        
-        v_row = tk.Frame(ver_frm, bg=self.colors["bg"])
-        v_row.pack(fill=tk.X, pady=5)
-        
-        self.tcm_verify_btn = ttk.Button(v_row, text="Verify Mismatches", style="Warning.TButton", command=self._verify_mismatches)
-        self.tcm_verify_btn.pack(side=tk.LEFT, padx=(0,10))
-        ttk.Label(v_row, text="Double-click confusing images to re-assign class.").pack(side=tk.LEFT)
-        
-        self.tcm_log = tk.Text(ver_frm, bg="black", fg="white", height=5)
-        self.tcm_log.pack(fill=tk.X, pady=(10, 0))
+                supervisor.set_password(path, first)
+            except ValueError as e:
+                messagebox.showerror(title, str(e))
+                return False
+            log.info("Supervisor password set")
+            return True
+        password = simpledialog.askstring(title, "Supervisor password:", show="*", parent=self)
+        if password is None:
+            return False
+        if not supervisor.check(path, password):
+            messagebox.showerror(title, "Wrong password. Nothing was changed.")
+            return False
+        return True
 
+    def _begin_training(self, kind, epochs, work):
+        """Run work(progress, stop) in a thread and show the live window. work returns the result dict."""
+        import training_ui
+        self.train_status = {"kind": kind, "running": True, "epochs": int(epochs), "history": [], "seconds_left": 0.0,
+                             "result": None, "error": "", "stop": False, "started": time.time()}
+        status = self.train_status
+        self.is_training = True
+
+        def progress(row):
+            status["seconds_left"] = row.pop("seconds_left", 0.0)
+            status["history"].append(row)
+
+        def run():
+            try:
+                status["result"] = work(progress, lambda: status["stop"])
+                if kind == "CNN":
+                    dataset_ops.training_finished(self._active_dataset_dir())      # "new images since the last training" starts again
+                log.info("[TRAIN] %s training finished: %s (not active until it is activated)", kind, status["result"].get("model"))
+            except Exception as exc:
+                log.exception("[TRAIN] %s training failed", kind)
+                status["error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                status["running"] = False
+                self.is_training = False
+        threading.Thread(target=run, daemon=True, name=f"{kind}Training").start()
+        training_ui.open_training_window(self)
+
+    def _training_blocked(self):
+        if getattr(self, "is_training", False):
+            messagebox.showwarning("Training", "A training is already running. Wait for it to finish or stop it in its window.")
+            return True
+        if self.shared_state.phase == "RUNNING":
+            messagebox.showwarning("Training", "Stop the machine first: training uses the same graphics card as the grader "
+                                               "and would slow the inspection down.")
+            return True
+        return False
 
     def _start_training_router(self):
-        arch = self.tcm_arch_var.get()
-        if "CNN" in arch:
-            self._start_cnn_train()
-        else:
-            self._start_yolo_train(arch)
+        self._start_cnn_train()
+
+    def _start_cnn_train(self):
+        import training
+        import training_ui
+        if self._training_blocked():
+            return
+        dataset_dir = self._active_dataset_dir()
+        images = training.list_class_images(dataset_dir)
+        if not images:
+            messagebox.showerror("Train CNN", f"No class folders found in\n{dataset_dir}")
+            return
+        try:
+            epochs = int(self.tcm_epochs.get())
+            if not 1 <= epochs <= 500:
+                raise ValueError
+        except (ValueError, tk.TclError):
+            messagebox.showerror("Train CNN", "Epochs must be a whole number from 1 to 500.")
+            return
+        prefix = "cnn_" + "".join(ch if ch.isalnum() else "_" for ch in str(self.active_program_name))
+
+        def start(classes):
+            # training.py reads every image through preprocess.py, the same crop and padding as live grading.
+            self._begin_training("CNN", epochs, lambda progress, stop: self._cnn_trainer(
+                dataset_dir, classes, epochs, str(MODEL_ROOT), name_prefix=prefix, progress=progress, stop=stop))
+        training_ui.choose_classes(self, images, epochs, start)
+
+    def _cnn_trainer(self, *args, **kwargs):
+        import training
+        return training.train_cnn(*args, **kwargs)
+
+    def _verify_mismatches(self):
+        """Run the active CNN on the labelled images and list those where label and prediction disagree."""
+        import training
+        import training_ui
+        if getattr(self, "_verify_running", False):
+            return
+        if self.shared_state.phase == "RUNNING":
+            messagebox.showwarning("Verify labels", "Stop the machine first: the check uses the same graphics card as the grader.")
+            return
+        model_path = self._active_cnn_path()
+        if not Path(model_path).exists():
+            messagebox.showerror("Verify labels", f"The active CNN model was not found:\n{model_path}")
+            return
+        dataset_dir = self._active_dataset_dir()
+        self._verify_running = True
+        self.config(cursor="watch")
+
+        def done(result=None, error=""):
+            self._verify_running = False
+            self.config(cursor="")
+            if error:
+                messagebox.showerror("Verify labels", f"The check failed:\n{error}")
+                return
+            folders = {name.upper().strip(): os.path.join(dataset_dir, name) for name in training.list_class_images(dataset_dir)}
+            if not result["checked"]:
+                messagebox.showwarning("Verify labels", f"Nothing could be checked: the model ({', '.join(result['model_classes'])}) "
+                                                        f"knows none of the class folders in\n{dataset_dir}")
+                return
+            training_ui.open_mismatch_window(self, result, Path(model_path).name, folders)
+
+        def run():
+            try:
+                result = training.verify_labels(str(model_path), dataset_dir)
+                self.after(0, lambda: done(result))
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                self.after(0, lambda: done(error=message))
+        threading.Thread(target=run, daemon=True, name="VerifyLabels").start()
 
     def _launch_tcm_studio(self):
         import subprocess
@@ -2997,116 +3123,15 @@ class App(tk.Tk):
             log.exception("Could not start TCM Studio Pro")
             messagebox.showerror("Launch Error", f"Failed to start TCM Studio Pro: {e}")
 
-    def _start_cnn_train(self):
-        if getattr(self, 'is_training', False):
-            return
-        train_script = app_paths.BASE_DIR / "train_cnn.py"
-        if not train_script.exists():
-            messagebox.showerror("Not available", "CNN training is not available yet:\ntrain_cnn.py is not in the project folder.")
-            return
-        dataset_dir = DATASET_DIR
-        disabled_dir = str(app_paths.DATASET_DISABLED_DIR)
-        
-        # In case previous run crashed, restore disabled folders first
-        if os.path.exists(disabled_dir):
-            for d in os.listdir(disabled_dir):
-                if not os.path.exists(os.path.join(dataset_dir, d)):
-                    shutil.move(os.path.join(disabled_dir, d), os.path.join(dataset_dir, d))
-                
-        if not os.path.exists(dataset_dir):
-            messagebox.showerror("Error", "Dataset folder not found!")
-            return
-            
-        classes = [d for d in os.listdir(dataset_dir) if os.path.isdir(os.path.join(dataset_dir, d))]
-        if not classes:
-            messagebox.showerror("Error", "No class folders found in dataset!")
-            return
-            
-        # Create Popup
-        popup = tk.Toplevel(self)
-        popup.title("Select Classes for Training")
-        popup.geometry("500x680")
-        popup.transient(self)
-        popup.grab_set()
-        
-        ttk.Label(popup, text="Select classes to include in this training run:", font=("Roboto", 12, "bold")).pack(pady=10)
-        
-        frame = tk.Frame(popup)
-        frame.pack(fill="both", expand=True, padx=20, pady=10)
-        
-        canvas = tk.Canvas(frame)
-        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas)
-        
-        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        
-        # Read counts and create checkboxes
-        self.class_vars = {}
-        for cls in sorted(classes):
-            cls_path = os.path.join(dataset_dir, cls)
-            count = len([f for f in os.listdir(cls_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-            var = tk.BooleanVar(value=(count > 0)) # Default check if has images
-            self.class_vars[cls] = var
-            chk = ttk.Checkbutton(scrollable_frame, text=f"{cls} ({count} images)", variable=var)
-            chk.pack(anchor="w", pady=2)
-            
-        def on_start():
-            selected = [cls for cls, var in self.class_vars.items() if var.get()]
-            unselected = [cls for cls, var in self.class_vars.items() if not var.get()]
-            
-            if len(selected) < 2:
-                messagebox.showerror("Error", "You must select at least 2 classes to train a model!")
-                return
-                
-            popup.destroy()
-            self.is_training = True
-            self.tcm_train_btn.config(state=tk.DISABLED)
-            
-            def cnn_thread():
-                try:
-                    # Move unselected classes to disabled_dir
-                    os.makedirs(disabled_dir, exist_ok=True)
-                    for cls in unselected:
-                        shutil.move(os.path.join(dataset_dir, cls), os.path.join(disabled_dir, cls))
-                        
-                    import subprocess
-                    import shlex
-                    cmd = ["gnome-terminal", "--wait", "--", "bash", "-c",
-                           f"cd {shlex.quote(str(app_paths.BASE_DIR))} && {shlex.quote(sys.executable)} {shlex.quote(str(train_script))}; read -p 'Press Enter to exit...'"]
-                    process = subprocess.Popen(cmd)
-                    process.wait()
-                    
-                except Exception:
-                    log.exception("CNN training could not be started")
-                finally:
-                    # Restore unselected classes
-                    if os.path.exists(disabled_dir):
-                        for cls in unselected:
-                            src = os.path.join(disabled_dir, cls)
-                            if os.path.exists(src):
-                                shutil.move(src, os.path.join(dataset_dir, cls))
-                                
-                    self.is_training = False
-                    self.after(0, lambda: self.tcm_train_btn.config(state=tk.NORMAL))
-                    
-            threading.Thread(target=cnn_thread, daemon=True).start()
-            
-        ttk.Button(popup, text="CONFIRM & TRAIN", style="Success.TButton", command=on_start).pack(pady=20, ipadx=20)
-
     def _start_yolo_train(self, arch=None):
-        if getattr(self, 'is_training', False):
+        if self._training_blocked():
             return
         if arch is None:        # buttons that do not pass an architecture use the selector of the Teaching CNN page
             arch = self.tcm_arch_var.get() if hasattr(self, 'tcm_arch_var') else ""
             if "YOLO" not in arch:
                 arch = "YOLO11-Classifier"
         self.is_training = True
-        self.tcm_train_btn.config(state=tk.DISABLED)
+        self.ann_train_btn.config(state=tk.DISABLED)
         
         def train_thread():
             try:
@@ -3161,7 +3186,7 @@ try:
     model = YOLO({base_model!r})
     results = model.train(
         data={temp_dataset_dir!r},
-        epochs={int(self.tcm_epochs.get())},
+        epochs={int(self.ann_epochs.get())},
         imgsz=224,
         project={str(app_paths.RUNS_DIR)!r},
         verbose=True, workers=0
@@ -3195,61 +3220,10 @@ except Exception as e:
                 log.exception("YOLO classifier training failed")
             finally:
                 self.is_training = False
-                self.after(0, lambda: self.tcm_train_btn.config(state=tk.NORMAL))
+                self.after(0, lambda: self.ann_train_btn.config(state=tk.NORMAL))
                 
         threading.Thread(target=train_thread, daemon=True).start()
 
-
-    def _verify_mismatches(self):
-        self.tcm_verify_btn.config(state=tk.DISABLED)
-        self.tcm_log.insert(tk.END, "\nStarting Dataset Verification...\n")
-        
-        def verify_thread():
-            try:
-                from ultralytics import YOLO
-                import glob
-                
-                model_path = self.tcm_base_model.get()
-                if not os.path.exists(model_path):
-                    self.after(0, lambda: self.tcm_log.insert(tk.END, f"Error: {model_path} not found.\n"))
-                    return
-                    
-                model = YOLO(model_path)
-                images = glob.glob(os.path.join(DATASET_DIR, "*.jpg"))
-                
-                mismatches = []
-                self.after(0, lambda: self.tcm_log.insert(tk.END, f"Checking {len(images)} images...\n"))
-                
-                for img_path in images:
-                    txt_path = img_path.replace(".jpg", ".txt")
-                    if not os.path.exists(txt_path): continue
-                    
-                    manual_labels = []
-                    with open(txt_path, 'r') as f:
-                        for line in f:
-                            if not line.strip(): continue
-                            manual_labels.append(int(line.split()[0]))
-                            
-                    if not manual_labels: continue
-                    
-                    results = model(img_path, verbose=False)
-                    if len(results) > 0:
-                        pred_classes = results[0].boxes.cls.cpu().numpy().astype(int).tolist()
-                        
-                        manual_set = set(manual_labels)
-                        pred_set = set(pred_classes)
-                        
-                        if manual_set != pred_set:
-                            mismatches.append(img_path)
-                            
-                self.after(0, lambda: self._show_mismatches(mismatches))
-                
-            except Exception as e:
-                self.after(0, lambda: self.tcm_log.insert(tk.END, f"Error: {e}\n"))
-            finally:
-                self.after(0, lambda: self.tcm_verify_btn.config(state=tk.NORMAL))
-                
-        threading.Thread(target=verify_thread, daemon=True).start()
 
     def _show_mismatches(self, mismatches):
         self.tcm_log.insert(tk.END, f"Found {len(mismatches)} mismatched images.\n")
@@ -3344,8 +3318,8 @@ except Exception as e:
         row2.pack(fill=tk.X, pady=2)
         
         ttk.Label(row2, text="Epochs:").pack(side=tk.LEFT, padx=(0,5))
-        self.tcm_epochs = tk.IntVar(value=100)
-        tk.Entry(row2, textvariable=self.tcm_epochs, width=5).pack(side=tk.LEFT, padx=(0,15))
+        self.ann_epochs = tk.IntVar(value=100)
+        tk.Entry(row2, textvariable=self.ann_epochs, width=5).pack(side=tk.LEFT, padx=(0,15))
         
         ttk.Label(row2, text="Base Model:").pack(side=tk.LEFT, padx=(0,5))
         self.tcm_base_model = tk.StringVar(value="yolo11n.pt")
@@ -3356,8 +3330,8 @@ except Exception as e:
         
         ttk.Button(row3, text="Cross Check Labels", style="Primary.TButton", command=self._launch_tcm_studio).pack(side=tk.LEFT, padx=(0,10))
         
-        self.tcm_train_btn = ttk.Button(row3, text="START TRAINING", style="Success.TButton", command=self._start_yolo_train)
-        self.tcm_train_btn.pack(side=tk.LEFT)
+        self.ann_train_btn = ttk.Button(row3, text="START TRAINING", style="Success.TButton", command=self._start_yolo_train)
+        self.ann_train_btn.pack(side=tk.LEFT)
         
         self.tcm_train_progress = ttk.Progressbar(train_frm, orient=tk.HORIZONTAL, mode='determinate')
         self.tcm_train_progress.pack(fill=tk.X, pady=(5,2))
@@ -4771,10 +4745,6 @@ except Exception as e:
         elif event.type == tk.EventType.ButtonRelease: self.shared_state.handle_mouse_up((x,y))
 
     def _update_loop(self):
-        if getattr(self, 'is_training', False):
-            self.after(500, self._update_loop)
-            return
-            
         try:
             (frame, geo) = self.display_queue.get_nowait()
             self.current_video_geometry = geo
@@ -4822,6 +4792,9 @@ except Exception as e:
         self._grading_tick = getattr(self, "_grading_tick", 0) + 1
         if self._grading_tick % 5 == 0:
             self._refresh_status()
+        if self._grading_tick % 50 == 1:
+            self._refresh_teaching()
+            self._fit_pills()
         if self._grading_tick % 10 == 0 and hasattr(self, "lbl_view_live"):
             self._refresh_grading_live()
 
@@ -5436,6 +5409,8 @@ except Exception as e:
             self.processing_thread.cashew_log.stop()
         if hasattr(self, 'ejector_check') and self.ejector_check.busy():
             self.ejector_check.stop()
+        if hasattr(self, 'processing_thread'):
+            self.processing_thread.capture.stop()
             
         print("[SYSTEM] Shutdown complete.")
         self.destroy()

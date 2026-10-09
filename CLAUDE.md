@@ -50,3 +50,7 @@
 - Plan: `PLAN.md` (English, current). Owner's requirements: `FINAL_PROMPT.txt`. Step order: (c1) done, then
   (e) UI, (c2), (c3), (d), (f).
 - `external_tools/` holds unmodified copies of the TCM tools; do not edit them.
+- Ported from the 5-track project (keep them close to the original): `ui_theme.py`, `teach_ui.py`, `dataset_ops.py`,
+  `production_capture.py`, `training.py`, `training_ui.py`. Training data: `programs/Default/{dataset,testset,inbox}`
+  (not in git), built by `dataset_import.py`; old `dataset/` folders are never moved or deleted.
+- UI checks without touching the owner's screen: start with `GSN_UI_OFFSCREEN=1` and photograph with `ui_debug.py`.

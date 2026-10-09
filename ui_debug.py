@@ -8,6 +8,9 @@ through the X server, which also works for a window that is covered or placed ou
 def place_offscreen(window, width=1920, height=1080):
     """Show a Tk window outside the visible screen (no title bar, no focus), so it can be photographed
     without appearing on the operator's display."""
+    if window.overrideredirect():               # already placed (the grader does it itself when GSN_UI_OFFSCREEN is set)
+        window.update()
+        return
     window.withdraw()                           # the window must be unmapped while its type changes
     window.update_idletasks()
     try:

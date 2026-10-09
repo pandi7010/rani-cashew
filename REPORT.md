@@ -4,6 +4,94 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-09 (9): Teaching CNN page rebuilt like the 5-track machine; clean dataset; production capture (INBOX)
+
+Reference: `TCM_CASHEWXAI_2026-10-06/source` (the five files are identical in `CNN/CNN/app`) and manual B8 / B9.
+
+### How it was done
+
+The 5-track modules were **ported**, not rewritten, so layout, look and behaviour are the same:
+`teach_ui.py` (the page), `dataset_ops.py` (confirm / test set / undo / warnings), `production_capture.py` (INBOX),
+`training.py` (training, label check, AI suggest), `training_ui.py` (class chooser, live training window,
+mismatch window). The sources on the drive are untouched. Adapted for this machine:
+
+| Change | Why |
+|---|---|
+| `training.py` reads every image through **`preprocess.py`** (`prepare_crop`: tight crop around the cashew, padded to a square) and uses `preprocess.build_transform` and `preprocess.load_cnn_checkpoint` | the same crop, padding, size and normalisation as live grading (the 5-track file had its own copy of that code) |
+| Thumbnails 152 x 112, compact class rows | 1920 px screen and 14 classes instead of 8 |
+| A switch for the production capture on the page (bottom of CLASSES) | no programs yet to hold that setting |
+| No password written in the code | CLEAR INBOX asks for the supervisor password; the first time you are asked to set one, only a salted hash is stored in `machine_config.json` |
+| Teaching YOLO keeps its own epochs box and button | they used to overwrite the CNN page's (a bug the 5-track project had fixed too) |
+
+### What the page has
+
+- **1 CAPTURE**: START AUTO CAPTURE, SNAPSHOT, Limit, CROP / FULL / BOTH. **2 LABEL**: AI SUGGEST, AUTO-LABEL TOOL, VERIFY LABELS, number of unlabelled. **3 TRAIN**: CNN MobileNetV2, Epochs (default 30), START TRAINING.
+- **Centre**: 5 x 5 image grid, click to select, arrows / PgUp / PgDn, PREV / NEXT, SELECT PAGE, DESELECT ALL, DELETE SELECTED; tabs CAPTURES and INBOX (INBOX adds CONFIRM ALL ON THIS PAGE AS SUGGESTED and CLEAR INBOX).
+- **Right**: classes with count / 1000 and a bar; keys 1-9 or a click move the selected images into the class; UNDO, ADD, DELETE, RENAME, COLOR; DATASET WARNINGS (fewer than 100, unbalanced); TRAINING panel with loss and validation accuracy per epoch, LAST RESULT with one line per class; ACTIVATE A MODEL opens AI Model Select.
+- **INBOX production capture while RUNNING** (5-track values): uncertain (confidence 0.40-0.85, or mixed classes, or an engine "would reject") 60 %, rejects 30 %, good 10 % (1 % of the sure good ones are candidates), 4 views per cashew, 5,000 images per day released hour by hour over 10 hours, 100,000 in the inbox, needs 20 GB free, **never deletes**, saved by its own thread (the frame loop only hands over a small copy of the crop). INBOX FULL / DISK SPACE LOW appear in the Home ALARMS box. Folder: `programs/Default/inbox/<date>/` with one JSON per cashew.
+- **Test set**: every 10th image confirmed from the INBOX goes to `programs/Default/testset/<class>/` and is never trained on. (As on the 5-track machine, images labelled from the CAPTURES tab all go to the dataset.)
+- **Training**: only when STOPPED; 20 % of every class held back for validation; best epoch kept; `<model>.json` with accuracy per class is written next to the model in `saved_models/`. **A new model is never activated**; the grader keeps `cashew_color_cnn_new.pth`.
+
+### Clean dataset: `programs/Default/dataset/` (one folder per final class name)
+
+Copied by `dataset_import.py` from `/home/phoenix/Documents/CNN_final/CNN/dataset` and from this project's
+`dataset/`. **Nothing was moved or deleted**: both sources have the same 2,217 files as before.
+GOOD -> GOOD_CASHEW, TESTA_SMALL -> TESTA SMALL, BACK_CUT_OIL and OIL_BACKCUT -> OIL. Every 10th image of a
+class went to the test set.
+
+| Class | Before | Imported | After (train) | Test set | Still needed to 1000 |
+|---|---|---|---|---|---|
+| GOOD_CASHEW | 0 | 619 | 558 | 61 | 442 |
+| UPW | 0 | 240 | 216 | 24 | 784 |
+| PKW1 | 0 | 199 | 180 | 19 | 820 |
+| PKW2 | 0 | 223 | 201 | 22 | 799 |
+| OIL | 0 | 69 | 63 | 6 | 937 |
+| BROWN | 0 | 117 | 106 | 11 | 894 |
+| DW1 | 0 | 0 | 0 | 0 | 1000 |
+| DW2 | 0 | 41 | 37 | 4 | 963 |
+| TESTA | 0 | 266 | 240 | 26 | 760 |
+| TESTA SMALL | 0 | 248 | 224 | 24 | 776 |
+| WHITE_DW | 0 | 21 | 19 | 2 | 981 |
+| SW | 0 | 0 | 0 | 0 | 1000 |
+| REJECTION | 0 | 93 | 84 | 9 | 916 |
+| EDGECUT | 0 | 2 | 2 | 0 | 998 |
+| **Total** | 0 | 2138 | 1930 | 208 | 12070 |
+
+- Left out: `DOUBLE_KERNELS` (52, not a final class), `Class_1` (1 full frame), 23 exact duplicates. No unreadable file.
+- **DW1 and SW have no image at all**; EDGECUT 2, WHITE_DW 19, DW2 37, OIL 63 are far too few. There are 15 SW images in `CNN_final/CNN/dataset_disabled/SW`; I did not import them because you named only the `dataset` folder. Say if they should go in.
+- The program folder is not in git (images). Run `python3 dataset_import.py` again at any time; it never copies an image twice.
+
+### Tested
+
+- `ast` check; **142 unit tests pass** (22 new): the 5-track tests of `dataset_ops` and `production_capture` (shares, hourly release, limits, never deletes, saver thread), the import tool (merge, test set, duplicates, full frames, source untouched), the password hash, and a **real small training run** (20 images, 2 epochs): images go through `preprocess.py`, 20 % held back, result file written, the checkpoint loads with the grader's loader.
+- The real window off-screen with a small dataset (110 images), fake PLC: 14 classes shown, warnings listed; 12 images labelled with a class and UNDO put them back; machine RUNNING on the simulated belt filled the inbox (about 50 images, 4 views per cashew, JSON per cashew, 0 skipped, 0 write errors); training refused while RUNNING; a **fake training run** of 30 epochs drew loss and validation accuracy and the result per class; the active CNN stayed the same.
+  Screenshots: `design/teaching_cnn_simulated.png`, `design/teaching_cnn_inbox_simulated.png`, `design/teaching_cnn_trained_simulated.png`.
+
+### Not tested
+
+- A full training on the real dataset (1,930 images) and its accuracy. AI SUGGEST, VERIFY LABELS and the mismatch window on real data. The AUTO-LABEL TOOL button only starts the existing `ai_auto_labeler.py`.
+- Production capture with the real camera at production speed (AI fps with capture ON: please compare).
+- CLEAR INBOX and the password dialogs (they need typing; the hash logic is unit-tested).
+
+### To know
+
+- Production capture is **ON** by default and writes up to 5,000 images a day into `programs/Default/inbox`. The switch is at the bottom of the CLASSES column.
+- AI SUGGEST and VERIFY LABELS use the active CNN, which knows 11 classes and has no REJECTION, DW1, EDGECUT.
+- The old Teaching CNN page (YOLO-classifier options, text log) is replaced. Teaching YOLO, AI Model Select (test-set comparison, PASS / FIRE popup) and Dataset Capture are still the older pages: step (e4).
+
+### How to test
+
+```
+cd /home/phoenix/Documents/GSN_V21/CNN
+python3 cashew_cnn_grader.py        # Teaching CNN in the left menu
+```
+
+1. The CLASSES column shows the 14 classes with the counts of the table above.
+2. Machine STOPPED: START TRAINING, choose the classes with enough images, CONFIRM & TRAIN. A window shows every epoch. Afterwards LAST RESULT shows the accuracy per class; the new model is in `saved_models/` and is not active.
+3. Machine RUNNING with cashews for a few minutes, then INBOX tab: select images, press 1-9 or click a class.
+
+---
+
 ## 2026-10-09 (8): Automatic EJECTOR CHECK (relays 1-40, 5 pulses each, read-back, operator marks)
 
 ### What was built

@@ -18,6 +18,13 @@ NAV_ICONS_DIR = ASSETS_DIR / "nav_icons"
 RUNS_DIR = BASE_DIR / "runs"
 LOGS_DIR = BASE_DIR / "logs"
 AUTO_LABELER_SCRIPT = BASE_DIR / "ai_auto_labeler.py"
+# The active program's data (5-track layout: programs/<name>/dataset, testset, inbox). One program until (e3).
+PROGRAM_NAME = "Default"
+PROGRAM_DIR = BASE_DIR / "programs" / PROGRAM_NAME
+CLEAN_DATASET_DIR = PROGRAM_DIR / "dataset"            # one folder per final class name, used for training
+TESTSET_DIR = PROGRAM_DIR / "testset"                  # every 10th confirmed image; never trained on
+INBOX_DIR = PROGRAM_DIR / "inbox"                      # production capture, unlabelled
+MACHINE_CONFIG_PATH = BASE_DIR / "machine_config.json" # belongs to the machine, not to a program (not in git)
 FFC_GAIN_MAP_PATH = BASE_DIR / "ffc_gain_map.png"      # white calibration (flat-field) map
 RECORDINGS_DIR = BASE_DIR / "recordings"                # camera frames recorded for replay tests
 

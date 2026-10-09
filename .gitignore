@@ -8,3 +8,4 @@ temp_train.py
 temp_results.json
 docs/*.pdf
 machine_config.json
+programs/
