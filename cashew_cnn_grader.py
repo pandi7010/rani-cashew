@@ -936,21 +936,31 @@ class ProcessingThread(threading.Thread):
         self.cnn_classes = []
         self.cnn_device = None
         self.cnn_transform = None
-        if _CNN_AVAILABLE and CNN_MODEL_PATH.exists():
-            try:
-                self.cnn_device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
-                self.cnn_model, self.cnn_classes = preprocess.load_cnn_checkpoint(CNN_MODEL_PATH, self.cnn_device)
-                self.cnn_transform = preprocess.build_transform(train=False)
-                # CNN classes are looked up by name; names YOLO does not have get an ID after the YOLO IDs.
-                self.registry.add_names(self.cnn_classes)
-                log.info("[CNN] Loaded %s (%d classes: %s)", CNN_MODEL_PATH.name, len(self.cnn_classes), self.cnn_classes)
-            except Exception:
-                self.cnn_model = None
-                log.exception("[CNN] Failed to load %s", CNN_MODEL_PATH)
+        self.cnn_path = None
+        if _CNN_AVAILABLE:
+            self.cnn_transform = preprocess.build_transform(train=False)
+            self.reload_cnn_model(active_cnn_path())
         else:
-            log.warning("[CNN] %s not found or PyTorch missing - YOLO classes are used.", CNN_MODEL_PATH)
+            log.warning("[CNN] PyTorch missing - YOLO classes are used.")
 
         log.info("Class names in use: %s", self.registry.snapshot())
+
+    def reload_cnn_model(self, path) -> bool:
+        """Load a CNN checkpoint (at start, or when a model is activated while STOPPED). The old model stays on a failure."""
+        path = Path(path)
+        if not path.exists():
+            log.warning("[CNN] %s not found - YOLO classes are used.", path)
+            return False
+        try:
+            device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
+            model, classes = preprocess.load_cnn_checkpoint(path, device)
+        except Exception:
+            log.exception("[CNN] Failed to load %s", path)
+            return False
+        self.cnn_device, self.cnn_classes, self.cnn_model, self.cnn_path = device, classes, model, path
+        self.registry.add_names(classes)     # names YOLO does not have get an ID after the YOLO IDs
+        log.info("[CNN] Loaded %s (%d classes: %s)", path.name, len(classes), classes)
+        return True
 
     def _cnn_predict(self, crop_bgr: np.ndarray):
         """Run CNN on a BGR crop already cut to the cashew. Returns (class_name, confidence) or (None, 0.0)."""
@@ -1605,6 +1615,19 @@ class NavButton(tk.Frame):
         self.text_lbl.config(bg=bg_col, fg=fg_col)
 
 
+def active_cnn_path() -> Path:
+    """The CNN checkpoint in use: the one activated on AI Model Select (saved_models/active_models.json),
+    otherwise the delivered one."""
+    try:
+        with open(app_paths.ACTIVE_MODELS_PATH, "r", encoding="utf-8") as f:
+            path = Path(MODEL_ROOT) / str(json.load(f).get("cnn_model", ""))
+        if path.is_file():
+            return path
+    except (OSError, ValueError):
+        pass
+    return CNN_MODEL_PATH
+
+
 # ---------------- Main GUI Application ----------------
 
 def _software_version() -> str:
@@ -1877,7 +1900,7 @@ class App(tk.Tk):
         nav_frm.pack_propagate(False)
         tk.Frame(body_frm, bg=ui.BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y)
         tk.Frame(nav_frm, bg=ui.PANEL, height=14).pack(fill=tk.X)
-        nav_items = ["Home", "Pneumatic", "Sorting Logic", "Colour Size", "Vision ROI", "Teaching CNN", "Dataset Capture", "Teaching YOLO", "AI Model Select", "Test Console", "Network"]
+        nav_items = ["Home", "Pneumatic", "Sorting Logic", "Colour Size", "Vision ROI", "Teaching CNN", "Dataset Capture", "Teaching YOLO", "AI Model Select", "Test Console", "Network", "Info"]
         self.nav_buttons = {}
         for item in nav_items:
             btn = ui.NavItem(nav_frm, item, command=lambda i=item: self._switch_page(i))
@@ -1936,6 +1959,7 @@ class App(tk.Tk):
         self._build_teaching_console_page()
         self._build_colour_size_page()
         self._build_test_console_page()
+        self._build_info_page()
         self._switch_page("Home")
 
     def _fit_pills(self):
@@ -1953,6 +1977,97 @@ class App(tk.Tk):
                 pill.set_level(level)
         self._pill_level = level
 
+    # ------------------------------------------------------------------ Info page (only facts the software knows)
+    def _build_info_page(self):
+        F = ui.FONT
+        page = tk.Frame(self.page_container, bg=ui.BG)
+        self.pages["Info"] = page
+        self._info_rows = {}
+
+        def card(parent, title, side, width=None):
+            box = tk.Frame(parent, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER, width=width or 1)
+            box.pack(side=side, fill=tk.BOTH, expand=width is None, padx=(0, 0 if side == tk.RIGHT else 16), pady=(0, 16))
+            if width:
+                box.pack_propagate(False)
+            tk.Label(box, text=title, font=(F, ui.F_SMALL, "bold"), fg=ui.MUTED, bg=ui.PANEL, anchor="w").pack(fill=tk.X, padx=20, pady=(16, 8))
+            return box
+
+        left = None
+
+        def row(box, key, label):
+            line = tk.Frame(box, bg=ui.PANEL)
+            line.pack(fill=tk.X, padx=20, pady=5)
+            tk.Label(line, text=label, font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.PANEL, width=24, anchor="w").pack(side=tk.LEFT)
+            value = tk.Label(line, text="-", font=(F, ui.F_BODY), fg=ui.TEXT, bg=ui.PANEL, anchor="w", justify="left",
+                             wraplength=370 if box is left else 760)
+            value.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            self._info_rows[key] = value
+
+        top = tk.Frame(page, bg=ui.BG)
+        top.pack(fill=tk.BOTH, expand=True)
+        left = card(top, "PRODUCT", tk.LEFT, width=620)
+        self._info_logo = None
+        try:
+            logo = Image.open(app_paths.ASSETS_DIR / "cashew_x_ai_logo_clean.png").convert("RGB")
+            logo = logo.resize((480, round(logo.height * 480 / logo.width)), Image.LANCZOS)
+            self._info_logo = ImageTk.PhotoImage(logo)
+            tk.Label(left, image=self._info_logo, bg=ui.PANEL, bd=0).pack(anchor="w", padx=20, pady=(0, 12))
+        except Exception:
+            pass
+        tk.Label(left, text="TCM CASHEW X AI", font=(F, ui.F_KPI, "bold"), fg=ui.TEXT, bg=ui.PANEL, anchor="w").pack(fill=tk.X, padx=20)
+        tk.Label(left, text="GSN V21  -  2 ROIs, 40 ejectors", font=(F, ui.F_BODY, "bold"), fg=ui.ACCENT, bg=ui.PANEL, anchor="w").pack(fill=tk.X, padx=20, pady=(0, 12))
+        for key, label in (("version", "Software (git commit)"), ("program", "Active program"), ("mode", "Ejector mode"),
+                           ("auto", "AUTO LEARNING"), ("samples", "Confirmed samples"), ("capture", "Production capture")):
+            row(left, key, label)
+
+        right = tk.Frame(top, bg=ui.BG)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        hardware = card(right, "HARDWARE", tk.TOP)
+        for key, label in (("camera", "Camera"), ("camera_state", "Camera state"), ("plc", "Controller"), ("plc_state", "Controller state"),
+                           ("ejectors", "Ejectors"), ("timing", "Valve timing")):
+            row(hardware, key, label)
+        software = card(right, "SOFTWARE", tk.TOP)
+        for key, label in (("yolo", "Detection model"), ("cnn", "Grading model"), ("engines", "Inspection engines"), ("tracking", "Tracking"), ("logs", "Logs")):
+            row(software, key, label)
+        today = card(right, "SINCE THE LAST RESET", tk.TOP)
+        for key, label in (("counts", "Results"), ("check", "Ejector check")):
+            row(today, key, label)
+
+    def _refresh_info(self):
+        if not self.pages["Info"].winfo_ismapped():
+            return
+        ss, cam, out = self.shared_state, self.camera_thread, self.relay_output
+        info = cam.info or {}
+        enabled, samples, target = self._auto_learning_status()
+        with ss.lock:
+            g = copy.deepcopy(ss.grading)
+            counts = dict(ss.result_counts)
+            capture_on = bool(ss.capture_cfg.get("enabled"))
+        total = sum(n for k, n in counts.items() if not k.startswith("UNDEFINED: "))
+        values = {
+            "version": _software_version(), "program": self.active_program_name,
+            "mode": ("DRY-RUN (nothing is sent to the PLC)" if out.dry_run else "LIVE (real valves)") + f",  MASTER EJECTOR {'ON' if out.master_enabled else 'OFF'}",
+            "auto": ("ON" if enabled else "OFF") + "   (planned, not active in this version)",
+            "samples": f"{ui.thousands(samples)} / {ui.thousands(target)}",
+            "capture": ("ON" if capture_on else "OFF") + f"   ({self.processing_thread.capture.blocking_reason()})",
+            "camera": f"{info.get('vendor', '')} {info.get('model', '-')}   serial {info.get('serial', '-')}   {info.get('pixel_format', '')}".strip(),
+            "camera_state": f"{cam.state},  {cam.fps:.0f} fps",
+            "plc": f"Inovance PLC, Modbus TCP {getattr(self.controller, 'plc_ip', '?')}:{getattr(self.controller, 'plc_port', '?')}, coils M100-M139",
+            "plc_state": "ONLINE" if self.controller.is_connected() else "OFFLINE",
+            "ejectors": "40 (ROI 1: 1-20, ROI 2: 21-40); 1 and 21 are the reject ejectors; M140 conveyor and M141 feeder are never used as ejectors",
+            "timing": f"delay = distance / speed - pulse / 2;  speed {ss.conveyor_speed_mm_s:g} mm/s, pulse {ss.common_pulse_ms} ms (Pneumatic page)",
+            "yolo": os.path.basename(str(ss.yolo_model_path or "-")),
+            "cnn": f"{Path(self._active_cnn_path()).name}   ({', '.join(self.processing_thread.cnn_classes) or 'not loaded'})",
+            "engines": ",  ".join(f"{engines.ENGINES[name][0]} {mode}" for name, mode in {**engines.ENGINE_DEFAULTS, **g.get('engines', {})}.items()),
+            "tracking": "per ROI, cashew IDs R1-000001 ..., one decision at the Decision line",
+            "logs": "logs/cashews_<date>.csv, frames_<date>.jsonl, manual_fire_<date>.csv, ejector_check_<date>.csv, admin_changes.log",
+            "counts": f"decided {total}:   " + (",  ".join(f"{k} {n}" for k, n in sorted(counts.items()) if not k.startswith("UNDEFINED: ")) or "-"),
+            "check": self.ejector_check.last_summary[0],
+        }
+        for key, text in values.items():
+            if self._info_rows[key].cget("text") != text:
+                self._info_rows[key].config(text=text)
+
     def _refresh_teaching(self):
         """Production capture settings to its thread; Teaching CNN page redrawn while it is shown."""
         try:
@@ -1961,6 +2076,9 @@ class App(tk.Tk):
                                                       "yolo": os.path.basename(str(self.shared_state.yolo_model_path or ""))})
         except Exception:
             _throttle.exception("capture_cfg", "Production capture could not be configured")
+        if getattr(self, "model_page", None) is not None and self.pages["AI Model Select"].winfo_ismapped():
+            self.model_page.refresh()
+        self._refresh_info()
         page = getattr(self, "teach_page", None)
         if page is not None and self.pages["Teaching CNN"].winfo_ismapped():
             capturing = self.shared_state.is_golden_capture_active()
@@ -2316,7 +2434,13 @@ class App(tk.Tk):
 
         # PAGE: AI Model
         p_model = tk.Frame(self.page_container, bg=self.colors["surface"], padx=15, pady=15)
-        self.pages["AI Model Select"] = p_model
+        self.pages["AI Model Old"] = p_model          # replaced by model_ui.ModelPage below
+        import model_ui
+        p_models = tk.Frame(self.page_container, bg=ui.BG)
+        self.pages["AI Model Select"] = p_models
+        self.model_page = model_ui.ModelPage(
+            self, p_models, str(MODEL_ROOT), self._active_model_name, self._activate_model, lambda: self.shared_state.phase == "RUNNING",
+            self._class_settings, self._apply_class_settings, lambda: str(app_paths.TESTSET_DIR))
         ttk.Label(p_model, text="YOLO MODEL UPLOAD", style="Title.TLabel").pack(anchor="w", pady=(0, 20))
         
         upload_frm = tk.Frame(p_model, bg=self.colors["surface"])
@@ -2992,7 +3116,55 @@ class App(tk.Tk):
 
     def _active_cnn_path(self):
         """The CNN checkpoint the grader is using now."""
-        return CNN_MODEL_PATH
+        return active_cnn_path()
+
+    # ── Model activation (AI Model Select page, model_ui.py) ──
+    def _active_model_name(self, kind):
+        if kind == "CNN":
+            return Path(self._active_cnn_path()).name
+        return os.path.basename(str(self.shared_state.yolo_model_path or "")) or Path(str(getattr(self.processing_thread, "model_path", "") or "")).name
+
+    def _activate_model(self, kind, name, path):
+        """Make a model file the active one (called only after the class changes were confirmed, machine STOPPED)."""
+        if kind == "YOLO":
+            with self.shared_state.lock:
+                self.shared_state.yolo_model_path = app_paths.relative(path)
+            self.shared_state.save_to_config(CFG_PATH)
+            self.processing_thread.reload_model(path)
+        else:
+            if not self.processing_thread.reload_cnn_model(path):
+                messagebox.showerror("Activate model", f"{name} could not be loaded. The model in use was not changed.")
+                return
+            with open(app_paths.ACTIVE_MODELS_PATH, "w", encoding="utf-8") as f:
+                json.dump({"cnn_model": name}, f)
+        log.info("[MODELS] %s model activated: %s", kind, name)
+
+    def _class_settings(self):
+        """(FIRE classes, PASS classes) as stored now. PASS = counts as "no defect"; FIRE = a defect (its ejector, or reject)."""
+        with self.shared_state.lock:
+            g = self.shared_state.grading
+            good = [str(c).upper() for c in g.get("good_classes", [])]
+            fire = [str(c).upper() for c in list(g.get("priority", [])) + list(g.get("reject_classes", [])) + [decision.REJECTION, decision.DOUBLE_CLASS]]
+        return [c for c in fire if c not in good], good
+
+    def _apply_class_settings(self, choice):
+        """Store the confirmed PASS / FIRE setting of every class of a newly activated model."""
+        with self.shared_state.lock:
+            g = copy.deepcopy(self.shared_state.grading)
+        good = {normalize_name(c): c for c in g.get("good_classes", [])}
+        known_fire = {normalize_name(c) for c in list(g.get("priority", [])) + list(g.get("reject_classes", [])) + [decision.REJECTION, decision.DOUBLE_CLASS]}
+        for name, value in choice.items():
+            key = normalize_name(name)
+            if value == "PASS":
+                good.setdefault(key, name)
+            else:
+                good.pop(key, None)
+                if key not in known_fire:           # a new defect class: lowest priority until it is moved on Sorting Logic
+                    g["priority"] = list(g.get("priority", [])) + [name]
+                    known_fire.add(key)
+        g["good_classes"] = list(good.values())
+        self.shared_state.set_grading(g)
+        log.info("[MODELS] class settings after activation: PASS %s, priority %s", g["good_classes"], g["priority"])
 
     def _set_production_capture(self, on):
         with self.shared_state.lock:
@@ -3920,7 +4092,7 @@ except Exception as e:
 
     # Settings-only pages use the whole width; the camera picture is shown where it is needed
     # (Home, Vision ROI, Dataset Capture; Teaching YOLO and Test Console have their own picture).
-    PAGES_WITHOUT_CAMERA = ("Pneumatic", "Teaching CNN", "Colour Size", "Sorting Logic", "AI Model Select", "Network")
+    PAGES_WITHOUT_CAMERA = ("Pneumatic", "Teaching CNN", "Colour Size", "Sorting Logic", "AI Model Select", "Network", "Info")
 
     def _switch_page(self, page_name):
         if hasattr(self, 'active_page'): self.active_page.set(page_name)
