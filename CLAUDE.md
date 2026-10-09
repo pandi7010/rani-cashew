@@ -56,4 +56,8 @@
 - Ported from the 5-track project (keep them close to the original): `ui_theme.py`, `teach_ui.py`, `dataset_ops.py`,
   `production_capture.py`, `training.py`, `training_ui.py`. Training data: `programs/Default/{dataset,testset,inbox}`
   (not in git), built by `dataset_import.py`; old `dataset/` folders are never moved or deleted.
+- Teaching CNN additions that are NOT in the 5-track files (marked `GSN_V21` in the code): CONFUSION folder
+  (`programs/<name>/confusion`, never trained), trash (`programs/<name>/trash`, never emptied by the program), multi-step
+  undo (`dataset_ops.Changes`, `logs/dataset_changes.log`), `training_report.py` (graphs next to the model).
+- Whole-program self-test with a fake PLC: `python3 tools/ui_selftest.py design/pages [tools/selftest_teaching.py]`.
 - UI checks without touching the owner's screen: start with `GSN_UI_OFFSCREEN=1` and photograph with `ui_debug.py`.

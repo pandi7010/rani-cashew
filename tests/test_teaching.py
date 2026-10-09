@@ -14,6 +14,7 @@ import dataset_ops as ops
 import preprocess
 import supervisor
 import training
+import training_report
 
 
 def cashew(path, colour=(190, 225, 235), size=(120, 90), seed=0):
@@ -131,6 +132,79 @@ class TrainingTest(unittest.TestCase):
             self.assertEqual(names, ["GOOD_CASHEW", "BROWN"])
             predictions = training.predict_images(model_path, [os.path.join(data, "BROWN", "b0.jpg")])
             self.assertIn(list(predictions.values())[0][0], names)
+            # GSN_V21: per-epoch training / validation loss and accuracy, confusion matrix, precision / recall, report pictures
+            self.assertTrue({"train_acc", "val_loss"} <= set(rows[0]))
+            self.assertEqual(sum(sum(r) for r in saved["confusion_matrix"]), 4)
+            self.assertTrue({"precision", "recall", "accuracy"} <= set(saved["per_class"]["BROWN"]))
+            self.assertEqual(saved["wrong_images_total"], len(saved["wrong_images"]))
+            for kind in ("curves", "classes", "confusion"):
+                self.assertTrue(os.path.getsize(result["reports"][kind]) > 5000, kind)
+            self.assertEqual(sorted(t for t, _ in training_report.existing_reports(model_path)),
+                             ["VALIDATION: CLASSES", "VALIDATION: CONFUSION", "VALIDATION: CURVES"])
+            # label check with a confidence limit: every image is listed as a mismatch or as unsure
+            check = training.verify_labels(model_path, data, low_confidence=1.01)
+            self.assertEqual(check["checked"], 20)
+            self.assertEqual(len(check["mismatches"]), 20)
+            self.assertEqual({m["kind"] for m in check["mismatches"]} - {"MISMATCH", "LOW CONFIDENCE"}, set())
+            self.assertEqual(len(training.verify_labels(model_path, data)["mismatches"]), sum(m["kind"] == "MISMATCH" for m in check["mismatches"]))
+            # a check on labelled folders without touching the model
+            before = os.path.getmtime(model_path)
+            folder_result = training.confusion_on_folder(model_path, data)
+            self.assertEqual((folder_result["images"], folder_result["classes"], folder_result["skipped"]), (20, names, {"OIL": 1}))
+            self.assertEqual(os.path.getmtime(model_path), before)
+
+
+class ReportAndChangesTest(unittest.TestCase):
+    def test_class_metrics_and_fire_warning(self):
+        matrix = [[98, 2, 0], [5, 45, 0], [0, 1, 9]]          # GOOD, TESTA, OIL
+        m = training_report.class_metrics(matrix, ["GOOD_CASHEW", "TESTA", "OIL"])
+        self.assertEqual((m["GOOD_CASHEW"]["accuracy"], m["TESTA"]["accuracy"], m["OIL"]["accuracy"]), (0.98, 0.9, 0.9))
+        self.assertEqual(m["TESTA"]["precision"], round(45 / 48, 4))
+        self.assertEqual(m["GOOD_CASHEW"]["recall"], 0.98)
+        low = training_report.fire_warnings(m, pass_classes=["GOOD_CASHEW"])
+        self.assertEqual(low, [("TESTA", 0.9), ("OIL", 0.9)])                 # the PASS class is not a FIRE class
+        self.assertEqual(training_report.fire_warnings({"UPW": {"accuracy": 0.985}}), [])
+        self.assertEqual(training_report.fire_warnings({"UPW": {"accuracy": None}}), [])
+
+    def test_confusion_folder_undo_trash_and_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data, logs = os.path.join(tmp, "prog", "dataset"), os.path.join(tmp, "logs")
+            paths = []
+            for n in range(4):
+                path = os.path.join(data, "TESTA", f"t{n}.jpg")
+                cashew(path, seed=n)
+                paths.append(path)
+            changes = ops.Changes(logs)
+            self.assertIsNone(changes.undo())
+            # 1. out of training into CONFUSION (beside the dataset, under the class it came from)
+            changes.add("MOVE TO CONFUSION", ops.move_to_confusion(paths[:2], data))
+            self.assertEqual(ops.class_counts(data)["TESTA"], 2)
+            self.assertEqual([i["former"] for i in ops.list_confusion(data)], ["TESTA", "TESTA"])
+            self.assertFalse(ops.confusion_dir(data).startswith(os.path.abspath(data)))
+            self.assertNotIn("CONFUSION", training.list_class_images(data))  # training never sees it
+            # 2. re-label one of them: it joins training again
+            again = ops.list_confusion(data)[0]["path"]
+            changes.add("RE-LABEL from CONFUSION to UPW", ops.confirm_images([again], "UPW", data, os.path.join(tmp, "prog", "testset"), use_testset=False))
+            self.assertEqual((ops.class_counts(data)["UPW"], ops.confusion_count(data)), (1, 1))
+            # 3. delete = trash, so it can be undone
+            changes.add("DELETE", ops.trash_images([paths[3]], data))
+            self.assertFalse(os.path.exists(paths[3]))
+            self.assertEqual(ops.class_counts(data)["TESTA"], 1)
+            # multi-step undo, newest first
+            self.assertEqual(changes.last_action(), "DELETE (1 image(s))")
+            self.assertEqual(changes.undo(), ("DELETE", 1))
+            self.assertTrue(os.path.exists(paths[3]))
+            self.assertEqual(changes.undo()[0], "RE-LABEL from CONFUSION to UPW")
+            self.assertEqual((ops.class_counts(data).get("UPW", 0), ops.confusion_count(data)), (0, 2))
+            self.assertEqual(changes.undo(), ("MOVE TO CONFUSION", 2))
+            self.assertEqual((ops.class_counts(data)["TESTA"], ops.confusion_count(data)), (4, 0))
+            self.assertFalse(changes.can_undo())
+            with open(os.path.join(logs, ops.CHANGES_LOG), encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            self.assertEqual(len(lines), 2 + 1 + 1 + 3)                       # one line per moved file, one per undo
+            self.assertIn("MOVE TO CONFUSION: ", lines[0])
+            self.assertIn(" -> ", lines[0])
+            self.assertIn("UNDO DELETE: 1 of 1 image(s) put back", lines[4])
 
 
 if __name__ == "__main__":

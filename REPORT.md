@@ -4,6 +4,49 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-10 (2): PART B - Teaching CNN: CHECK CONFUSION, CONFUSION folder, multi-step UNDO, large view, training graphs
+
+| # | Asked | What is there now |
+|---|---|---|
+| 1 | CHECK CONFUSION before training | Button in step 2 LABEL (it replaces VERIFY LABELS). The **active** model runs on every labelled image; the list shows MISMATCH (model disagrees with the folder) and LOW CONFIDENCE (agrees, below 60 %). Per image: LABEL IS RIGHT - KEEP, MOVE TO THE MODEL'S CLASS, MOVE TO THIS CLASS (any class), MOVE TO CONFUSION, DELETE, UNDO. STOPPED only. |
+| 2 | After training | The result file stores the images the new model still gets wrong (all training + validation images). Training panel: **STILL WRONG: n - REVIEW** opens the same list; **MOVE ALL LISTED TO CONFUSION** = one click (asks once). CONFUSION is `programs/Default/confusion/<class it came from>/`, beside the dataset, so no training reads it. |
+| 3 | CONFUSION review | Third tab of the grid (CAPTURES / INBOX / CONFUSION), also the CONFUSION row under the class list. Thumbnails show "was: <class>". Press 1-9 or click a class = re-label (joins training again); DELETE SELECTED. |
+| 4 | Multi-step UNDO + log | UNDO takes back one action per press, as many as were done since the program started: label, re-label, move, move to CONFUSION, delete, also those made in the review windows. Delete moves the image to `programs/Default/trash/<time>/` (that is what makes it undoable; the program never empties the trash). Every moved file and every undo is a line in `logs/dataset_changes.log`. |
+| 5 | OPEN FOLDER, large view | Folder sign on every class row and on CONFUSION, OPEN FOLDER under the grid (captures / inbox / confusion): opens Ubuntu Files. Double click on any thumbnail (and on the picture in the review window) = large view. |
+| 6 | Graphs | Per epoch: training loss, validation loss, training accuracy, validation accuracy. After training: precision / recall / accuracy bars per class and a confusion-matrix heatmap. Saved next to the model as `<model>_curves.png`, `_classes.png`, `_confusion.png`. Button GRAPHS on the Teaching CNN panel and on each CNN card in AI Model Select. |
+| 7 | FIRE classes, 98 % | LAST RESULT marks every class PASS or FIRE; a FIRE class is green only at 98 % or more. Red line "WARNING: FIRE classes below 98 %: ..." on the Teaching CNN panel, on the model card in AI Model Select, and red bars in the class graph. |
+
+Also new: **TEST SET REPORT** on each CNN card (AI Model Select): confusion matrix and per-class bars of that model on the
+test set. It writes only `<model>_testset_*.png`; model and result file are not changed. This is how your model
+`cnn_Default_20261010_005648` (trained before the graphs existed) can get its pictures. I did not run it on your model;
+its files are untouched.
+
+**Not carried over from the 5-track page:** double click on a capture used to open the auto-label tool with that image; it
+is now the large view (the AUTO-LABEL TOOL button is still there).
+
+### Tested
+
+- 169 unit tests pass (new: metrics and the 98 % rule, CONFUSION folder outside the dataset, trash, 3-step undo, the log,
+  per-epoch numbers, report pictures, low-confidence listing, test-set matrix without touching the model).
+- `python3 tools/ui_selftest.py design/pages tools/selftest_teaching.py`: in the real window, on a **temporary copy** of
+  240 dataset images with 4 labels made wrong on purpose and a 6-epoch model: CHECK CONFUSION found 4 of 4; move / confusion /
+  delete / keep and 3 x UNDO restored the exact counts; STILL WRONG -> all to CONFUSION (training then saw fewer images);
+  CONFUSION tab re-label and delete, UNDO back to the start, trash empty; folder buttons call `xdg-open` with the right
+  folders; graphs and test-set report shown. Screenshots `design/pages/30...36`.
+
+### Not tested
+
+- On your full dataset (I did not run a check or a training on it), and Ubuntu Files really opening (the self-test only
+  records the call). Graph numbers of the 6-epoch test model mean nothing; they only show the pictures work.
+
+### How to test
+
+1. Teaching CNN, machine STOPPED. CHECK CONFUSION uses the active model (now the old `cashew_color_cnn_new.pth`; classes it
+   does not know are skipped and named). To check with your new model, activate it first in AI Model Select.
+2. Train again (START TRAINING): after it, GRAPHS and STILL WRONG are filled.
+
+---
+
 ## 2026-10-10 (1): After the power cut; PART A - DRY-RUN and MASTER EJECTOR removed, pulse buttons fire the real PLC
 
 ### Check after the power cut

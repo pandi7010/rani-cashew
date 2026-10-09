@@ -193,3 +193,111 @@ def retrain_classes(dataset_dir):
     """Classes that gained RETRAIN_AFTER or more confirmed images since the last training."""
     since = read_state(dataset_dir)["since_training"]
     return {name: count for name, count in since.items() if int(count) >= RETRAIN_AFTER}
+
+
+# ====================================================================== GSN_V21 additions (not in the 5-track file)
+# CONFUSION folder (images the model keeps getting wrong: left out of training until re-labelled), deletes that can
+# be undone (a trash folder), a multi-step undo journal and logs/dataset_changes.log.
+import time
+
+CONFUSION = "CONFUSION"
+CHANGES_LOG = "dataset_changes.log"
+
+
+def confusion_dir(dataset_dir):
+    """programs/<name>/confusion: beside the dataset, so no training ever reads it."""
+    return os.path.join(os.path.dirname(os.path.abspath(str(dataset_dir))), "confusion")
+
+
+def trash_dir(dataset_dir):
+    return os.path.join(os.path.dirname(os.path.abspath(str(dataset_dir))), "trash")
+
+
+def list_confusion(dataset_dir):
+    """Images in the CONFUSION folder, newest first; 'suggested' is the class they were labelled as before."""
+    root, items = confusion_dir(dataset_dir), []
+    if os.path.isdir(root):
+        for former in sorted(os.listdir(root)):
+            folder = os.path.join(root, former)
+            if os.path.isdir(folder):
+                items += [{"path": path, "suggested": former, "confidence": 0.0, "former": former} for path in list_images(folder)]
+    items.sort(key=lambda item: os.path.getmtime(item["path"]), reverse=True)
+    return items
+
+
+def confusion_count(dataset_dir):
+    return len(list_confusion(dataset_dir))
+
+
+def move_images(paths, target_folder):
+    """Move images into a folder (name clashes get a number). Returns [(old path, new path)] for undo."""
+    moves = []
+    os.makedirs(target_folder, exist_ok=True)
+    for path in paths:
+        if os.path.exists(path) and os.path.abspath(os.path.dirname(path)) != os.path.abspath(target_folder):
+            target = _free_name(target_folder, os.path.basename(path))
+            shutil.move(path, target)
+            moves.append((path, target))
+    return moves
+
+
+def move_to_confusion(paths, dataset_dir):
+    """Take images out of training: confusion/<the class folder they were in>/. Returns the moves."""
+    moves = []
+    for path in paths:
+        former = os.path.basename(os.path.dirname(os.path.abspath(path))) or "UNLABELLED"
+        moves += move_images([path], os.path.join(confusion_dir(dataset_dir), former))
+    return moves
+
+
+def trash_images(paths, dataset_dir):
+    """"Delete": the images go into trash/<time>/<their folder name>/ so the delete can be undone.
+    The trash is never emptied by the program."""
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    moves = []
+    for path in paths:
+        former = os.path.basename(os.path.dirname(os.path.abspath(path)))
+        moves += move_images([path], os.path.join(trash_dir(dataset_dir), stamp, former))
+    return moves
+
+
+class Changes:
+    """Multi-step undo for every move and delete of the teaching pages, with a line per file in the log."""
+
+    def __init__(self, log_dir=None):
+        self.log_dir = log_dir
+        self.stack = []             # [(action text, [(old path, new path)])]
+
+    def _log(self, text):
+        if not self.log_dir:
+            return
+        try:
+            os.makedirs(str(self.log_dir), exist_ok=True)
+            with open(os.path.join(str(self.log_dir), CHANGES_LOG), "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {text}\n")
+        except OSError:
+            pass
+
+    def add(self, action, moves):
+        """Remember one action (a list of moves) so it can be undone, and log every file of it."""
+        if not moves:
+            return 0
+        self.stack.append((action, list(moves)))
+        for old, new in moves:
+            self._log(f"{action}: {old} -> {new}")
+        return len(moves)
+
+    def can_undo(self):
+        return bool(self.stack)
+
+    def last_action(self):
+        return f"{self.stack[-1][0]} ({len(self.stack[-1][1])} image(s))" if self.stack else ""
+
+    def undo(self):
+        """Take back the last action. Returns (action, images restored) or None when there is nothing to undo."""
+        if not self.stack:
+            return None
+        action, moves = self.stack.pop()
+        restored = undo_moves(moves)
+        self._log(f"UNDO {action}: {restored} of {len(moves)} image(s) put back")
+        return action, restored

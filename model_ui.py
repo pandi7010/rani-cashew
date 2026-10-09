@@ -261,6 +261,47 @@ class ModelPage:
             button = hu.FlatButton(bottom, "SET ACTIVE", lambda: self._set_active(kind, name, path), height=32, width=130)
             button.pack(side=tk.RIGHT)
             button.set_enabled(not running and classes is not None)
+        if kind == "CNN":           # GSN_V21: training graphs, and a check on the test set that does not change the model
+            import training_report
+            graphs = hu.FlatButton(bottom, "GRAPHS", lambda: self._show_reports(name, path), kind="muted", height=32, width=96)
+            graphs.pack(side=tk.RIGHT, padx=(0, 8))
+            graphs.set_enabled(bool(training_report.existing_reports(path)))
+            test = hu.FlatButton(bottom, "TEST SET REPORT", lambda: self._testset_report(name, path), kind="muted", height=32, width=160)
+            test.pack(side=tk.RIGHT, padx=(0, 8))
+            test.set_enabled(not running)
+            if metrics and metrics.get("type") == "cnn":
+                low = training_report.fire_warnings(metrics.get("per_class", {}), self.get_class_settings()[1])
+                if low:
+                    tk.Label(card, text="FIRE classes below 98 % (validation):  " + ",  ".join(f"{n} {a * 100:.0f} %" for n, a in low), font=SMALL_BOLD,
+                             fg=hu.BAD, bg=bg, anchor="w", justify="left", wraplength=780).pack(fill=tk.X, padx=16, pady=(0, 10))
+
+    def _show_reports(self, name, path):
+        import training_report
+        import training_ui
+        return training_ui.open_image_viewer(self.app, f"Report: {name}", training_report.existing_reports(path))
+
+    def _testset_report(self, name, path):
+        """Confusion matrix and per-class precision / recall / accuracy of this model on the test set (pictures never
+        used for training). Writes only <model>_testset_*.png; the model and its result file are not changed."""
+        import training_report
+        testset = self.testset_dir()
+        if self.is_running():
+            return None
+        if not testset or not any(training.list_class_images(testset).values()):
+            messagebox.showinfo("Test set report", "There is no test set yet.")
+            return None
+        self.app.config(cursor="watch")
+        self.app.update_idletasks()
+        try:
+            result = training.confusion_on_folder(path, testset)
+        except Exception as exc:
+            messagebox.showerror("Test set report", f"The model could not be run: {exc}")
+            return None
+        finally:
+            self.app.config(cursor="")
+        training_report.save_all(path, None, result["matrix"], result["classes"], self.get_class_settings()[1], prefix="testset_", name=name)
+        self._signature = None
+        return self._show_reports(name, path)
 
     def _set_active(self, kind, name, path):
         if self.is_running():

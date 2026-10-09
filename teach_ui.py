@@ -28,7 +28,7 @@ TARGET = 1000
 THUMB_W, THUMB_H, COLS, ROWS = 152, 112, 5, 5
 PAGE = COLS * ROWS
 PALETTE = ["#E5484D", "#F2A93B", "#2FBF71", "#4C8DF6", "#9B6CF6", "#E667AF", "#22B8CF", "#C8D04A", "#FF8A5B"]
-CAPTURES, INBOX = "CAPTURES", "INBOX"
+CAPTURES, INBOX, CONFUSION = "CAPTURES", "INBOX", "CONFUSION"      # CONFUSION: GSN_V21
 
 
 class TeachPage:
@@ -38,7 +38,7 @@ class TeachPage:
         self.page = 0
         self.items = []                 # [{path, suggested, confidence, ...}] of the current source
         self.selected = set()
-        self.undo_stack = []
+        self.changes = ops.Changes(getattr(app, "log_dir", None))      # multi-step undo + logs/dataset_changes.log (GSN_V21)
         self.suggestions = {}           # path -> (class, confidence) from AI SUGGEST
         self.active_class = ""
         self.classes = []               # class names in card order (shortcut 1-9)
@@ -109,7 +109,7 @@ class TeachPage:
 
         hu.FlatButton(label, "AI SUGGEST", self.suggest, height=36, width=110).pack(side=tk.LEFT)
         hu.FlatButton(label, "AUTO-LABEL TOOL", self.launch_auto_labeler, kind="muted", height=36, width=150).pack(side=tk.LEFT, padx=(8, 0))
-        app.tcm_verify_btn = hu.FlatButton(label, "VERIFY LABELS", app._verify_mismatches, kind="muted", height=36, width=130)
+        app.tcm_verify_btn = hu.FlatButton(label, "CHECK CONFUSION", app._verify_mismatches, kind="muted", height=36, width=138)
         app.tcm_verify_btn.pack(side=tk.LEFT, padx=(8, 0))
         self.lbl_unlabelled = tk.Label(label, text="", font=SMALL_BOLD, fg=hu.WARN, bg=hu.PANEL)
         self.lbl_unlabelled.pack(side=tk.LEFT, padx=(12, 0))
@@ -146,6 +146,13 @@ class TeachPage:
         self.lbl_result = tk.Label(train_card, text="", font=SMALL, fg=hu.MUTED, bg=hu.PANEL, anchor="w", justify="left", wraplength=368)
         self.lbl_result.pack(fill=tk.X, padx=16, pady=(6, 0))
         hu.FlatButton(train_card, "ACTIVATE A MODEL ...", lambda: app._switch_page("AI Model Select"), height=34).pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=(0, 16))
+        extra = tk.Frame(train_card, bg=hu.PANEL)
+        extra.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=(0, 8))
+        hu.FlatButton(extra, "GRAPHS", self.show_report, kind="muted", height=30, width=96).pack(side=tk.LEFT)
+        self.btn_wrong = hu.FlatButton(extra, "STILL WRONG: -", app._review_wrong_images, kind="muted", height=30)
+        self.btn_wrong.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        self.lbl_fire = tk.Label(train_card, text="", font=SMALL_BOLD, fg=hu.BAD, bg=hu.PANEL, anchor="w", justify="left", wraplength=340)
+        self.lbl_fire.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=(0, 6))
         # GSN_V21: AUTO LEARNING switch (admin password; the learning itself is a later phase)
         auto = tk.Frame(train_card, bg=hu.PANEL, highlightthickness=1, highlightbackground=hu.BORDER)
         auto.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=(0, 10))
@@ -191,7 +198,7 @@ class TeachPage:
         # ---- gallery (left, takes the rest)
         gallery_card, gallery_head, self.lbl_gallery_note = self._card(body, "IMAGES TO LABEL", "click to select, then press 1-9 or click a class")
         gallery_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.source_selector = hu.Segmented(gallery_head, (CAPTURES, INBOX), CAPTURES, self.set_source)
+        self.source_selector = hu.Segmented(gallery_head, (CAPTURES, INBOX, CONFUSION), CAPTURES, self.set_source)
         self.source_selector.pack(side=tk.RIGHT)
         self.lbl_selected = tk.Label(gallery_head, text="", font=SMALL_BOLD, fg=hu.ACCENT, bg=hu.PANEL)
         self.lbl_selected.pack(side=tk.RIGHT, padx=(0, 16))
@@ -204,6 +211,7 @@ class TeachPage:
         hu.FlatButton(bottom, "DELETE SELECTED", self.delete_selected, kind="danger", height=32, width=160).pack(side=tk.RIGHT)
         hu.FlatButton(bottom, "DESELECT ALL", self.deselect_all, kind="muted", height=32, width=124).pack(side=tk.RIGHT, padx=8)
         hu.FlatButton(bottom, "SELECT PAGE", self.select_page, kind="muted", height=32, width=116).pack(side=tk.RIGHT)
+        hu.FlatButton(bottom, "OPEN FOLDER", self.open_source_folder, kind="muted", height=32, width=120).pack(side=tk.RIGHT, padx=8)   # GSN_V21
         self.inbox_bar = tk.Frame(gallery_card, bg=hu.PANEL)
         self.btn_confirm_page = hu.FlatButton(self.inbox_bar, "CONFIRM ALL ON THIS PAGE AS SUGGESTED", self.confirm_page, height=30, width=340)
         self.btn_confirm_page.pack(side=tk.LEFT)
@@ -225,6 +233,8 @@ class TeachPage:
     def _load_items(self):
         if self.source == INBOX:
             return ops.list_inbox(self.inbox_dir())
+        if self.source == CONFUSION:
+            return ops.list_confusion(self.dataset_dir())
         return [{"path": path, "suggested": "", "confidence": 0.0} for path in ops.list_images(self.golden_dir)]
 
     def _page_items(self):
@@ -256,7 +266,8 @@ class TeachPage:
         self._thumbs, self._cells = [], {}
         page_items = self._page_items()
         if not page_items:
-            text = ("The inbox is empty. Production capture fills it while the machine runs." if self.source == INBOX
+            text = ("The CONFUSION folder is empty." if self.source == CONFUSION else
+                    "The inbox is empty. Production capture fills it while the machine runs." if self.source == INBOX
                     else "No unlabelled captures. Use START AUTO CAPTURE or SNAPSHOT.")
             tk.Label(self.grid, text=text, font=SMALL, fg=hu.MUTED, bg=hu.PANEL).grid(row=0, column=0, columnspan=COLS, pady=60)
         for index, item in enumerate(page_items):
@@ -277,13 +288,14 @@ class TeachPage:
             suggestion = self._suggestion(item)
             if suggestion:
                 name, confidence = suggestion
-                tk.Label(picture, text=f" AI: {name} {confidence * 100:.0f}% ", font=(hu.FONT, -11, "bold"), bg="#0A0F18",
+                caption = f" was: {name} " if item.get("former") and item["path"] not in self.suggestions else f" AI: {name} {confidence * 100:.0f}% "
+                tk.Label(picture, text=caption, font=(hu.FONT, -11, "bold"), bg="#0A0F18",
                          fg=hu.GOOD if confidence >= 0.85 else hu.WARN).place(x=4, y=THUMB_H - 22)
             name_label = tk.Label(cell, text=os.path.basename(path)[:28], font=(hu.FONT, -10), fg="#566178", bg=hu.PANEL, anchor="w")
             name_label.pack(fill=tk.X)
             for widget in (cell, picture, name_label):
                 widget.bind("<Button-1>", lambda e, p=path: self.toggle(p))
-                widget.bind("<Double-Button-1>", lambda e, p=path: self.launch_auto_labeler(p))
+                widget.bind("<Double-Button-1>", lambda e, p=path: self.view_large(p))
             self._cells[path] = cell
         self._paint_selection()
 
@@ -297,7 +309,8 @@ class TeachPage:
         os.makedirs(dataset_dir, exist_ok=True)
         counts = ops.class_counts(dataset_dir)
         colours = self._colours()
-        signature = (tuple(counts.items()), self.active_class, tuple(sorted(colours.items())))
+        confusion = ops.confusion_count(dataset_dir)
+        signature = (tuple(counts.items()), self.active_class, tuple(sorted(colours.items())), confusion)
         if signature == self._class_signature:
             return
         self._class_signature = signature
@@ -318,6 +331,9 @@ class TeachPage:
             label = tk.Label(top, text=name, font=SMALL_BOLD, fg=hu.TEXT, bg=bg, anchor="w")
             label.pack(side=tk.LEFT)
             colour = hu.GOOD if count >= TARGET else (hu.WARN if count >= 100 else hu.BAD)
+            folder = tk.Label(top, text="▤", font=SMALL_BOLD, fg=hu.MUTED, bg=bg, cursor="hand2")
+            folder.pack(side=tk.RIGHT, padx=(6, 0))
+            folder.bind("<Button-1>", lambda e, n=name: (self.open_folder(os.path.join(self.dataset_dir(), n)), "break")[1])
             number = tk.Label(top, text=f"{count} / {TARGET}", font=SMALL_BOLD, fg=colour, bg=bg)
             number.pack(side=tk.RIGHT)
             bar = hu.ProgressBar(card, bg, colour, height=4)
@@ -325,6 +341,17 @@ class TeachPage:
             bar.set(count / TARGET, colour)
             for widget in (card, top, key, dot, label, number, bar):
                 widget.bind("<Button-1>", lambda e, n=name: self.class_clicked(n))
+        row = tk.Frame(self.class_box, bg=hu.PANEL, highlightthickness=1, highlightbackground=hu.WARN if confusion else hu.BORDER, cursor="hand2")
+        row.pack(fill=tk.X, pady=(0, 3))
+        text = tk.Label(row, text="   CONFUSION   left out of training", font=SMALL_BOLD, fg=hu.WARN if confusion else hu.MUTED, bg=hu.PANEL, anchor="w")
+        text.pack(side=tk.LEFT, pady=3)
+        opener = tk.Label(row, text="▤", font=SMALL_BOLD, fg=hu.MUTED, bg=hu.PANEL, cursor="hand2")
+        opener.pack(side=tk.RIGHT, padx=(6, 8))
+        opener.bind("<Button-1>", lambda e: (self.open_folder(ops.confusion_dir(self.dataset_dir())), "break")[1])
+        amount = tk.Label(row, text=str(confusion), font=SMALL_BOLD, fg=hu.WARN if confusion else hu.MUTED, bg=hu.PANEL)
+        amount.pack(side=tk.RIGHT)
+        for widget in (row, text, amount):
+            widget.bind("<Button-1>", lambda e: self.set_source(CONFUSION))
         notes = ops.dataset_warnings(counts)
         if notes:
             self.lbl_warn.config(text="DATASET WARNINGS\n" + "\n".join(notes))
@@ -337,16 +364,19 @@ class TeachPage:
         total = len(self.items)
         pages = max(1, (total + PAGE - 1) // PAGE)
         self.lbl_page.config(text=f"page {self.page + 1 if total else 0} of {pages if total else 0}")
-        unlabelled = len(ops.list_images(self.golden_dir)) if self.source == INBOX else total
+        unlabelled = len(ops.list_images(self.golden_dir)) if self.source != CAPTURES else total
         self.lbl_unlabelled.config(text=f"{unlabelled} unlabelled" if unlabelled else "all labelled",
                                    fg=hu.WARN if unlabelled else hu.GOOD)
         self.mode_selector.set(self.mode_names.get(app.capture_mode_var.get(), "CROP"))
-        if self.source == INBOX:
+        if self.source == CONFUSION:
+            self.lbl_gallery_note.config(text="left out of training: re-label (1-9 or class) or delete. Double click = large view.")
+            self.inbox_bar.pack_forget()
+        elif self.source == INBOX:
             self.lbl_gallery_note.config(text="production inbox, most uncertain first: confirm (1-9 or class) or delete")
             self.inbox_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=(4, 0), before=self.grid)
             self.lbl_inbox.config(text=f"{total} images to review")
         else:
-            self.lbl_gallery_note.config(text="click to select (arrows, PgUp / PgDn turn the page), then press 1-9 or click a class")
+            self.lbl_gallery_note.config(text="click to select, then press 1-9 or click a class. Double click = large view.")
             self.inbox_bar.pack_forget()
         if getattr(app, "processing_thread", None) is None:      # the page is built before the threads exist
             return
@@ -397,16 +427,30 @@ class TeachPage:
             else:
                 self.chart_loss.show([row["loss"] for row in result.get("history", [])])
                 self.chart_acc.show([row["val_acc"] for row in result.get("history", [])])
+                import training_report
+                passed = {str(c).upper().strip() for c in self.app._class_settings()[1]}
                 for name, row in result["per_class"].items():
                     accuracy = row["accuracy"]
-                    colour = hu.BAD if accuracy is None or accuracy < 0.8 else (hu.WARN if accuracy < 0.9 else hu.GOOD)
+                    fire = name.upper().strip() not in passed
+                    # GSN_V21: a FIRE (defect) class must reach 98 %; a PASS class is judged by the softer steps
+                    if fire:
+                        colour = hu.GOOD if accuracy is not None and accuracy >= training_report.FIRE_LIMIT else hu.BAD
+                    else:
+                        colour = hu.BAD if accuracy is None or accuracy < 0.8 else (hu.WARN if accuracy < 0.9 else hu.GOOD)
                     line = tk.Frame(self.result_box, bg=hu.PANEL)
-                    line.pack(fill=tk.X, pady=1)
-                    tk.Label(line, text=name, font=SMALL_BOLD, fg=hu.TEXT, bg=hu.PANEL, width=14, anchor="w").pack(side=tk.LEFT)
+                    line.pack(fill=tk.X, pady=0)
+                    tk.Label(line, text="FIRE" if fire else "PASS", font=(hu.FONT, -9, "bold"), fg=hu.BAD if fire else hu.GOOD, bg=hu.PANEL, width=5, anchor="w").pack(side=tk.LEFT)
+                    tk.Label(line, text=name, font=SMALL_BOLD, fg=hu.TEXT, bg=hu.PANEL, width=13, anchor="w").pack(side=tk.LEFT)
                     tk.Label(line, text=f"{row['correct']} of {row['total']}", font=SMALL, fg=hu.MUTED, bg=hu.PANEL, width=12, anchor="w").pack(side=tk.LEFT)
                     tk.Label(line, text="-" if accuracy is None else f"{accuracy * 100:.0f} %", font=SMALL_BOLD, fg=colour, bg=hu.PANEL).pack(side=tk.RIGHT)
                 self.lbl_result.config(text=f"{result['model']}\noverall {result['val_accuracy'] * 100:.1f} %, trained {result['trained']}. "
                                             "A new model is not active until you activate it.")
+                low = training_report.fire_warnings(result["per_class"], passed)
+                self.lbl_fire.config(text=("WARNING: FIRE classes below 98 %:  " + ",  ".join(f"{n} {a * 100:.0f} %" for n, a in low)) if low
+                                     else "All FIRE classes are at 98 % or above.", fg=hu.BAD if low else hu.GOOD)
+                wrong = result.get("wrong_images_total")
+                self.btn_wrong.set_text("STILL WRONG: not recorded" if wrong is None else f"STILL WRONG: {wrong} - REVIEW")
+                self.btn_wrong.set_enabled(bool(wrong))
 
     def _last_result(self):
         best = None
@@ -466,8 +510,7 @@ class TeachPage:
         """Move the selected images into the class folder. Inbox images count for the test set rule (every 10th)."""
         paths = [item["path"] for item in self.items if item["path"] in self.selected]
         moves = ops.confirm_images(paths, class_name, self.dataset_dir(), self.testset_dir(), use_testset=self.source == INBOX)
-        if moves:
-            self.undo_stack.append(moves)
+        self.changes.add(f"{'RE-LABEL from CONFUSION' if self.source == CONFUSION else 'LABEL'} as {class_name}", moves)
         self.selected.clear()
         self.active_class = class_name
         if self.source == INBOX:
@@ -494,30 +537,30 @@ class TeachPage:
         moves = []
         for name, paths in plan.items():
             moves += ops.confirm_images(paths, name, self.dataset_dir(), self.testset_dir(), use_testset=True)
-        if moves:
-            self.undo_stack.append(moves)
+        self.changes.add("CONFIRM PAGE AS SUGGESTED", moves)
         self.selected.clear()
         self.app.processing_thread.capture.refresh_inbox()
         self._class_signature = None
         self.refresh(force=True)
 
     def undo(self):
-        if not self.undo_stack:
+        """Multi-step undo: every press takes back one more move or delete (also those made in the review windows)."""
+        result = self.changes.undo()
+        if result is None:
+            self.lbl_selected.config(text="nothing to undo")
             return
-        ops.undo_moves(self.undo_stack.pop())
         self._class_signature = None
         self.refresh(force=True)
+        self.lbl_selected.config(text=f"UNDO {result[0]}: {result[1]} image(s) put back")
 
     def delete_selected(self):
         if not self.selected:
             return
-        if not messagebox.askyesno("Delete images", f"Delete {len(self.selected)} selected image(s)?\nThis cannot be undone.", icon="warning"):
+        if not messagebox.askyesno("Delete images", f"Delete {len(self.selected)} selected image(s)?\n\nUNDO brings them back (they are kept in the trash folder of the program).",
+                                   icon="warning"):
             return
-        for path in list(self.selected):
-            try:
-                os.remove(path)
-            except OSError as exc:
-                print(f"[TEACH] Could not delete {path}: {exc}")
+        self.changes.add("DELETE", ops.trash_images(sorted(self.selected), self.dataset_dir()))
+        self._class_signature = None
         self.selected.clear()
         if self.source == INBOX:
             self.app.processing_thread.capture.refresh_inbox()
@@ -629,6 +672,39 @@ class TeachPage:
             finally:
                 self._suggesting = False
         threading.Thread(target=run, daemon=True, name="AISuggest").start()
+
+    # ------------------------------------------------------------------- GSN_V21: folders, large view, graphs
+    def open_folder(self, folder):
+        """Open a folder in the Ubuntu file manager."""
+        try:
+            os.makedirs(folder, exist_ok=True)
+            subprocess.Popen(["xdg-open", str(folder)])
+        except Exception as exc:
+            messagebox.showerror("Open folder", f"Could not open {folder}: {exc}")
+
+    def open_source_folder(self):
+        self.open_folder({CAPTURES: self.golden_dir, INBOX: self.inbox_dir(), CONFUSION: ops.confusion_dir(self.dataset_dir())}[self.source])
+
+    def view_large(self, path):
+        import training_ui
+        item = next((i for i in self.items if i["path"] == path), {})
+        suggestion = self._suggestion(item) if item else None
+        info = os.path.basename(path) + (f"     AI: {suggestion[0]} {suggestion[1] * 100:.0f} %" if suggestion and suggestion[1] else "") \
+            + (f"     was labelled {item['former']}" if item.get("former") else "")
+        return training_ui.open_image_viewer(self.app, "Image", [("IMAGE", path)], info)
+
+    def show_report(self, model_path=None):
+        """Training graphs of a model (curves, per-class bars, confusion matrix) in a large window."""
+        import training_report
+        import training_ui
+        result = self._last_result()
+        path = model_path or (os.path.join(self.model_root, result["model"]) if result else "")
+        reports = training_report.existing_reports(path) if path else []
+        if not reports:
+            messagebox.showinfo("Training graphs", "This model has no graphs. Models trained from now on get them; "
+                                                   "for an older model use TEST SET REPORT on the AI Model Select page.")
+            return None
+        return training_ui.open_image_viewer(self.app, f"Report: {os.path.basename(path)}", reports)
 
     def launch_auto_labeler(self, target_image=None):
         script = Path(__file__).resolve().parent / "ai_auto_labeler.py"

@@ -1840,6 +1840,10 @@ class App(tk.Tk):
         style.configure("Treeview", background=surf, foreground=text, fieldbackground=surf, borderwidth=0, rowheight=30)
         style.configure("Treeview.Heading", background=self.colors["surface_light"], foreground=self.colors["info"], font=("Roboto", 10, "bold"), borderwidth=0)
         style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])      # no light frame around tables
+        style.configure("Home.Treeview", rowheight=26, font=("Roboto", 10), background=ui.PANEL, fieldbackground=ui.PANEL, foreground=ui.TEXT, borderwidth=0)
+        style.configure("Home.Treeview.Heading", font=("Roboto", 9, "bold"), background=ui.BORDER, foreground=ui.ACCENT, borderwidth=0)
+        style.layout("Home.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+        style.map("Home.Treeview", background=[("selected", ui.mix(ui.PANEL, ui.ACCENT, 0.3))])
         for bar in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
             style.configure(bar, background=ui.BORDER, troughcolor=ui.FIELD, bordercolor=ui.FIELD, lightcolor=ui.BORDER,
                             darkcolor=ui.BORDER, arrowcolor=ui.MUTED, relief="flat", borderwidth=0)
@@ -3413,12 +3417,39 @@ class App(tk.Tk):
         def start(classes):
             # training.py reads every image through preprocess.py, the same crop and padding as live grading.
             self._begin_training("CNN", epochs, lambda progress, stop: self._cnn_trainer(
-                dataset_dir, classes, epochs, str(MODEL_ROOT), name_prefix=prefix, progress=progress, stop=stop))
+                dataset_dir, classes, epochs, str(MODEL_ROOT), name_prefix=prefix, progress=progress, stop=stop,
+                pass_classes=self._class_settings()[1]))
         training_ui.choose_classes(self, images, epochs, start)
 
     def _cnn_trainer(self, *args, **kwargs):
         import training
         return training.train_cnn(*args, **kwargs)
+
+    CONFUSION_CONFIDENCE = 0.60      # CHECK CONFUSION also lists images the model labels right but below this confidence
+
+    def _teach_changed(self):
+        page = getattr(self, "teach_page", None)
+        if page is not None:
+            page._class_signature = None
+            page._signature = None
+
+    def _review_wrong_images(self):
+        """After a training: the images the new model still gets wrong, to keep, move, or move to CONFUSION in one click."""
+        import training
+        import training_ui
+        page = self.teach_page
+        result = page._last_result()
+        wrong = [m for m in (result or {}).get("wrong_images", []) if os.path.exists(m["path"])]
+        if not wrong:
+            messagebox.showinfo("Still wrong", "No image of the last training is listed as wrong (or they were all moved already).")
+            return None
+        dataset_dir = self._active_dataset_dir()
+        folders = {name.upper().strip(): os.path.join(dataset_dir, name) for name in training.list_class_images(dataset_dir)}
+        intro = (f"Model: {result['model']}.   After training it still gets {len(wrong)} of its own training / validation images wrong.\n"
+                 "Either the label is wrong, or the image is unclear. MOVE ALL LISTED TO CONFUSION takes them out of the next training in one click; "
+                 "review them later on the CONFUSION tab.")
+        return training_ui.open_mismatch_window(self, {"mismatches": wrong, "skipped": {}}, result["model"], folders, on_changed=self._teach_changed,
+                                                changes=page.changes, dataset_dir=dataset_dir, title="Images the new model still gets wrong", intro=intro)
 
     def _verify_mismatches(self):
         """Run the active CNN on the labelled images and list those where label and prediction disagree."""
@@ -3427,11 +3458,11 @@ class App(tk.Tk):
         if getattr(self, "_verify_running", False):
             return
         if self.shared_state.phase == "RUNNING":
-            messagebox.showwarning("Verify labels", "Stop the machine first: the check uses the same graphics card as the grader.")
+            messagebox.showwarning("Check confusion", "Stop the machine first: the check uses the same graphics card as the grader.")
             return
         model_path = self._active_cnn_path()
         if not Path(model_path).exists():
-            messagebox.showerror("Verify labels", f"The active CNN model was not found:\n{model_path}")
+            messagebox.showerror("Check confusion", f"The active CNN model was not found:\n{model_path}")
             return
         dataset_dir = self._active_dataset_dir()
         self._verify_running = True
@@ -3441,18 +3472,19 @@ class App(tk.Tk):
             self._verify_running = False
             self.config(cursor="")
             if error:
-                messagebox.showerror("Verify labels", f"The check failed:\n{error}")
+                messagebox.showerror("Check confusion", f"The check failed:\n{error}")
                 return
             folders = {name.upper().strip(): os.path.join(dataset_dir, name) for name in training.list_class_images(dataset_dir)}
             if not result["checked"]:
-                messagebox.showwarning("Verify labels", f"Nothing could be checked: the model ({', '.join(result['model_classes'])}) "
+                messagebox.showwarning("Check confusion", f"Nothing could be checked: the model ({', '.join(result['model_classes'])}) "
                                                         f"knows none of the class folders in\n{dataset_dir}")
                 return
-            training_ui.open_mismatch_window(self, result, Path(model_path).name, folders)
+            training_ui.open_mismatch_window(self, result, Path(model_path).name, folders, on_changed=self._teach_changed,
+                                             changes=self.teach_page.changes, dataset_dir=dataset_dir, title="Check confusion")
 
         def run():
             try:
-                result = training.verify_labels(str(model_path), dataset_dir)
+                result = training.verify_labels(str(model_path), dataset_dir, low_confidence=self.CONFUSION_CONFIDENCE)
                 self.after(0, lambda: done(result))
             except Exception as exc:
                 message = f"{type(exc).__name__}: {exc}"

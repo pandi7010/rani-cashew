@@ -72,7 +72,8 @@ def _load_rgb(path):
     return Image.fromarray(preprocess.prepare_crop(image, tight=True))
 
 
-def train_cnn(dataset_dir, classes, epochs, out_dir, name_prefix="cnn", progress=None, stop=None, batch_size=32, pretrained=True):
+def train_cnn(dataset_dir, classes, epochs, out_dir, name_prefix="cnn", progress=None, stop=None, batch_size=32, pretrained=True,
+              pass_classes=()):
     """Train MobileNetV2 on the chosen class folders.
 
     progress(dict) is called after every epoch with: epoch, epochs, loss, val_acc, seconds_left.
@@ -134,37 +135,48 @@ def train_cnn(dataset_dir, classes, epochs, out_dir, name_prefix="cnn", progress
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3 if not pretrained else 3e-4)
 
     def evaluate():
+        """Validation: correct / total per class, the loss, and the confusion matrix (rows = label, columns = prediction)."""
         model.eval()
         correct = [0] * len(class_names)
         total = [0] * len(class_names)
+        matrix = [[0] * len(class_names) for _ in class_names]
+        loss_sum, count = 0.0, 0
         with torch.no_grad():
             for inputs, labels in val_loader:
-                predicted = model(inputs.to(device)).argmax(dim=1).cpu()
+                outputs = model(inputs.to(device))
+                loss_sum += criterion(outputs, labels.to(device)).item() * inputs.size(0)
+                count += inputs.size(0)
+                predicted = outputs.argmax(dim=1).cpu()
                 for label, pred in zip(labels.tolist(), predicted.tolist()):
                     total[label] += 1
                     correct[label] += int(label == pred)
+                    matrix[label][pred] += 1
+        evaluate.loss, evaluate.matrix = loss_sum / max(1, count), matrix
         return correct, total
 
     history, best, started = [], None, time.time()
     for epoch in range(1, int(epochs) + 1):
         model.train()
-        running, seen = 0.0, 0
+        running, seen, train_right = 0.0, 0, 0
         for inputs, labels in train_loader:
             inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
-            loss = criterion(model(inputs), labels)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
             running += loss.item() * inputs.size(0)
             seen += inputs.size(0)
+            train_right += int((outputs.argmax(dim=1) == labels).sum().item())
         correct, total = evaluate()
         val_acc = sum(correct) / max(1, sum(total))
         # Mean of the per-class accuracies: a model that ignores a small class does not look good.
         balanced = sum(c / t for c, t in zip(correct, total) if t) / max(1, sum(1 for t in total if t))
-        row = {"epoch": epoch, "loss": round(running / max(1, seen), 4), "val_acc": round(val_acc, 4), "val_balanced_acc": round(balanced, 4)}
+        row = {"epoch": epoch, "loss": round(running / max(1, seen), 4), "val_acc": round(val_acc, 4), "val_balanced_acc": round(balanced, 4),
+               "train_acc": round(train_right / max(1, seen), 4), "val_loss": round(evaluate.loss, 4)}
         history.append(row)
         if best is None or balanced >= best["balanced"]:
-            best = {"balanced": balanced, "epoch": epoch, "correct": correct, "total": total, "val_acc": val_acc,
+            best = {"balanced": balanced, "epoch": epoch, "correct": correct, "total": total, "val_acc": val_acc, "matrix": evaluate.matrix,
                     "state": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}}
         if progress:
             elapsed = time.time() - started
@@ -176,17 +188,39 @@ def train_cnn(dataset_dir, classes, epochs, out_dir, name_prefix="cnn", progress
     stamp = datetime.now()
     model_path = os.path.join(out_dir, f"{name_prefix}_{stamp:%Y%m%d_%H%M%S}.pth")
     torch.save({"model_state_dict": best["state"], "class_names": class_names}, model_path)
+
+    # GSN_V21: the images the finished (best) model still gets wrong, over the whole training set, for the CONFUSION review.
+    import training_report
+    model.load_state_dict(best["state"])
+    model.eval()
+    wrong_images = []
+    every = train_items + val_items
+    with torch.no_grad():
+        for start in range(0, len(every), batch_size):
+            batch = every[start:start + batch_size]
+            probabilities = torch.softmax(model(torch.stack([eval_tf(_load_rgb(path)) for path, _ in batch]).to(device)), dim=1).cpu()
+            for (path, label), probs in zip(batch, probabilities):
+                index = int(probs.argmax())
+                if index != label:
+                    wrong_images.append({"path": path, "label": class_names[label], "predicted": class_names[index],
+                                         "confidence": round(float(probs[index]), 3), "kind": "WRONG AFTER TRAINING"})
+    wrong_images.sort(key=lambda m: -m["confidence"])
+    metrics = training_report.class_metrics(best["matrix"], class_names)
     result = {
         "type": "cnn", "architecture": "MobileNetV2", "model": os.path.basename(model_path), "trained": stamp.strftime("%Y-%m-%d %H:%M"),
         "dataset": str(dataset_dir), "classes": class_names, "images": {name: len(images[name]) for name in class_names},
         "train_images": len(train_items), "val_images": len(val_items), "epochs_run": len(history), "best_epoch": best["epoch"],
         "val_accuracy": round(best["val_acc"], 4), "val_balanced_accuracy": round(best["balanced"], 4),
         "per_class": {name: {"correct": best["correct"][i], "total": best["total"][i],
-                             "accuracy": round(best["correct"][i] / best["total"][i], 4) if best["total"][i] else None}
+                             "accuracy": round(best["correct"][i] / best["total"][i], 4) if best["total"][i] else None,
+                             "precision": metrics[name]["precision"], "recall": metrics[name]["recall"]}
                       for i, name in enumerate(class_names)},
+        "confusion_matrix": best["matrix"], "wrong_images": wrong_images[:2000], "wrong_images_total": len(wrong_images),
+        "pass_classes": [str(c) for c in pass_classes],
         "pretrained": pretrained, "device": str(device), "history": history,
         "note": "Accuracy is measured on validation images that were not used for training.",
     }
+    result["reports"] = training_report.save_all(model_path, history, best["matrix"], class_names, pass_classes)
     with open(metrics_path(model_path), "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
     result["model_path"] = model_path
@@ -205,8 +239,9 @@ def load_cnn(model_path):
     return model, class_names, device
 
 
-def verify_labels(model_path, dataset_dir, progress=None, batch_size=32):
-    """Run the CNN on every labelled image. Returns a dict:
+def verify_labels(model_path, dataset_dir, progress=None, batch_size=32, low_confidence=0.0):
+    """Run the CNN on every labelled image. With low_confidence above 0 the list also has images whose prediction
+    agrees with the label but with less confidence than that ("kind": LOW CONFIDENCE). Returns a dict:
         mismatches     [{path, label, predicted, confidence}] sorted by confidence (most certain first)
         checked        images checked
         skipped        {class folder: image count} whose class the model does not know (cannot be checked)
@@ -241,10 +276,14 @@ def verify_labels(model_path, dataset_dir, progress=None, batch_size=32):
         for (path, label), probs in zip(kept, probabilities):
             index = int(probs.argmax())
             if class_names[index] != label:
-                mismatches.append({"path": path, "label": label, "predicted": class_names[index], "confidence": round(float(probs[index]), 3)})
+                mismatches.append({"path": path, "label": label, "predicted": class_names[index], "confidence": round(float(probs[index]), 3),
+                                   "kind": "MISMATCH"})
+            elif float(probs[index]) < low_confidence:
+                mismatches.append({"path": path, "label": label, "predicted": class_names[index], "confidence": round(float(probs[index]), 3),
+                                   "kind": "LOW CONFIDENCE"})
         if progress:
             progress(min(len(items), start + batch_size), len(items))
-    mismatches.sort(key=lambda m: -m["confidence"])
+    mismatches.sort(key=lambda m: (m["kind"] != "MISMATCH", -m["confidence"]))
     return {"mismatches": mismatches, "checked": len(items), "skipped": skipped, "model_classes": class_names}
 
 
@@ -304,6 +343,40 @@ def evaluate_cnn(model_path, dataset_dir, batch_size=32):
             total += len(predicted)
         result[key] = (correct, total)
     return result
+
+
+def confusion_on_folder(model_path, dataset_dir, batch_size=32):
+    """GSN_V21: confusion matrix of a CNN on labelled class folders (for example the test set), without changing the model.
+    Returns {"classes": [...], "matrix": rows = label, columns = prediction, "images": n, "skipped": {folder: count}}.
+    Classes are the model's classes; folders the model does not know are skipped."""
+    import torch
+    import preprocess
+    model, class_names, device = load_cnn(model_path)
+    eval_tf = preprocess.build_transform(train=False)
+    known = {name.upper().strip(): index for index, name in enumerate(class_names)}
+    matrix = [[0] * len(class_names) for _ in class_names]
+    images, skipped = 0, {}
+    for folder, paths in list_class_images(dataset_dir).items():
+        key = folder.upper().strip()
+        if key not in known:
+            if paths:
+                skipped[folder] = len(paths)
+            continue
+        for start in range(0, len(paths), batch_size):
+            tensors = []
+            for path in paths[start:start + batch_size]:
+                try:
+                    tensors.append(eval_tf(_load_rgb(path)))
+                except ValueError:
+                    continue
+            if not tensors:
+                continue
+            with torch.no_grad():
+                predicted = model(torch.stack(tensors).to(device)).argmax(dim=1).cpu().tolist()
+            for pred in predicted:
+                matrix[known[key]][pred] += 1
+                images += 1
+    return {"classes": class_names, "matrix": matrix, "images": images, "skipped": skipped}
 
 
 # ------------------------------------------------------------------ YOLO detection

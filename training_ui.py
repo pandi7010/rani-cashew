@@ -175,36 +175,87 @@ def open_training_window(app):
     return top
 
 
-def open_mismatch_window(app, result, model_name, class_folders, on_changed=None):
-    """Images where the folder label and the CNN prediction disagree, for review one by one."""
+def open_image_viewer(app, title, images, info=""):
+    """GSN_V21: large view of one or several pictures. images = [(label, path)]; a selector switches between them."""
+    images = [(label, path) for label, path in images if path and os.path.exists(path)]
+    if not images:
+        messagebox.showinfo(title, "There is no picture to show.")
+        return None
+    top = _window(app, title, 1500, 980)
+    bar = tk.Frame(top, bg=hu.BG)
+    bar.pack(fill=tk.X, padx=16, pady=(10, 6))
+    lbl_info = tk.Label(bar, text=info, font=SMALL, fg=hu.MUTED, bg=hu.BG, anchor="w", justify="left", wraplength=900)
+    lbl_info.pack(side=tk.LEFT)
+    hu.FlatButton(bar, "CLOSE", top.destroy, kind="muted", height=32, width=110).pack(side=tk.RIGHT)
+    picture = tk.Label(top, bg="#0A1626", bd=0)
+    picture.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 16))
+
+    def show(label):
+        path = dict(images)[label]
+        try:
+            image = Image.open(path).convert("RGB")
+            scale = min(1460 / image.width, 840 / image.height)
+            if scale < 1.0 or image.width < 500:            # small crops are enlarged for the eye
+                scale = min(scale, 4.0) if image.width >= 500 else min(1460 / image.width, 840 / image.height, 4.0)
+                image = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))),
+                                     Image.Resampling.LANCZOS if scale < 1 else Image.Resampling.NEAREST)
+            picture.image = ImageTk.PhotoImage(image)
+            picture.config(image=picture.image, text="")
+        except Exception as exc:
+            picture.config(image="", text=f"cannot show {path}: {exc}", fg=hu.MUTED)
+        if len(images) > 1:
+            selector.set(label)
+    if len(images) > 1:
+        selector = hu.Segmented(bar, [label for label, _ in images], images[0][0], show, font=SMALL_BOLD, pad=12)
+        selector.pack(side=tk.RIGHT, padx=12)
+    top.viewer_show = show
+    show(images[0][0])
+    return top
+
+
+def open_mismatch_window(app, result, model_name, class_folders, on_changed=None, changes=None, dataset_dir=None, title=None, intro=None):
+    """Images where the folder label and the CNN disagree (or the CNN is unsure), for review one by one:
+    keep, move to the model's class, move to another class, move to CONFUSION (out of training), delete.
+    GSN_V21: every move and delete can be undone (dataset_ops.Changes) and is written to logs/dataset_changes.log."""
+    import dataset_ops as ops
+    changes = changes if changes is not None else ops.Changes(getattr(app, "log_dir", None))
     mismatches = list(result["mismatches"])
-    top = _window(app, "Verify label mismatches", 1100, 760)
-    skipped = ", ".join(f"{name} ({count})" for name, count in result["skipped"].items())
-    intro = (f"Model: {model_name}.   Checked {result['checked']} images, {len(mismatches)} disagree with their folder label."
-             + (f"\nNot checked, because the model does not know these classes: {skipped}." if skipped else "")
-             + "\nA disagreement is a hint, not proof: the label can be wrong, or the model can be wrong. Look at each image.")
-    tk.Label(top, text=intro, font=SMALL, fg=hu.MUTED, bg=hu.BG, anchor="w", justify="left", wraplength=1060).pack(fill=tk.X, padx=16, pady=(12, 8))
+    top = _window(app, title or "Check confusion", 1280, 820)
+    skipped = ", ".join(f"{name} ({count})" for name, count in result.get("skipped", {}).items())
+    text = intro or (f"Model: {model_name}.   Checked {result.get('checked', len(mismatches))} images: "
+                     f"{sum(1 for m in mismatches if m.get('kind') != 'LOW CONFIDENCE')} disagree with their folder label, "
+                     f"{sum(1 for m in mismatches if m.get('kind') == 'LOW CONFIDENCE')} agree but with low confidence."
+                     + (f"\nNot checked, because the model does not know these classes: {skipped}." if skipped else "")
+                     + "\nA disagreement is a hint, not proof: the label can be wrong, or the model can be wrong. Look at each image.")
+    tk.Label(top, text=text, font=SMALL, fg=hu.MUTED, bg=hu.BG, anchor="w", justify="left", wraplength=1240).pack(fill=tk.X, padx=16, pady=(12, 8))
     body = tk.Frame(top, bg=hu.BG)
     body.pack(fill=tk.BOTH, expand=True, padx=16)
-    tree = ttk.Treeview(body, columns=("file", "label", "predicted", "conf"), show="headings", style="Home.Treeview")
-    for col, title, width in (("file", "IMAGE", 260), ("label", "LABEL (FOLDER)", 150), ("predicted", "MODEL SAYS", 150), ("conf", "CONFIDENCE", 110)):
-        tree.heading(col, text=title, anchor="w")
+    tree = ttk.Treeview(body, columns=("file", "label", "predicted", "conf", "why"), show="headings", style="Home.Treeview")
+    for col, heading, width in (("file", "IMAGE", 250), ("label", "LABEL (FOLDER)", 140), ("predicted", "MODEL SAYS", 140), ("conf", "CONF.", 70), ("why", "WHY LISTED", 170)):
+        tree.heading(col, text=heading, anchor="w")
         tree.column(col, width=width, anchor="w")
     tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    side = tk.Frame(body, bg=hu.PANEL, highlightthickness=1, highlightbackground=hu.BORDER, width=380)
+    side = tk.Frame(body, bg=hu.PANEL, highlightthickness=1, highlightbackground=hu.BORDER, width=400)
     side.pack(side=tk.LEFT, fill=tk.Y, padx=(16, 0))
     side.pack_propagate(False)
-    picture = tk.Label(side, bg="#0A1626", bd=0, text="select an image", fg=hu.MUTED, font=SMALL)
+    picture = tk.Label(side, bg="#0A1626", bd=0, text="select an image", fg=hu.MUTED, font=SMALL, cursor="hand2")
     picture.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
-    lbl_info = tk.Label(side, text="", font=BODY_BOLD, fg=hu.TEXT, bg=hu.PANEL, wraplength=350, justify="left", anchor="w")
+    lbl_info = tk.Label(side, text="", font=BODY_BOLD, fg=hu.TEXT, bg=hu.PANEL, wraplength=370, justify="left", anchor="w")
     lbl_info.pack(fill=tk.X, padx=12)
+    lbl_left = tk.Label(top, text="", font=SMALL_BOLD, fg=hu.MUTED, bg=hu.BG, anchor="w")
 
     for index, item in enumerate(mismatches):
-        tree.insert("", "end", iid=str(index), values=(os.path.basename(item["path"]), item["label"], item["predicted"], f"{item['confidence'] * 100:.0f} %"))
+        tree.insert("", "end", iid=str(index), values=(os.path.basename(item["path"]), item["label"], item["predicted"], f"{item['confidence'] * 100:.0f} %",
+                                                       item.get("kind", "MISMATCH")))
+    removed = []                    # [(index, item)] in the order they left the list, for UNDO
 
     def current():
         selection = tree.selection()
         return (int(selection[0]), mismatches[int(selection[0])]) if selection else (None, None)
+
+    def count():
+        left = len(tree.get_children())
+        lbl_left.config(text=f"{left} image(s) left in this list" + (f"     last action: {changes.last_action()}" if changes.can_undo() else ""))
 
     def show(event=None):
         _, item = current()
@@ -212,21 +263,37 @@ def open_mismatch_window(app, result, model_name, class_folders, on_changed=None
             return
         try:
             image = Image.open(item["path"]).convert("RGB")
-            image = Image.eval(image, lambda v: min(255, int(v * 2.0)))        # the crops are dark; brighter for the eye only
-            image.thumbnail((350, 330), Image.Resampling.LANCZOS)
+            image.thumbnail((370, 340), Image.Resampling.LANCZOS)
             picture.image = ImageTk.PhotoImage(image)
             picture.config(image=picture.image, text="")
         except Exception as exc:
             picture.config(image="", text=f"cannot show image: {exc}")
         lbl_info.config(text=f"Label: {item['label']}     Model: {item['predicted']} ({item['confidence'] * 100:.0f} %)")
     tree.bind("<<TreeviewSelect>>", show)
+    picture.bind("<Double-Button-1>", lambda e: current()[1] and open_image_viewer(app, os.path.basename(current()[1]["path"]), [("IMAGE", current()[1]["path"])],
+                                                                                 f"label {current()[1]['label']}, model says {current()[1]['predicted']}"))
 
-    def remove_row(index):
-        tree.delete(str(index))
+    def remove_row(index, select_next=True):
+        children = list(tree.get_children())
+        position = children.index(str(index)) if str(index) in children else -1
+        if position >= 0:
+            tree.delete(str(index))
+            removed.append((index, mismatches[index]))
         picture.config(image="", text="select an image")
         lbl_info.config(text="")
+        children = list(tree.get_children())
+        if select_next and children:
+            tree.selection_set(children[min(max(position, 0), len(children) - 1)])
+        count()
         if on_changed:
             on_changed()
+
+    def done(action, index, moves):
+        if not moves:
+            messagebox.showerror(action, "The image could not be moved (it is no longer there).", parent=top)
+            return
+        changes.add(action, moves)
+        remove_row(index)
 
     def move():
         index, item = current()
@@ -236,35 +303,78 @@ def open_mismatch_window(app, result, model_name, class_folders, on_changed=None
         if not target:
             messagebox.showerror("Move", f"There is no class folder for {item['predicted']}.", parent=top)
             return
-        try:
-            shutil.move(item["path"], os.path.join(target, os.path.basename(item["path"])))
-        except Exception as exc:
-            messagebox.showerror("Move", f"Could not move the image: {exc}", parent=top)
+        done(f"MOVE {item['label']} -> {item['predicted']}", index, ops.move_images([item["path"]], target))
+
+    def move_other():
+        index, item = current()
+        name = other_var.get()
+        if item and name in other_folders:
+            done(f"MOVE {item['label']} -> {name}", index, ops.move_images([item["path"]], other_folders[name]))
+
+    def to_confusion():
+        index, item = current()
+        if item and dataset_dir:
+            done("MOVE TO CONFUSION", index, ops.move_to_confusion([item["path"]], dataset_dir))
+
+    def all_to_confusion():
+        rows = [int(iid) for iid in tree.get_children()]
+        if not rows or not dataset_dir:
             return
-        remove_row(index)
+        if not messagebox.askyesno("Move all to CONFUSION", f"Move all {len(rows)} listed images to the CONFUSION folder?\n\n"
+                                   "They are left out of the next training until you re-label them. UNDO puts them back.", parent=top):
+            return
+        moves = ops.move_to_confusion([mismatches[i]["path"] for i in rows], dataset_dir)
+        changes.add("MOVE ALL TO CONFUSION", moves)
+        for i in rows:
+            remove_row(i, select_next=False)
 
     def delete():
         index, item = current()
-        if not item or not messagebox.askyesno("Delete image", f"Delete {os.path.basename(item['path'])} from the dataset?\nThis cannot be undone.", parent=top):
-            return
-        try:
-            os.remove(item["path"])
-        except Exception as exc:
-            messagebox.showerror("Delete", f"Could not delete the image: {exc}", parent=top)
-            return
-        remove_row(index)
+        if item and dataset_dir:
+            done("DELETE", index, ops.trash_images([item["path"]], dataset_dir))
 
     def keep():
         index, item = current()
         if item:
-            tree.delete(str(index))                 # the label is right: only taken off this list
+            remove_row(index)               # the label is right: only taken off this list
+            removed.pop()
 
+    def undo():
+        result_ = changes.undo()
+        if result_ is None:
+            return
+        action, restored = result_
+        back = removed[-restored:] if restored else []
+        del removed[len(removed) - len(back):]
+        for index, item in back:
+            if os.path.exists(item["path"]) and str(index) not in tree.get_children():
+                tree.insert("", "end", iid=str(index), values=(os.path.basename(item["path"]), item["label"], item["predicted"],
+                                                               f"{item['confidence'] * 100:.0f} %", item.get("kind", "MISMATCH")))
+        count()
+        if on_changed:
+            on_changed()
+
+    other_folders = {os.path.basename(folder): folder for folder in class_folders.values()}
+    other_var = tk.StringVar(value=sorted(other_folders)[0] if other_folders else "")
     actions = tk.Frame(side, bg=hu.PANEL)
     actions.pack(fill=tk.X, padx=12, pady=12)
-    hu.FlatButton(actions, "LABEL IS RIGHT - KEEP", keep, kind="muted", height=36).pack(fill=tk.X)
-    hu.FlatButton(actions, "MOVE TO THE MODEL'S CLASS", move, height=36).pack(fill=tk.X, pady=(8, 0))
-    hu.FlatButton(actions, "DELETE IMAGE", delete, kind="danger", height=36).pack(fill=tk.X, pady=(8, 0))
-    hu.FlatButton(top, "CLOSE", top.destroy, kind="muted", height=36, width=120).pack(side=tk.RIGHT, padx=16, pady=16)
+    hu.FlatButton(actions, "LABEL IS RIGHT - KEEP", keep, kind="muted", height=34).pack(fill=tk.X)
+    hu.FlatButton(actions, "MOVE TO THE MODEL'S CLASS", move, height=34).pack(fill=tk.X, pady=(6, 0))
+    row = tk.Frame(actions, bg=hu.PANEL)
+    row.pack(fill=tk.X, pady=(6, 0))
+    ttk.Combobox(row, textvariable=other_var, values=sorted(other_folders), state="readonly", width=16).pack(side=tk.LEFT)
+    hu.FlatButton(row, "MOVE TO THIS CLASS", move_other, height=34).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+    hu.FlatButton(actions, "MOVE TO CONFUSION", to_confusion, height=34).pack(fill=tk.X, pady=(6, 0))
+    hu.FlatButton(actions, "DELETE IMAGE", delete, kind="danger", height=34).pack(fill=tk.X, pady=(6, 0))
+    hu.FlatButton(actions, "UNDO", undo, kind="muted", height=34).pack(fill=tk.X, pady=(6, 0))
+    bottom = tk.Frame(top, bg=hu.BG)
+    bottom.pack(fill=tk.X, padx=16, pady=14)
+    hu.FlatButton(bottom, "CLOSE", top.destroy, kind="muted", height=36, width=120).pack(side=tk.RIGHT)
+    hu.FlatButton(bottom, "MOVE ALL LISTED TO CONFUSION", all_to_confusion, kind="danger", height=36, width=320).pack(side=tk.RIGHT, padx=10)
+    lbl_left.pack(in_=bottom, side=tk.LEFT)
+    top.review = {"tree": tree, "keep": keep, "move": move, "move_other": move_other, "other_var": other_var, "to_confusion": to_confusion,
+                  "all_to_confusion": all_to_confusion, "delete": delete, "undo": undo, "changes": changes}
     if mismatches:
         tree.selection_set("0")
+    count()
     return top
