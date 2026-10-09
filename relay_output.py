@@ -51,7 +51,7 @@ class RelayOutput:
         self.master_enabled = False
         self.wanted = {r: 0 for r in range(FIRST_EJECTOR, LAST_EJECTOR + 1)}   # decisions that asked for this relay
         self.sent = {r: 0 for r in range(FIRST_EJECTOR, LAST_EJECTOR + 1)}     # pulses really given to the PLC
-        self.not_sent = {DRY_RUN: 0, MASTER_OFF: 0, PLC_OFFLINE: 0, REFUSED: 0}
+        self.not_sent = {DRY_RUN: 0, MASTER_OFF: 0, PLC_OFFLINE: 0, REFUSED: 0, "WRITE_FAIL": 0, "READBACK_FAIL": 0}
         self.events = deque(maxlen=500)     # (time, relay, delay_ms, pulse_ms, result, source)
         self._pending = deque(maxlen=2000)  # (time the pulse starts, relay, source) of pulses given to the PLC
         self.manual_log_dir = None          # folder for manual_fire_YYYYMMDD.csv (None = no file)

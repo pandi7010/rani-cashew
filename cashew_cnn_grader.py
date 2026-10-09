@@ -1977,6 +1977,364 @@ class App(tk.Tk):
                 pill.set_level(level)
         self._pill_level = level
 
+    # ------------------------------------------------------------------ Pneumatic page (5-track layout, 2 ROIs x 20 ejectors)
+    def _build_pneumatic_page(self):
+        F = ui.FONT
+        page = tk.Frame(self.page_container, bg=ui.BG)
+        self.pages["Pneumatic"] = page
+        self.act_vars, self.dist_vars, self.pn_map_lbls, self.pn_leds, self.map_lbls = {}, {}, {}, {}, getattr(self, "map_lbls", {})
+        self._pn_status, self._pn_fires = {}, {}
+        self._recalc_active = False
+
+        def card(parent, title, note="", **pack):
+            box = tk.Frame(parent, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
+            box.pack(**pack)
+            head = tk.Frame(box, bg=ui.PANEL)
+            head.pack(fill=tk.X, padx=14, pady=(10, 4))
+            tk.Label(head, text=title, font=(F, ui.F_SMALL, "bold"), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT)
+            if note:
+                tk.Label(head, text=note, font=(F, -11), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT, padx=12)
+            return box, head
+
+        def field(parent, var, width=6, **kw):
+            return tk.Entry(parent, textvariable=var, width=width, bg=ui.FIELD, fg=ui.TEXT, insertbackground=ui.TEXT, bd=0, justify="center",
+                            font=(F, -13), highlightthickness=1, highlightbackground=ui.BORDER, highlightcolor=ui.ACCENT, **kw)
+
+        # ── right column: tools ──
+        tools, _ = card(page, "EJECTOR TOOLS", side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
+        tools.config(width=318)
+        tools.pack_propagate(False)
+        pad = dict(fill=tk.X, padx=14)
+        ui.FlatButton(tools, "RUN EJECTOR CHECK 1-40", command=self._open_ejector_check, height=34).pack(pady=(2, 6), **pad)
+        ui.FlatButton(tools, "OPEN PLC DIAGNOSTICS", command=self._open_plc_diagnostics, height=34).pack(pady=(0, 8), **pad)
+        tk.Frame(tools, bg=ui.BORDER, height=1).pack(pady=4, **pad)
+
+        def number_row(label, var, unit=""):
+            row = tk.Frame(tools, bg=ui.PANEL)
+            row.pack(pady=3, **pad)
+            tk.Label(row, text=label, font=(F, -13), fg=ui.TEXT, bg=ui.PANEL).pack(side=tk.LEFT)
+            tk.Label(row, text=unit, font=(F, -11), fg=ui.MUTED, bg=ui.PANEL, width=5, anchor="w").pack(side=tk.RIGHT)
+            field(row, var, 7).pack(side=tk.RIGHT, padx=(0, 4), ipady=2)
+
+        self.weight_var = tk.StringVar(value=f"{self.shared_state.grading.get('avg_cashew_weight_g', 1.8):g}")
+        number_row("AVG CASHEW WEIGHT", self.weight_var, "g")
+        self.common_pulse_var = tk.StringVar(value=str(self.shared_state.common_pulse_ms))
+        number_row("Pulse (all ejectors)", self.common_pulse_var, "ms")
+        self.common_pulse_var.trace_add("write", self._update_common_pulse)
+        self.conveyor_speed_var = tk.StringVar(value=str(int(getattr(self.shared_state, 'conveyor_speed_mm_s', 300))))
+        number_row("Conveyor speed", self.conveyor_speed_var, "mm/s")
+        self.conveyor_speed_var.trace_add("write", self._update_conveyor_speed)
+        ui.FlatButton(tools, "RECALCULATE DELAYS", command=self._recalculate_all_from_distances, kind="muted", height=30).pack(pady=(4, 2), **pad)
+        tk.Label(tools, text="delay = distance / speed - pulse / 2", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL).pack(**pad)
+        tk.Frame(tools, bg=ui.BORDER, height=1).pack(pady=8, **pad)
+
+        # MASTER EJECTOR (off at every start) and DRY-RUN (on at every start)
+        self.dry_run_var = tk.BooleanVar(value=True)
+        self.master_ejector_var = tk.BooleanVar(value=False)
+
+        def switch_row(title):
+            row = tk.Frame(tools, bg=ui.PANEL)
+            row.pack(pady=(2, 0), **pad)
+            tk.Label(row, text=title, font=(F, ui.F_SMALL, "bold"), fg=ui.MUTED, bg=ui.PANEL).pack(anchor="w")
+            line = tk.Frame(row, bg=ui.PANEL)
+            line.pack(fill=tk.X)
+            state = tk.Label(line, text="", font=(F, ui.F_HEAD, "bold"), bg=ui.PANEL)
+            state.pack(side=tk.LEFT)
+            note = tk.Label(tools, text="", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL, anchor="w", justify="left", wraplength=286)
+            return line, state, note
+
+        def refresh_safety_labels():
+            dry, master = self.relay_output.dry_run, self.relay_output.master_enabled
+            self.master_ej_btn.config(text="ON" if master else "OFF", fg=ui.GOOD if master else ui.MUTED)
+            self.dry_run_btn.config(text="ON" if dry else "OFF", fg=ui.WARN if dry else ui.BAD)
+            self._dry_note.config(text="Nothing is sent to the PLC." if dry else "REAL valves fire.", fg=ui.MUTED if dry else ui.BAD)
+            if not master:
+                text, colour = "Grading does not fire.", ui.MUTED
+            elif dry:
+                text, colour = "Grading: dry-run only.", ui.WARN
+            else:
+                text, colour = "Grading fires REAL valves.", ui.BAD
+            self.master_ej_led.config(text=text, fg=colour)
+            for switch, value in ((self._master_switch, master), (self._dry_switch, dry)):
+                if switch.on != value:
+                    switch.set(value)
+        self._refresh_safety_labels = refresh_safety_labels
+
+        def toggle_dry_run(want):
+            if not want and not messagebox.askyesno("DRY-RUN OFF", "With DRY-RUN off, test buttons and grading (if MASTER EJECTOR is on) energise REAL valves.\n\nSwitch DRY-RUN off?"):
+                want = True
+            self.dry_run_var.set(want)
+            self.relay_output.dry_run = want
+            log.info("DRY-RUN %s", "ON" if want else "OFF")
+            refresh_safety_labels()
+
+        def toggle_ejector(want):
+            self.master_ejector_var.set(want)
+            self.relay_output.master_enabled = bool(want)
+            log.info("MASTER EJECTOR %s", "ON" if want else "OFF")
+            refresh_safety_labels()
+
+        line, self.master_ej_btn, self.master_ej_led = switch_row("MASTER EJECTOR")
+        self._master_switch = ui.ToggleSwitch(line, ui.PANEL, on=False, command=toggle_ejector)
+        self._master_switch.pack(side=tk.RIGHT)
+        self.master_ej_led.pack(**pad)
+        line, self.dry_run_btn, self._dry_note = switch_row("DRY-RUN")
+        self._dry_switch = ui.ToggleSwitch(line, ui.PANEL, on=True, command=toggle_dry_run)
+        self._dry_switch.pack(side=tk.RIGHT)
+        self._dry_note.pack(**pad)
+        refresh_safety_labels()
+        tk.Frame(tools, bg=ui.BORDER, height=1).pack(pady=8, **pad)
+
+        # MANUAL FIRE: one ejector, all at once, one after the other. All follow DRY-RUN, only when STOPPED.
+        tk.Label(tools, text="MANUAL FIRE", font=(F, ui.F_SMALL, "bold"), fg=ui.MUTED, bg=ui.PANEL, anchor="w").pack(**pad)
+        row = tk.Frame(tools, bg=ui.PANEL)
+        row.pack(pady=4, **pad)
+        tk.Label(row, text="Ejector", font=(F, -13), fg=ui.TEXT, bg=ui.PANEL).pack(side=tk.LEFT)
+        self.test_relay_var = tk.StringVar(value="1")
+        ttk.Combobox(row, textvariable=self.test_relay_var, values=[str(r) for r in range(FIRST_EJECTOR, LAST_EJECTOR + 1)], width=4,
+                     state="readonly").pack(side=tk.LEFT, padx=(6, 10))
+        tk.Label(row, text="Pulse", font=(F, -13), fg=ui.TEXT, bg=ui.PANEL).pack(side=tk.LEFT)
+        self.test_pulse_var = tk.StringVar(value="100")
+        field(row, self.test_pulse_var, 5).pack(side=tk.LEFT, padx=(6, 4), ipady=2)
+        tk.Label(row, text="ms", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT)
+        self.lbl_test_relay_addr = tk.Label(tools, text="", bg=ui.PANEL, fg=ui.ACCENT, font=(F, -12, "bold"), anchor="w", justify="left", wraplength=286)
+        self.lbl_test_relay_addr.pack(**pad)
+
+        def show_test_relay(*_):
+            try:
+                relay = int(self.test_relay_var.get())
+            except (ValueError, tk.TclError):
+                return
+            role = "REJECT ejector" if relay_mapping.is_reject(relay) else relay_mapping.label(self.shared_state.mapping_by_act, relay)
+            self.lbl_test_relay_addr.config(text=f"{self.relay_output.describe(relay)}\nROI {relay_mapping.roi_of(relay)},  {role}")
+        self.test_relay_var.trace_add("write", show_test_relay)
+        show_test_relay()
+
+        def step_relay(step):
+            try:
+                relay = int(self.test_relay_var.get())
+            except (ValueError, tk.TclError):
+                relay = FIRST_EJECTOR
+            self.test_relay_var.set(str(min(LAST_EJECTOR, max(FIRST_EJECTOR, relay + step))))
+        nav = tk.Frame(tools, bg=ui.PANEL)
+        nav.pack(pady=(4, 6), **pad)
+        ui.FlatButton(nav, "◀", command=lambda: step_relay(-1), kind="muted", height=34, width=40).pack(side=tk.LEFT)
+        ui.FlatButton(nav, "▶", command=lambda: step_relay(1), kind="muted", height=34, width=40).pack(side=tk.RIGHT)
+        ui.FlatButton(nav, "TEST FIRE THIS EJECTOR", command=self._test_fire_selected_relay, kind="danger", height=34).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        both = tk.Frame(tools, bg=ui.PANEL)
+        both.pack(**pad)
+        ui.FlatButton(both, "FIRE 1-40", command=self._fire_all, kind="danger", height=32, width=138).pack(side=tk.LEFT)
+        ui.FlatButton(both, "SEQUENCE 1-40", command=self._sequence_all, kind="danger", height=32, width=138).pack(side=tk.RIGHT)
+        tk.Label(tools, text="Only when STOPPED. They ask first and follow DRY-RUN.", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL, anchor="w", justify="left",
+                 wraplength=286).pack(pady=(4, 0), **pad)
+        self.lbl_test_relay_result = tk.Label(tools, text="", bg=ui.PANEL, fg=ui.MUTED, font=(F, -12), anchor="w", justify="left", wraplength=286)
+        self.lbl_test_relay_result.pack(pady=(4, 0), **pad)
+
+        ui.FlatButton(tools, "SAVE PNEUMATICS", command=self._save_pneumatics, kind="primary", height=44, font=(F, ui.F_BODY, "bold")).pack(side=tk.BOTTOM, pady=(6, 14), **pad)
+        self.lbl_pn_saved = tk.Label(tools, text="", font=(F, -12, "bold"), fg=ui.MUTED, bg=ui.PANEL, anchor="w")
+        self.lbl_pn_saved.pack(side=tk.BOTTOM, **pad)
+
+        # ── left: the two ejector tables ──
+        left = tk.Frame(page, bg=ui.BG)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tables = tk.Frame(left, bg=ui.BG)
+        tables.pack(fill=tk.X)
+        columns = (("", 2), ("EJ", 4), ("PLC", 5), ("CLASSES / GRADES", 27), ("DIST mm", 7), ("DELAY", 7), ("TEST", 5), ("LAST FIRE", 17), ("FIRES", 6))
+        for block, (title, relays) in enumerate((("EJECTORS  ROI 1", range(1, 21)), ("EJECTORS  ROI 2", range(21, 41)))):
+            box, _ = card(tables, title, "click the classes of a row to change them" if block == 0 else "", side=tk.LEFT, fill=tk.BOTH, expand=True,
+                          padx=(0, 6) if block == 0 else (6, 0))
+            grid = tk.Frame(box, bg=ui.PANEL)
+            grid.pack(fill=tk.X, padx=10, pady=(0, 8))
+            for col, (text, width) in enumerate(columns):
+                tk.Label(grid, text=text, font=(F, -10, "bold"), fg=ui.MUTED, bg=ui.PANEL, width=width, anchor="w").grid(row=0, column=col, sticky="w", pady=(0, 2))
+            for r, i in enumerate(relays, start=1):
+                reject = relay_mapping.is_reject(i)
+                led = tk.Label(grid, text="●", font=(F, -11), fg=ui.BORDER, bg=ui.PANEL)
+                led.grid(row=r, column=0)
+                self.pn_leds[i] = led
+                tk.Label(grid, text=f"A{i:02d}", font=(F, -13, "bold"), fg=ui.WARN if reject else ui.TEXT, bg=ui.PANEL, anchor="w").grid(row=r, column=1, sticky="w")
+                address = self.relay_output.address_of(i)
+                tk.Label(grid, text=f"M{address}" if address is not None else "?", font=(F, -12), fg=ui.MUTED, bg=ui.PANEL, anchor="w").grid(row=r, column=2, sticky="w")
+                classes = ttk.Label(grid, text="", width=30, anchor="w", font=(F, -12, "bold"), background=ui.PANEL, cursor="arrow" if reject else "hand2")
+                classes.grid(row=r, column=3, sticky="w")
+                classes.bind("<Button-1>", lambda e, x=i: self._popup_mapper(x))
+                self.pn_map_lbls[i] = classes
+                dist = tk.StringVar(value=str(self.shared_state.distances_mm[i - 1]))
+                field(grid, dist, 7).grid(row=r, column=4, sticky="w", pady=1)
+                delay = tk.StringVar(value=str(self.shared_state.delays_ms[i - 1]))
+                field(grid, delay, 7).grid(row=r, column=5, sticky="w", pady=1)
+                self.dist_vars[i], self.act_vars[i] = dist, delay
+                ui.FlatButton(grid, "TEST", command=lambda x=i: self._pulse_and_flash(x), height=22, width=46, font=(F, -10, "bold")).grid(row=r, column=6, sticky="w", padx=(2, 4))
+                status = tk.Label(grid, text="", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL, anchor="w", width=19)
+                status.grid(row=r, column=7, sticky="w")
+                fires = tk.Label(grid, text="0", font=(F, -12, "bold"), fg=ui.TEXT, bg=ui.PANEL, anchor="e", width=6)
+                fires.grid(row=r, column=8, sticky="e")
+                self._pn_status[i], self._pn_fires[i] = status, fires
+                dist.trace_add("write", lambda *_, ii=i: self._on_distance_changed(ii))
+                delay.trace_add("write", lambda *_, ii=i: self._update_act_timing(ii))
+
+        # ── class chips: PASS (counts as no defect) or FIRE (its ejector, or the reject ejector) ──
+        chips_box, chips_head = card(left, "CLASSES", "click: PASS = no defect,  FIRE = a defect (to its ejector, or REJECT)", fill=tk.X, pady=(10, 0))
+        self._chip_frame = tk.Frame(chips_box, bg=ui.PANEL)
+        self._chip_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
+        self._chip_signature = None
+
+        low = tk.Frame(left, bg=ui.BG)
+        low.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        # ── inspection engines ──
+        eng_box, _ = card(low, "INSPECTION ENGINES", "SHADOW = measured, \"would reject\" is logged, never fires", side=tk.LEFT, fill=tk.BOTH, padx=(0, 6))
+        eng_box.config(width=610)
+        eng_box.pack_propagate(False)
+        self._engine_switches, self._engine_counts = {}, {}
+        for name, (title, looks_for, measuring) in engines.ENGINES.items():
+            row = tk.Frame(eng_box, bg=ui.PANEL)
+            row.pack(fill=tk.X, padx=14, pady=3)
+            text = tk.Frame(row, bg=ui.PANEL)
+            text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            tk.Label(text, text=title, font=(F, -13, "bold"), fg=ui.TEXT, bg=ui.PANEL, anchor="w").pack(fill=tk.X)
+            count = tk.Label(text, text=looks_for, font=(F, -11), fg=ui.WARN if measuring else ui.MUTED, bg=ui.PANEL, anchor="w", justify="left", wraplength=370)
+            count.pack(fill=tk.X)
+            mode = {**engines.ENGINE_DEFAULTS, **self.shared_state.grading.get("engines", {})}[name]
+            switch = ui.Segmented(row, list(engines.MODES), mode, command=lambda value, n=name: self._set_engine(n, value),
+                                  colours={engines.OFF: ui.IDLE, engines.SHADOW: ui.WARN, engines.ACTIVE: ui.GOOD})
+            switch.pack(side=tk.RIGHT)
+            self._engine_switches[name], self._engine_counts[name] = switch, count
+        tk.Label(eng_box, text="Always reject, cannot be switched off: Double / touching (longer than 45 mm or CNN class DOUBLE), stuck, lost over 300 ms, seen after the line.",
+                 font=(F, -11), fg=ui.MUTED, bg=ui.PANEL, anchor="w", justify="left", wraplength=580).pack(fill=tk.X, padx=14, pady=(4, 8))
+
+        # ── recent ejector events + mapping notes ──
+        ev_box, _ = card(low, "RECENT EJECTOR EVENTS", side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
+        style = ttk.Style(self)
+        style.configure("Events.Treeview", rowheight=20, font=(F, -12), background=ui.PANEL, fieldbackground=ui.PANEL, foreground=ui.TEXT, borderwidth=0)
+        style.configure("Events.Treeview.Heading", font=(F, -11, "bold"), background=ui.BORDER, foreground=ui.ACCENT, borderwidth=0)
+        style.layout("Events.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+        self.lbl_map_problem = tk.Label(ev_box, text="", font=(F, -12, "bold"), fg=ui.BAD, bg=ui.PANEL, anchor="w", justify="left", wraplength=520)
+        self.lbl_map_problem.pack(side=tk.BOTTOM, fill=tk.X, padx=14)
+        self.lbl_map_unassigned = tk.Label(ev_box, text="", font=(F, -12, "bold"), fg=ui.WARN, bg=ui.PANEL, anchor="w", justify="left", wraplength=520)
+        self.lbl_map_unassigned.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=(4, 8))
+        self.event_tree = ttk.Treeview(ev_box, columns=("time", "ej", "source", "delay", "pulse", "result"), show="headings", height=6, style="Events.Treeview")
+        for col, text, width in (("time", "TIME", 92), ("ej", "EJ", 44), ("source", "CASHEW / SOURCE", 220), ("delay", "DELAY", 60), ("pulse", "PULSE", 54), ("result", "RESULT", 120)):
+            self.event_tree.heading(col, text=text)
+            self.event_tree.column(col, width=width, anchor="w")
+        self.event_tree.tag_configure("sent", foreground=ui.GOOD)
+        self.event_tree.tag_configure("not", foreground=ui.WARN)
+        self.event_tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 4))
+        self._events_shown = None
+        self._update_all_map_labels()
+        self._refresh_pneumatic(force=True)
+
+    def _set_engine(self, name, mode):
+        """OFF / SHADOW / ACTIVE of one inspection engine. An engine that does not measure yet cannot be ACTIVE."""
+        if mode == engines.ACTIVE and not engines.ENGINES[name][2]:
+            messagebox.showinfo("Inspection engine", f"{engines.ENGINES[name][0]} does not measure yet in this version: NOT AVAILABLE as ACTIVE.\nIt stays in SHADOW.")
+            return
+        if mode == engines.ACTIVE and not messagebox.askyesno("Inspection engine", f"Set {engines.ENGINES[name][0]} to ACTIVE?\n\nIt will then turn GOOD cashews into rejects. "
+                                                             "Do this only after its \"would reject\" numbers were checked in SHADOW."):
+            return
+        g = copy.deepcopy(self.shared_state.grading)
+        g.setdefault("engines", {})[name] = mode
+        self.shared_state.set_grading(g)
+        self._engine_switches[name].set(mode)
+        log.info("Inspection engine %s -> %s", name, mode)
+
+    def _toggle_class_pass(self, name):
+        """A class chip was clicked: PASS (a "no defect" class) <-> FIRE (a defect class)."""
+        g = copy.deepcopy(self.shared_state.grading)
+        good = [c for c in g.get("good_classes", [])]
+        if any(normalize_name(c) == normalize_name(name) for c in good):
+            good = [c for c in good if normalize_name(c) != normalize_name(name)]
+            if not any(normalize_name(c) == normalize_name(name) for c in g.get("priority", []) + g.get("reject_classes", [])):
+                g["priority"] = list(g.get("priority", [])) + [name]
+        else:
+            if not messagebox.askyesno("PASS", f"Set {name} to PASS?\n\nA cashew of this class then counts as \"no defect\" and is graded as GOOD."):
+                return
+            good.append(name)
+        g["good_classes"] = good
+        self.shared_state.set_grading(g)
+        self._refresh_pneumatic(force=True)
+
+    def _refresh_pneumatic(self, force=False):
+        """Chips, engine counts, last fire and fires per ejector, recent events (while the page is shown)."""
+        if not force and not self.pages["Pneumatic"].winfo_ismapped():
+            return
+        F, ss, out = ui.FONT, self.shared_state, self.relay_output
+        with ss.lock:
+            g = copy.deepcopy(ss.grading)
+            table = dict(ss.mapping_t1)
+            engine_counts = dict(ss.engine_counts)
+        good = {normalize_name(c) for c in g.get("good_classes", [])}
+        fixed = [decision.REJECTION, decision.DOUBLE_CLASS] + list(g.get("reject_classes", []))
+        names = list(g.get("priority", [])) + ["GOOD_CASHEW"] + [c for c in g.get("good_classes", []) if normalize_name(c) not in ("good cashew", "good")]
+        seen, chips = set(), []
+        for name in names + fixed:
+            key = normalize_name(name)
+            if key in seen:
+                continue
+            seen.add(key)
+            if name in fixed:
+                chips.append((name, "REJECT", ui.BAD, True))
+            elif key in good:
+                chips.append((name, "PASS", ui.GOOD, False))
+            else:
+                relay = table.get(key)
+                chips.append((name, f"A{relay:02d}" if relay else "REJECT", ui.BAD if relay else ui.WARN, False))
+        signature = tuple(chips)
+        if signature != self._chip_signature:
+            self._chip_signature = signature
+            for child in self._chip_frame.winfo_children():
+                child.destroy()
+            for index, (name, tag, colour, is_fixed) in enumerate(chips):
+                chip = tk.Frame(self._chip_frame, bg=ui.mix(ui.PANEL, colour, 0.14), highlightthickness=1, highlightbackground=ui.mix(ui.PANEL, colour, 0.5),
+                                cursor="arrow" if is_fixed else "hand2")
+                chip.grid(row=index // 7, column=index % 7, sticky="ew", padx=3, pady=3)
+                self._chip_frame.columnconfigure(index % 7, weight=1, uniform="chip")
+                label = tk.Label(chip, text=name, font=(F, -12, "bold"), fg=ui.TEXT, bg=chip.cget("bg"), anchor="w")
+                label.pack(side=tk.LEFT, padx=(8, 4), pady=5)
+                mark = tk.Label(chip, text=f" {tag} ", font=(F, -11, "bold"), fg="#06131A", bg=colour)
+                mark.pack(side=tk.RIGHT, padx=(0, 6))
+                if is_fixed:
+                    tk.Label(chip, text="FIXED", font=(F, -8, "bold"), fg=ui.MUTED, bg=chip.cget("bg")).pack(side=tk.RIGHT, padx=(0, 4))
+                else:
+                    for widget in (chip, label, mark):
+                        widget.bind("<Button-1>", lambda e, n=name: self._toggle_class_pass(n))
+        modes = {**engines.ENGINE_DEFAULTS, **g.get("engines", {})}
+        for name, (title, looks_for, measuring) in engines.ENGINES.items():
+            self._engine_switches[name].set(modes[name])
+            if not measuring:
+                text = f"{looks_for}  -  not measuring yet: NOT AVAILABLE"
+            elif modes[name] == engines.OFF:
+                text = looks_for
+            else:
+                word = "would reject" if modes[name] == engines.SHADOW else "rejected"
+                text = f"{word}: {engine_counts.get(name, 0)}" + ("   (shadow: logged only, nothing is fired)" if modes[name] == engines.SHADOW else "")
+            self._engine_counts[name].config(text=text)
+
+        wanted, sent, _ = out.counts()
+        events = out.recent_events()
+        last = {}
+        for when, relay, delay_ms, pulse_ms, result, source in events:
+            last.setdefault(relay, (when, result))
+        texts = {"SENT": "OK", "DRY_RUN": "DRY-RUN", "PLC_OFFLINE": "PLC OFFLINE", "MASTER_OFF": "MASTER OFF", "REFUSED": "REFUSED", "WRITE_FAIL": "WRITE FAIL", "READBACK_FAIL": "READ-BACK FAIL"}
+        for relay in range(FIRST_EJECTOR, LAST_EJECTOR + 1):
+            if relay in last:
+                when, result = last[relay]
+                self._pn_status[relay].config(text=f"{texts.get(result, result)}  {time.strftime('%H:%M:%S', time.localtime(when))}", fg=ui.GOOD if result == "SENT" else ui.WARN)
+            else:
+                self._pn_status[relay].config(text="(free)" if not relay_mapping.is_reject(relay) and not ss.mapping_by_act.get(relay) else "-", fg=ui.MUTED)
+            real, asked = sent.get(relay, 0), wanted.get(relay, 0)
+            self._pn_fires[relay].config(text=str(real) if real == asked else f"{real} ({asked})")
+        key = (len(events), events[0][0] if events else 0)
+        if key != self._events_shown:
+            self._events_shown = key
+            self.event_tree.delete(*self.event_tree.get_children())
+            for when, relay, delay_ms, pulse_ms, result, source in events[:60]:
+                stamp = time.strftime("%H:%M:%S", time.localtime(when)) + f".{int(when * 1000) % 1000:03d}"
+                self.event_tree.insert("", "end", values=(stamp, f"A{relay:02d}" if isinstance(relay, int) else relay, source, f"{delay_ms:.0f}", f"{pulse_ms:.0f}",
+                                                         texts.get(result, result)), tags=("sent" if result == "SENT" else "not",))
+        self._refresh_safety_labels()
+        dirty = getattr(self, "_mapping_dirty", False)
+        self.lbl_pn_saved.config(text="●  mapping changed, not saved" if dirty else "All changes saved", fg=ui.WARN if dirty else ui.MUTED)
+
     # ------------------------------------------------------------------ Info page (only facts the software knows)
     def _build_info_page(self):
         F = ui.FONT
@@ -2107,6 +2465,9 @@ class App(tk.Tk):
         cam_colour = ui.GOOD if cam.is_connected else (ui.WARN if cam.state in ("CONNECTING", "RECONNECTING") else ui.BAD)
         self.pills["camera"].set(str(cam.state), cam_colour)
         plc_ok = self.controller.is_connected()
+        if plc_ok and getattr(self, "_plc_was_ok", None) is False:
+            self.plc_reconnects += 1
+        self._plc_was_ok = plc_ok
         self.pills["plc"].set("ONLINE" if plc_ok else "OFFLINE", ui.GOOD if plc_ok else ui.BAD)
         master, dry = self.relay_output.master_enabled, self.relay_output.dry_run
         self.pills["master"].set("ON" if master else "OFF", ui.GOOD if master else ui.MUTED)
@@ -2789,250 +3150,7 @@ class App(tk.Tk):
         ttk.Button(sort_inner, text="SAVE SORTING CONFIG", style="Primary.TButton", command=self._save_program).pack(fill=tk.X, pady=20)
 
 
-        p_pneu = tk.Frame(self.page_container, bg=self.colors["surface"])
-        self.pages["Pneumatic"] = p_pneu
-        # Right controls panel
-        pn_controls = tk.Frame(p_pneu, bg=self.colors["surface"], width=320, padx=15, pady=15)
-        pn_controls.pack(side="right", fill="y", padx=(10,0))
-        pn_controls.pack_propagate(False)
-        
-        ttk.Button(pn_controls, text="SAVE PNEUMATICS", style="Primary.TButton", command=self._save_pneumatics).pack(fill=tk.X, pady=(0, 30))
-        ttk.Label(pn_controls, text="GLOBAL CONTROLS", style="Header.TLabel").pack(anchor="w", pady=(0, 10))
-        
-        cp_frm = tk.Frame(pn_controls, bg=self.colors["surface"])
-        cp_frm.pack(fill=tk.X, pady=(0,15))
-        ttk.Label(cp_frm, text="Common Pulse Time:", style="Surface.TLabel").pack(side=tk.LEFT)
-        self.common_pulse_var = tk.StringVar(value=str(self.shared_state.common_pulse_ms))
-        tk.Entry(cp_frm, textvariable=self.common_pulse_var, width=8, bg=self.colors["surface_light"], fg=self.colors["text"], bd=0, font=("Roboto", 12)).pack(side=tk.RIGHT)
-        self.common_pulse_var.trace_add("write", self._update_common_pulse)
-        
-        cs_frm = tk.Frame(pn_controls, bg=self.colors["surface"])
-        cs_frm.pack(fill=tk.X, pady=(0,15))
-        ttk.Label(cs_frm, text="Conveyor Speed (mm/s):", style="Surface.TLabel").pack(side=tk.LEFT)
-        self.conveyor_speed_var = tk.StringVar(value=str(int(getattr(self.shared_state, 'conveyor_speed_mm_s', 300))))
-        tk.Entry(cs_frm, textvariable=self.conveyor_speed_var, width=8, bg=self.colors["surface_light"], fg=self.colors["text"], bd=0, font=("Roboto", 12)).pack(side=tk.RIGHT)
-        self.conveyor_speed_var.trace_add("write", self._update_conveyor_speed)
-        
-        ttk.Button(pn_controls, text="RECALCULATE FROM DISTANCES", style="Secondary.TButton", command=self._recalculate_all_from_distances).pack(fill=tk.X, pady=(0, 10))
-        
-        ttk.Button(pn_controls, text="OPEN PLC DIAGNOSTICS", style="Primary.TButton", command=self._open_plc_diagnostics).pack(fill=tk.X, pady=(0, 10))
-
-        ttk.Separator(pn_controls, orient="horizontal").pack(fill=tk.X, pady=10)
-
-        surf = self.colors["surface"]
-        # DRY-RUN: on at every start. Nothing reaches the PLC; what would fire is only counted and logged.
-        self.dry_run_var = tk.BooleanVar(value=True)
-        # MASTER EJECTOR: off at every start. Blocks firing that comes from grading.
-        self.master_ejector_var = tk.BooleanVar(value=False)
-
-        def refresh_safety_labels():
-            dry, master = self.relay_output.dry_run, self.relay_output.master_enabled
-            self.dry_run_btn.config(text="DRY-RUN: ON (nothing is sent to the PLC)" if dry else "DRY-RUN: OFF (REAL valves)",
-                                    fg=self.colors["success"] if dry else self.colors["danger"])
-            self.master_ej_btn.config(text="MASTER EJECTOR: ON" if master else "MASTER EJECTOR: OFF")
-            if not master:
-                text, colour = "● Grading does not fire", self.colors["text_muted"]
-            elif dry:
-                text, colour = "● Grading: dry-run only", self.colors["warning"]
-            else:
-                text, colour = "● Grading fires REAL valves", self.colors["danger"]
-            self.master_ej_led.config(text=text, fg=colour)
-
-        def toggle_dry_run():
-            want = self.dry_run_var.get()
-            if not want and not messagebox.askyesno("DRY-RUN OFF", "With DRY-RUN off, test buttons and grading (if MASTER EJECTOR is on) energise REAL valves.\n\nSwitch DRY-RUN off?"):
-                self.dry_run_var.set(True)
-                want = True
-            self.relay_output.dry_run = want
-            log.info("DRY-RUN %s", "ON" if want else "OFF")
-            refresh_safety_labels()
-
-        def toggle_ejector():
-            self.relay_output.master_enabled = self.master_ejector_var.get()
-            log.info("MASTER EJECTOR %s", "ON" if self.relay_output.master_enabled else "OFF")
-            refresh_safety_labels()
-
-        self.dry_run_btn = tk.Checkbutton(pn_controls, variable=self.dry_run_var, command=toggle_dry_run, bg=surf, selectcolor=self.colors["surface_light"],
-                                          activebackground=surf, font=("Roboto", 9, "bold"), indicatoron=False, wraplength=240, pady=4)
-        self.dry_run_btn.pack(fill=tk.X, pady=(0, 6))
-        self.master_ej_btn = tk.Checkbutton(pn_controls, variable=self.master_ejector_var, command=toggle_ejector, bg=surf, fg="white", selectcolor=self.colors["surface_light"],
-                                            activebackground=surf, font=("Roboto", 11, "bold"), indicatoron=False, pady=4)
-        self.master_ej_btn.pack(fill=tk.X, pady=(0, 6))
-        self.master_ej_led = tk.Label(pn_controls, text="", font=("Roboto", 10, "bold"), bg=surf)
-        self.master_ej_led.pack(anchor="center")
-        refresh_safety_labels()
-
-        ttk.Separator(pn_controls, orient="horizontal").pack(fill=tk.X, pady=10)
-
-        # ── Single relay test: check that each M coil drives the right valve ──
-        ttk.Label(pn_controls, text="SINGLE RELAY TEST", style="Header.TLabel").pack(anchor="w", pady=(0, 6))
-        test_row = tk.Frame(pn_controls, bg=surf)
-        test_row.pack(fill=tk.X)
-        ttk.Label(test_row, text="Relay", style="Surface.TLabel").pack(side=tk.LEFT)
-        self.test_relay_var = tk.StringVar(value="1")
-        ttk.Combobox(test_row, textvariable=self.test_relay_var, values=[str(r) for r in range(FIRST_EJECTOR, LAST_EJECTOR + 1)],
-                     width=4, state="readonly").pack(side=tk.LEFT, padx=(5, 10))
-        ttk.Label(test_row, text="Pulse ms", style="Surface.TLabel").pack(side=tk.LEFT)
-        self.test_pulse_var = tk.StringVar(value="100")
-        tk.Entry(test_row, textvariable=self.test_pulse_var, width=5, bg=self.colors["surface_light"], fg=self.colors["text"], bd=0, font=("Roboto", 11)).pack(side=tk.LEFT, padx=5)
-        self.lbl_test_relay_addr = tk.Label(pn_controls, text="", bg=surf, fg=self.colors["info"], font=("Roboto", 10, "bold"), anchor="w")
-        self.lbl_test_relay_addr.pack(fill=tk.X, pady=(6, 2))
-        nav_row = tk.Frame(pn_controls, bg=surf)
-        nav_row.pack(fill=tk.X, pady=2)
-        nav_row.columnconfigure(0, weight=1); nav_row.columnconfigure(1, weight=3); nav_row.columnconfigure(2, weight=1)
-
-        def show_test_relay(*_):
-            try:
-                relay = int(self.test_relay_var.get())
-            except ValueError:
-                return
-            roi = 1 if relay <= 20 else 2
-            role = "REJECT relay" if relay in (1, 21) else "class / grade relay"
-            self.lbl_test_relay_addr.config(text=f"{self.relay_output.describe(relay)}\nROI {roi}, {role}", justify="left")
-
-        def step_test_relay(step):
-            relay = min(LAST_EJECTOR, max(FIRST_EJECTOR, int(self.test_relay_var.get()) + step))
-            self.test_relay_var.set(str(relay))
-
-        ttk.Button(nav_row, text="◀", width=3, command=lambda: step_test_relay(-1)).grid(row=0, column=0, sticky="ew", padx=(0, 3))
-        ttk.Button(nav_row, text="TEST FIRE THIS RELAY", style="Danger.TButton", command=self._test_fire_selected_relay).grid(row=0, column=1, sticky="ew")
-        ttk.Button(nav_row, text="▶", width=3, command=lambda: step_test_relay(1)).grid(row=0, column=2, sticky="ew", padx=(3, 0))
-        self.lbl_test_relay_result = tk.Label(pn_controls, text="Only when the machine is STOPPED.", bg=surf, fg=self.colors["text_muted"],
-                                              font=("Roboto", 9), anchor="w", justify="left", wraplength=250)
-        self.lbl_test_relay_result.pack(fill=tk.X, pady=(4, 8))
-        self.test_relay_var.trace_add("write", show_test_relay)
-        show_test_relay()
-
-        all_row = tk.Frame(pn_controls, bg=surf)
-        all_row.pack(fill=tk.X)
-        all_row.columnconfigure(0, weight=1); all_row.columnconfigure(1, weight=1)
-        ttk.Button(all_row, text="SEQUENCE 1-40", command=self._sequence_all).grid(row=0, column=0, sticky="ew", padx=(0, 3))
-        ttk.Button(all_row, text="FIRE 1-40", command=self._fire_all).grid(row=0, column=1, sticky="ew", padx=(3, 0))
-        ttk.Button(pn_controls, text="RUN EJECTOR CHECK 1-40", style="Primary.TButton", command=self._open_ejector_check).pack(fill=tk.X, pady=(8, 0))
-
-        pn_canvas = tk.Canvas(p_pneu, bg=self.colors["surface"], highlightthickness=0)
-        pn_scroll = ttk.Scrollbar(p_pneu, orient="vertical", command=pn_canvas.yview)
-        pn_inner = tk.Frame(pn_canvas, bg=self.colors["surface"], padx=15, pady=15)
-        pn_inner.bind("<Configure>", lambda e: pn_canvas.configure(scrollregion=pn_canvas.bbox("all")))
-        pn_inner_id = pn_canvas.create_window((0, 0), window=pn_inner, anchor="nw")
-        pn_canvas.bind("<Configure>", lambda e: pn_canvas.itemconfig(pn_inner_id, width=e.width))
-        pn_canvas.configure(yscrollcommand=pn_scroll.set)
-        pn_canvas.pack(side="left", fill="both", expand=True)
-        pn_scroll.pack(side="right", fill="y")
-        
-        ttk.Label(pn_inner, text="PNEUMATIC TIMING (MS) & DISTANCE (MM)", style="Title.TLabel").pack(anchor="w", pady=(0,10))
-        
-        act_grid = tk.Frame(pn_inner, bg=self.colors["surface"])
-        act_grid.pack(fill=tk.X)
-        act_grid.columnconfigure(0, weight=1); act_grid.columnconfigure(1, weight=1)
-        
-        # Header Row 0
-        h_f1 = tk.Frame(act_grid, bg=self.colors["surface"])
-        h_f1.grid(row=0, column=0, sticky="ew", padx=(0,10), pady=(0,8))
-        ttk.Label(h_f1, text="ROI LEFT (A01-A20)", font=("Roboto", 12, "bold"), foreground=self.colors["info"], style="Surface.TLabel").pack(side=tk.LEFT)
-        ttk.Label(h_f1, text="Dist(mm)  Delay(ms)", font=("Roboto", 9, "bold"), foreground=self.colors["text_muted"], style="Surface.TLabel").pack(side=tk.RIGHT, padx=(0,40))
-
-        h_f2 = tk.Frame(act_grid, bg=self.colors["surface"])
-        h_f2.grid(row=0, column=1, sticky="ew", padx=(10,0), pady=(0,8))
-        ttk.Label(h_f2, text="ROI RIGHT (A21-A40)", font=("Roboto", 12, "bold"), foreground=self.colors["info"], style="Surface.TLabel").pack(side=tk.LEFT)
-        ttk.Label(h_f2, text="Dist(mm)  Delay(ms)", font=("Roboto", 9, "bold"), foreground=self.colors["text_muted"], style="Surface.TLabel").pack(side=tk.RIGHT, padx=(0,40))
-
-        self.act_vars = {}
-        self.dist_vars = {}
-        self._recalc_active = False
-
-        for i in range(1, 21):
-            f1 = tk.Frame(act_grid, bg=self.colors["surface"])
-            f1.grid(row=i, column=0, sticky="ew", padx=(0,10), pady=4)
-            d1 = tk.StringVar(value=str(self.shared_state.delays_ms[i-1]))
-            cur_dist1 = self.shared_state.distances_mm[i-1]
-            dist_str1 = f"{cur_dist1:.1f}" if cur_dist1 > 0 else ""
-            dist1 = tk.StringVar(value=dist_str1)
-            self.dist_vars[i] = dist1
-            self.act_vars[i] = d1
-
-            ttk.Label(f1, text=f"A{i:02d}", font=("Roboto", 10, "bold"), foreground=self.colors["text_muted"], style="Surface.TLabel").pack(side=tk.LEFT, padx=(0,3))
-            
-            # Distance input box (mm)
-            tk.Entry(f1, textvariable=dist1, width=5, bg=self.colors["surface_light"], fg=self.colors.get("accent", "#38BDF8"), bd=0, font=("Roboto", 10)).pack(side=tk.LEFT, padx=(0,1))
-            ttk.Label(f1, text="mm", font=("Roboto", 8), foreground=self.colors["text_muted"], style="Surface.TLabel").pack(side=tk.LEFT, padx=(0,4))
-
-            # Delay input box (ms)
-            tk.Entry(f1, textvariable=d1, width=5, bg=self.colors["surface_light"], fg=self.colors["text"], bd=0, font=("Roboto", 10)).pack(side=tk.LEFT, padx=(0,1))
-            ttk.Label(f1, text="ms", font=("Roboto", 8), foreground=self.colors["text_muted"], style="Surface.TLabel").pack(side=tk.LEFT, padx=(0,4))
-
-            if hasattr(self, 'img_test') and self.img_test:
-                tk.Button(f1, image=self.img_test, bg=self.colors["surface_light"], bd=0, command=lambda x=i: self._pulse_and_flash(x)).pack(side=tk.LEFT)
-            else:
-                tk.Button(f1, text="T", bg=self.colors["surface_light"], fg=self.colors["text"], bd=0, command=lambda x=i: self._pulse_and_flash(x)).pack(side=tk.LEFT)
-                
-            if hasattr(self, 'img_gear') and self.img_gear:
-                tk.Button(f1, image=self.img_gear, bg=self.colors["surface_light"], bd=0, command=lambda x=i: self._popup_mapper(x)).pack(side=tk.LEFT, padx=(2,0))
-            else:
-                tk.Button(f1, text="M", bg=self.colors["info"], fg="white", bd=0, command=lambda x=i: self._popup_mapper(x)).pack(side=tk.LEFT, padx=(2,0))
-            
-            if not hasattr(self, 'pn_map_lbls'): self.pn_map_lbls = {}
-            if not hasattr(self, 'pn_leds'): self.pn_leds = {}
-            
-            self.pn_leds[i] = tk.Label(f1, text="●", fg=self.colors["surface_light"], bg=self.colors["surface"], font=("Roboto", 10))
-            self.pn_leds[i].pack(side=tk.LEFT, padx=(2,0))
-            
-            self.pn_map_lbls[i] = ttk.Label(f1, text="(none)", width=24, anchor="w", style="Surface.TLabel")
-            self.pn_map_lbls[i].pack(side=tk.LEFT, padx=(3,0))
-
-            dist1.trace_add("write", lambda *_, ii=i: self._on_distance_changed(ii))
-            d1.trace_add("write", lambda *_, ii=i: self._update_act_timing(ii))
-            
-            i2 = i + 20
-            f2 = tk.Frame(act_grid, bg=self.colors["surface"])
-            f2.grid(row=i, column=1, sticky="ew", padx=(10,0), pady=4)
-            d2 = tk.StringVar(value=str(self.shared_state.delays_ms[i2-1]))
-            cur_dist2 = self.shared_state.distances_mm[i2-1]
-            dist_str2 = f"{cur_dist2:.1f}" if cur_dist2 > 0 else ""
-            dist2 = tk.StringVar(value=dist_str2)
-            self.dist_vars[i2] = dist2
-            self.act_vars[i2] = d2
-
-            ttk.Label(f2, text=f"A{i2:02d}", font=("Roboto", 10, "bold"), foreground=self.colors["text_muted"], style="Surface.TLabel").pack(side=tk.LEFT, padx=(0,3))
-            
-            # Distance input box (mm)
-            tk.Entry(f2, textvariable=dist2, width=5, bg=self.colors["surface_light"], fg=self.colors.get("accent", "#38BDF8"), bd=0, font=("Roboto", 10)).pack(side=tk.LEFT, padx=(0,1))
-            ttk.Label(f2, text="mm", font=("Roboto", 8), foreground=self.colors["text_muted"], style="Surface.TLabel").pack(side=tk.LEFT, padx=(0,4))
-
-            # Delay input box (ms)
-            tk.Entry(f2, textvariable=d2, width=5, bg=self.colors["surface_light"], fg=self.colors["text"], bd=0, font=("Roboto", 10)).pack(side=tk.LEFT, padx=(0,1))
-            ttk.Label(f2, text="ms", font=("Roboto", 8), foreground=self.colors["text_muted"], style="Surface.TLabel").pack(side=tk.LEFT, padx=(0,4))
-
-            if hasattr(self, 'img_test') and self.img_test:
-                tk.Button(f2, image=self.img_test, bg=self.colors["surface_light"], bd=0, command=lambda x=i2: self._pulse_and_flash(x)).pack(side=tk.LEFT)
-            else:
-                tk.Button(f2, text="T", bg=self.colors["surface_light"], fg=self.colors["text"], bd=0, command=lambda x=i2: self._pulse_and_flash(x)).pack(side=tk.LEFT)
-                
-            if hasattr(self, 'img_gear') and self.img_gear:
-                tk.Button(f2, image=self.img_gear, bg=self.colors["surface_light"], bd=0, command=lambda x=i2: self._popup_mapper(x)).pack(side=tk.LEFT, padx=(2,0))
-            else:
-                tk.Button(f2, text="M", bg=self.colors["info"], fg="white", bd=0, command=lambda x=i2: self._popup_mapper(x)).pack(side=tk.LEFT, padx=(2,0))
-                
-            self.pn_leds[i2] = tk.Label(f2, text="●", fg=self.colors["surface_light"], bg=self.colors["surface"], font=("Roboto", 10))
-            self.pn_leds[i2].pack(side=tk.LEFT, padx=(2,0))
-            
-            self.pn_map_lbls[i2] = ttk.Label(f2, text="(none)", width=24, anchor="w", style="Surface.TLabel")
-            self.pn_map_lbls[i2].pack(side=tk.LEFT, padx=(3,0))
-
-            dist2.trace_add("write", lambda *_, ii=i2: self._on_distance_changed(ii))
-            d2.trace_add("write", lambda *_, ii=i2: self._update_act_timing(ii))
-            
-        notes = tk.Frame(act_grid, bg=self.colors["surface"])
-        notes.grid(row=30, column=0, columnspan=2, sticky="ew", pady=(14, 0))
-        tk.Label(notes, text="Gear button of a row: choose its classes / grades (several per ejector). An ejector without a class is (free) and stays OFF.",
-                 font=("Roboto", 10), fg=self.colors["text_muted"], bg=self.colors["surface"], anchor="w", justify="left").pack(fill=tk.X)
-        self.lbl_map_unassigned = tk.Label(notes, text="", font=("Roboto", 11, "bold"), fg=self.colors["warning"], bg=self.colors["surface"],
-                                           anchor="w", justify="left", wraplength=1250)
-        self.lbl_map_unassigned.pack(fill=tk.X, pady=(6, 0))
-        self.lbl_map_problem = tk.Label(notes, text="", font=("Roboto", 11, "bold"), fg=self.colors["danger"], bg=self.colors["surface"],
-                                        anchor="w", justify="left", wraplength=1250)
-        self.lbl_map_problem.pack(fill=tk.X, pady=(6, 0))
-        self._update_all_map_labels()
+        self._build_pneumatic_page()
 
         p_net = tk.Frame(self.page_container, bg=self.colors["surface"], padx=15, pady=15)
         self.pages["Network"] = p_net
@@ -3109,6 +3227,8 @@ class App(tk.Tk):
 
     # ── Training (training.py does the work; training_ui.py shows it) ──
     active_program_name = app_paths.PROGRAM_NAME
+    plc_reconnects = 0                  # PLC came back after being offline (since program start)
+    log_dir = app_paths.LOGS_DIR
 
     def _active_dataset_dir(self):
         """The clean dataset of the active program: one folder per final class name."""
@@ -4564,7 +4684,12 @@ except Exception as e:
                                             conveyor_off=lambda: not self.shared_state.is_conveyor_on)
 
     def _open_plc_diagnostics(self):
-        """The PLC diagnostics tool is a separate program that writes straight to the PLC: it does not know
+        """PLC DIAGNOSTICS window of this program (plc_diag_ui.py): everything in it goes through relay_output."""
+        import plc_diag_ui
+        plc_diag_ui.open_plc_diagnostics(self)
+
+    def _open_plc_vendor_tool(self):
+        """The PLC vendor tool is a separate program that writes straight to the PLC: it does not know
         DRY-RUN or MASTER EJECTOR and can also switch conveyor and feeder. So it is only opened deliberately."""
         if not hasattr(self.controller, 'open_diagnostics_gui'):
             return
@@ -4766,6 +4891,12 @@ except Exception as e:
                             self.shared_state.conveyor_speed_mm_s = float(spd_str)
                     except Exception:
                         pass
+            try:
+                weight = float(self.weight_var.get())
+                if 0.1 <= weight <= 20.0:
+                    self.shared_state.grading["avg_cashew_weight_g"] = weight
+            except (ValueError, AttributeError, tk.TclError):
+                pass
             self.shared_state.save_to_config(CFG_PATH)
             self._mapping_dirty = False
             messagebox.showinfo("Saved", "Pneumatic delays, distances and the class -> ejector mapping are saved.")
@@ -5134,6 +5265,8 @@ except Exception as e:
         self._grading_tick = getattr(self, "_grading_tick", 0) + 1
         if self._grading_tick % 5 == 0:
             self._refresh_status()
+        if self._grading_tick % 15 == 2:
+            self._refresh_pneumatic()
         if self._grading_tick % 50 == 1:
             self._refresh_teaching()
             self._fit_pills()
