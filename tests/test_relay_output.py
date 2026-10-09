@@ -108,5 +108,72 @@ class RelayOutputTest(unittest.TestCase):
         self.assertEqual(ro.REJECT_RELAY, {1: 1, 2: 21})
 
 
+
+class ManualFireRuleTest(unittest.TestCase):
+    """Every manual fire button is test_fire(): one rule, one wording, one log."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.plc = FakePLC()
+        self.out = RelayOutput(self.plc)
+        self.out.manual_log_dir = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def rows(self):
+        import csv
+        import glob
+        files = glob.glob(os.path.join(self.tmp.name, "manual_fire_*.csv"))
+        if not files:
+            return []
+        with open(files[0], encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+
+    def test_dry_run_blocks_single_all_and_sequence_alike(self):
+        self.assertTrue(self.out.dry_run)
+        self.assertEqual(self.out.test_fire(7, 100), ro.DRY_RUN)
+        self.assertEqual(set(self.out.test_all(100).values()), {ro.DRY_RUN})
+        self.assertEqual(set(self.out.test_sequence(100, interval_ms=0).values()), {ro.DRY_RUN})
+        self.assertEqual(self.plc.pulses, [])
+        self.assertEqual(self.plc.forbidden, [])
+        rows = self.rows()
+        self.assertEqual(len(rows), 81)
+        self.assertEqual({r["sent_to_plc"] for r in rows}, {"NO"})
+        self.assertEqual({r["dry_run"] for r in rows}, {"ON"})
+
+    def test_with_dry_run_off_all_three_send_single_pulses_of_relays_1_to_40(self):
+        self.out.dry_run = False
+        self.out.test_fire(7, 100)
+        self.out.test_all(120)
+        self.out.test_sequence(90, interval_ms=0)
+        self.assertEqual(self.plc.pulses[0], (7, 0, 100))
+        self.assertEqual([p[0] for p in self.plc.pulses[1:41]], list(range(1, 41)))
+        self.assertEqual([p[0] for p in self.plc.pulses[41:]], list(range(1, 41)))
+        self.assertEqual(self.plc.forbidden, [])             # never fire_all / sequence_all / set_relay of the PLC
+        rows = self.rows()
+        self.assertEqual({r["sent_to_plc"] for r in rows}, {"YES"})
+        self.assertEqual((rows[0]["action"], rows[0]["relay"], rows[0]["m_address"], rows[0]["pulse_ms"], rows[0]["result"]),
+                         ("SINGLE RELAY TEST", "7", "M106", "100", "SENT"))
+        self.assertEqual({r["action"] for r in rows[1:41]}, {"FIRE 1-40"})
+        self.assertEqual(rows[40]["m_address"], "M139")
+        self.assertEqual({r["action"] for r in rows[41:]}, {"SEQUENCE 1-40"})
+
+    def test_offline_and_refused_are_logged_as_not_sent(self):
+        self.out.dry_run = False
+        self.plc.connected_flag = False
+        self.assertEqual(self.out.test_fire(3, 100), ro.PLC_OFFLINE)
+        self.assertEqual(self.out.test_fire(41, 100), ro.REFUSED)
+        rows = self.rows()
+        self.assertEqual([(r["result"], r["sent_to_plc"], r["plc_connected"]) for r in rows],
+                         [("PLC_OFFLINE", "NO", "NO"), ("REFUSED", "NO", "NO")])
+        self.assertEqual(self.plc.pulses, [])
+
+    def test_one_wording_for_every_result(self):
+        self.assertEqual(set(ro.RESULT_TEXT), {ro.SENT, ro.DRY_RUN, ro.PLC_OFFLINE, ro.REFUSED, ro.MASTER_OFF})
+        self.assertEqual(ro.RESULT_TEXT[ro.DRY_RUN], "DRY-RUN: NOT sent to the PLC")
+
+
 if __name__ == "__main__":
     unittest.main()

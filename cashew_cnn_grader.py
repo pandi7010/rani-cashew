@@ -29,7 +29,7 @@ import preprocess
 import flow_geometry as fg
 from class_registry import ClassRegistry, normalize_name
 from camera_backends import CameraThread, CameraSettings, FlatField
-from relay_output import RelayOutput, FIRST_EJECTOR, LAST_EJECTOR, REJECT_RELAY
+from relay_output import RelayOutput, FIRST_EJECTOR, LAST_EJECTOR, REJECT_RELAY, RESULT_TEXT
 import copy
 from collections import OrderedDict
 import segmentation
@@ -1712,6 +1712,7 @@ class App(tk.Tk):
         self.camera_thread = CameraThread(self.camera_queue, self.stop_event, self.shared_state.camera_settings, self.flat_field)
         # Every relay pulse of the grader goes through this object (relays 1-40 only, dry-run, master switch).
         self.relay_output = RelayOutput(self.controller)
+        self.relay_output.manual_log_dir = app_paths.LOGS_DIR     # every manual fire is logged
         self.processing_thread = ProcessingThread(
             self.model_path, self.registry, self.camera_queue, self.display_queue, 
             self.stop_event, self.shared_state, self.relay_output, self.fire_counts, self.fire_lock,
@@ -2608,7 +2609,7 @@ class App(tk.Tk):
         
         ttk.Button(pn_controls, text="RECALCULATE FROM DISTANCES", style="Secondary.TButton", command=self._recalculate_all_from_distances).pack(fill=tk.X, pady=(0, 10))
         
-        ttk.Button(pn_controls, text="OPEN PLC DIAGNOSTICS", style="Primary.TButton", command=lambda: self.controller.open_diagnostics_gui() if hasattr(self.controller, 'open_diagnostics_gui') else None).pack(fill=tk.X, pady=(0, 10))
+        ttk.Button(pn_controls, text="OPEN PLC DIAGNOSTICS", style="Primary.TButton", command=self._open_plc_diagnostics).pack(fill=tk.X, pady=(0, 10))
 
         ttk.Separator(pn_controls, orient="horizontal").pack(fill=tk.X, pady=10)
 
@@ -2877,7 +2878,7 @@ class App(tk.Tk):
                 messagebox.showerror("PLC Config Error", f"Failed to save PLC settings: {e}")
 
         ttk.Button(pr4, text="Save & Connect PLC", style="Primary.TButton", command=_apply_plc_settings).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(pr4, text="Open PLC Diagnostics Tool", style="Warning.TButton", command=lambda: self.controller.open_diagnostics_gui() if hasattr(self.controller, 'open_diagnostics_gui') else None).pack(side=tk.LEFT)
+        ttk.Button(pr4, text="Open PLC Diagnostics Tool", style="Warning.TButton", command=self._open_plc_diagnostics).pack(side=tk.LEFT)
 
         self._build_tcm_studio_page()
         self._build_annotate_page()
@@ -4287,26 +4288,53 @@ except Exception as e:
         return min(1000, max(10, pulse))
 
     def _result_text(self, relay, result):
-        texts = {"SENT": "pulse sent to the PLC", "DRY_RUN": "DRY-RUN: NOT sent to the PLC",
-                 "PLC_OFFLINE": "PLC OFFLINE: NOT sent", "REFUSED": "refused (not an ejector relay)", "MASTER_OFF": "MASTER EJECTOR off"}
-        return f"{time.strftime('%H:%M:%S')}  {self.relay_output.describe(relay)}: {texts.get(result, result)}"
+        return f"{time.strftime('%H:%M:%S')}  {self.relay_output.describe(relay)}: {RESULT_TEXT.get(result, result)}"
+
+    def _confirm_fire_many(self, title) -> bool:
+        """Question before FIRE 1-40 / SEQUENCE 1-40. Asked every time; it also says whether DRY-RUN is on."""
+        if self.relay_output.dry_run:
+            mode = "DRY-RUN is ON: nothing will be sent to the PLC."
+        else:
+            mode = "DRY-RUN is OFF: the REAL valves of relays 1-40 will fire."
+        return messagebox.askyesno(title, f"Make sure nobody is at the nozzles.\n\n{mode}\n\nGo on?")
+
+    def _show_manual_result(self, text, sent):
+        if hasattr(self, 'lbl_test_relay_result'):
+            self.lbl_test_relay_result.config(text=text, fg=self.colors["success"] if sent else self.colors["warning"])
+
+    def _open_plc_diagnostics(self):
+        """The PLC diagnostics tool is a separate program that writes straight to the PLC: it does not know
+        DRY-RUN or MASTER EJECTOR and can also switch conveyor and feeder. So it is only opened deliberately."""
+        if not hasattr(self.controller, 'open_diagnostics_gui'):
+            return
+        if not self._manual_test_allowed():
+            return
+        if self.relay_output.dry_run:
+            messagebox.showwarning("PLC diagnostics", "DRY-RUN is ON.\n\nThe PLC diagnostics tool writes directly to the PLC and would ignore DRY-RUN, "
+                                   "so it is blocked.\n\nSwitch DRY-RUN off first if you really want to drive the PLC by hand.")
+            self.relay_output.log_manual("PLC DIAGNOSTICS TOOL blocked (DRY-RUN)", "", "", "DRY_RUN")
+            return
+        if not messagebox.askyesno("PLC diagnostics", "Make sure nobody is at the nozzles.\n\nThis tool writes directly to the PLC: its buttons fire REAL "
+                                   "valves at once, ignore DRY-RUN and MASTER EJECTOR, and can also switch CONVEYOR (M140) and FEEDER (M141). "
+                                   "What is done there is NOT in the manual fire log.\n\nOpen it?"):
+            return
+        log.warning("PLC diagnostics tool opened by the operator (direct PLC access, outside DRY-RUN)")
+        self.relay_output.log_manual("PLC DIAGNOSTICS TOOL opened", "", "", "DIRECT")
+        self.controller.open_diagnostics_gui()
 
     def _flash_relay_led(self, relay, pulse):
         if hasattr(self, 'pn_leds') and relay in self.pn_leds:
             self.pn_leds[relay].config(fg=self.colors["success"])
             self.after(max(pulse, 200), lambda r=relay: self.pn_leds[r].config(fg=self.colors["surface_light"]))
 
-    def _test_fire_relay(self, relay):
+    def _test_fire_relay(self, relay, action="SINGLE RELAY TEST"):
         """Fire one relay once, by hand. Returns the result code."""
         if not self._manual_test_allowed():
             return None
         pulse = self._test_pulse_ms()
-        result = self.relay_output.test_fire(relay, pulse)
+        result = self.relay_output.test_fire(relay, pulse, action=action)
         self._flash_relay_led(relay, pulse)
-        if hasattr(self, 'lbl_test_relay_result'):
-            ok = result == "SENT"
-            self.lbl_test_relay_result.config(text=self._result_text(relay, result),
-                                              fg=self.colors["success"] if ok else self.colors["warning"])
+        self._show_manual_result(self._result_text(relay, result), result == "SENT")
         return result
 
     def _test_fire_selected_relay(self):
@@ -4319,24 +4347,30 @@ except Exception as e:
     def _pulse_and_flash(self, act_idx):
         if hasattr(self, 'test_relay_var'):
             self.test_relay_var.set(str(act_idx))
-        self._test_fire_relay(act_idx)
+        self._test_fire_relay(act_idx, action="ROW TEST")
 
     def _fire_all(self):
         if not self._manual_test_allowed():
             return
-        if not self.relay_output.dry_run and not messagebox.askyesno("FIRE 1-40", "Fire ALL 40 ejector valves at once (real valves)?"):
+        if not self._confirm_fire_many("FIRE 1-40"):
+            return
+        if not self._manual_test_allowed():      # the machine may have been started while the question was open
             return
         pulse = self._test_pulse_ms()
-        results = self.relay_output.test_all(pulse)
+        results = self.relay_output.test_all(pulse)     # 40 x test_fire(): the same path as the single relay test
         for relay in results:
             self._flash_relay_led(relay, pulse)
-        self.lbl_test_relay_result.config(text=f"{time.strftime('%H:%M:%S')}  Relays 1-40: " + ", ".join(sorted(set(results.values()))))
+        kinds = sorted(set(results.values()))
+        summary = "; ".join(f"{sum(1 for r in results.values() if r == kind)} x {RESULT_TEXT.get(kind, kind)}" for kind in kinds)
+        self._show_manual_result(f"{time.strftime('%H:%M:%S')}  FIRE 1-40 (relays 1-40, M100-M139): {summary}", kinds == ["SENT"])
             
     def _sequence_all(self):
         """Relays 1-40 one after another. Runs on the UI timer (no extra thread); stops if the machine is started."""
         if not self._manual_test_allowed() or getattr(self, '_sequence_running', False):
             return
-        if not self.relay_output.dry_run and not messagebox.askyesno("SEQUENCE 1-40", "Fire the 40 ejector valves one after another (real valves)?"):
+        if not self._confirm_fire_many("SEQUENCE 1-40"):
+            return
+        if not self._manual_test_allowed():
             return
         pulse = self._test_pulse_ms()
         interval = max(120, pulse + 40)
@@ -4346,11 +4380,10 @@ except Exception as e:
             if relay > LAST_EJECTOR or self.stop_event.is_set() or self.shared_state.phase == "RUNNING":
                 self._sequence_running = False
                 return
-            result = self.relay_output.test_fire(relay, pulse)
+            result = self.relay_output.test_fire(relay, pulse, action="SEQUENCE 1-40")
             self.test_relay_var.set(str(relay))
             self._flash_relay_led(relay, pulse)
-            self.lbl_test_relay_result.config(text=self._result_text(relay, result),
-                                              fg=self.colors["success"] if result == "SENT" else self.colors["warning"])
+            self._show_manual_result("SEQUENCE 1-40  " + self._result_text(relay, result), result == "SENT")
             self.after(interval, lambda: step(relay + 1))
 
         step(FIRST_EJECTOR)

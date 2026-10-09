@@ -4,6 +4,78 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-09 (6): Safety fix - every manual fire button follows DRY-RUN; PLC diagnostics tool gated
+
+Owner's report: with DRY-RUN ON the single relay test says "NOT sent", but FIRE 1-40 fired real valves.
+
+### What I found
+
+- In the code, FIRE 1-40 and SEQUENCE 1-40 already used the same DRY-RUN-checked call as the single test
+  (`RelayOutput.test_fire`), in the version you were running too (`d0492ce`).
+- `logs/grader.log` of 2026-10-09: one SEQUENCE 1-40 at 22:39:20-25 (40 lines "[DRY-RUN] would fire"), row
+  tests at 22:38 and 22:41, **no FIRE 1-40 press and not one pulse sent to the PLC by the grader all day**
+  (no "[FIRE]" line, no "DRY-RUN OFF" line).
+- **The real bypass:** the buttons OPEN PLC DIAGNOSTICS (Pneumatic page) and "Open PLC Diagnostics Tool"
+  (Network page) start `innovance_plc.py` as a separate program. It has its own PLC connection and its own
+  fire buttons. It knows nothing of DRY-RUN or MASTER EJECTOR, fires at once, can also switch M140 / M141, and
+  writes nothing into the grader's log. I cannot prove from the log that this is what fired your valves, but it
+  is the only path in this project that ignores DRY-RUN. If you are sure you pressed FIRE 1-40 on the
+  Pneumatic page itself with DRY-RUN ON, tell me: then something else is wrong and I look again.
+
+### What changed
+
+| Area | Change |
+|---|---|
+| One rule | Row test, single relay test, FIRE 1-40, SEQUENCE 1-40 all call `test_fire()`; there is no second way. One wording for all of them (`RESULT_TEXT`): "DRY-RUN: NOT sent to the PLC", "pulse sent to the PLC", "PLC OFFLINE: NOT sent". FIRE 1-40 shows e.g. "40 x DRY-RUN: NOT sent to the PLC". |
+| Confirmation | FIRE 1-40 and SEQUENCE 1-40 always ask first: "Make sure nobody is at the nozzles." and say whether DRY-RUN is ON (nothing is sent) or OFF (real valves). |
+| STOPPED only | All manual fires are refused while RUNNING (checked again after the question). |
+| PLC diagnostics tool | Blocked while DRY-RUN is ON and while RUNNING. With DRY-RUN OFF it asks first and says plainly that it writes directly to the PLC. Opening (or the blocked attempt) is logged. |
+| Manual fire log | `logs/manual_fire_YYYYMMDD.csv`: time, action, relay, M address, pulse ms, result, sent to PLC YES / NO, DRY-RUN ON / OFF, PLC connected. |
+
+`innovance_plc.py` is unchanged.
+
+### How FIRE 1-40 writes to the PLC compared with the single test
+
+Identical path, 40 times: `test_fire(r)` -> `InovancePLCController.pulse_actuator(r, 0, pulse)` -> the controller's
+dispatcher thread -> Modbus **FC05 (write single coil)**, ON at address 100 + (r - 1), and OFF after the pulse.
+It never calls the PLC's `fire_all()` (48 coils). Differences only in timing: the dispatcher writes one coil per
+Modbus round trip, so with 40 relays the ONs (and later the OFFs) go out one after the other, a few ms apart;
+the pulse of each relay stays about the set length.
+
+If the single test does not fire a valve with DRY-RUN OFF, read the result line:
+- "PLC OFFLINE: NOT sent": no Modbus connection.
+- "pulse sent to the PLC" but no valve: the pulse was handed to the controller's queue. A failed write is only
+  printed in the terminal ("[PLC] Write error ..."), the grader is not told. Then check the M address of that
+  relay, the wiring / valve / air, and the pulse length (default 100 ms; `inovance_config.json` has
+  `pulse_duration` 25, which the diagnostics tool uses, not the grader).
+- The diagnostics tool pulses differently: it keeps re-writing the coil ON during the pulse; the grader writes
+  ON once and OFF once. If a relay fires from the tool but not from the grader, the PLC program may be
+  resetting that coil; tell me and I look at it with you.
+
+### Tested
+
+- `ast` check; 102 unit tests pass (4 new: DRY-RUN blocks single / all / sequence alike; with DRY-RUN off all
+  three send single pulses of relays 1-40 only; offline and refused are logged as not sent; one wording).
+- The real window off-screen with a fake PLC: with DRY-RUN ON single, row, FIRE 1-40, SEQUENCE 1-40 gave
+  0 pulses and the same message, the diagnostics tool did not open; answering NO sends nothing; with DRY-RUN
+  OFF single gave 1 pulse and FIRE 1-40 gave 40 pulses of relays 1-40; while RUNNING everything is refused.
+
+### Not tested
+
+- The real PLC. Nothing was sent to it by me.
+
+### How to test on the machine (close the running grader first, it still runs the old code)
+
+1. Start the grader. Pneumatic page: DRY-RUN ON.
+2. TEST FIRE THIS RELAY, a row test, FIRE 1-40, SEQUENCE 1-40: each must say "DRY-RUN: NOT sent to the PLC",
+   FIRE and SEQUENCE must ask first, **no valve may move**.
+3. OPEN PLC DIAGNOSTICS: must be refused.
+4. Open `logs/manual_fire_<date>.csv`: one line per press, "sent_to_plc" = NO.
+5. Only then, nobody at the nozzles: DRY-RUN OFF, single test on relay 1: valve 1 fires, the log says YES.
+6. If a valve moves in step 2, stop and tell me exactly which button.
+
+---
+
 ## 2026-10-09 (5): Step (e2a) done - delay table fixed, always-reject rules, shadow engines, alarms
 
 Feature reference read: 5-track user manual v4.2 (`docs/CASHEW_X_AI_Manual_English.pdf`; it was not in `docs/`,

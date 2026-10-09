@@ -23,6 +23,9 @@
   `fire_all()` / `sequence_all()` (they pulse 48 coils, including conveyor M140 and feeder M141).
 - Grading logic never touches relay 41 (conveyor, M140) or 42 (feeder, M141).
 - Do not change `innovance_plc.py` without asking first.
+- Every manual fire button is `RelayOutput.test_fire()` (DRY-RUN checked, logged in `logs/manual_fire_*.csv`).
+  The PLC diagnostics tool (`innovance_plc.py` run as a program) writes directly to the PLC; the grader only
+  opens it with DRY-RUN off, STOPPED and after a confirmation.
 
 ## Machine facts
 
