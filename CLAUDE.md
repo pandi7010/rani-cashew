@@ -50,6 +50,8 @@
   `TCM_CASHEWXAI_2026-10-06/` (the owner's UI reference; theme in `source/home_ui.py`, screenshots in
   `source/design/`) and `CNN/CNN/app/` (the same project, 11 commits newer). Also
   `/home/phoenix/Documents/RaniVision_Latest`, `v2_snapshot/`. Never modify any of them.
+- px per mm comes from the Vision ROI calibration (`size_config.roi_length_mm`); 10.0 is only a placeholder. Taught size
+  limits (`size_config.grades`) are stored but not used by the decision until step (c2).
 - Plan: `PLAN.md` (English, current). Owner's requirements: `FINAL_PROMPT.txt`. Step order: (c1) done, then
   (e) UI, (c2), (c3), (d), (f).
 - `external_tools/` holds unmodified copies of the TCM tools; do not edit them.

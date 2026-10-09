@@ -4,6 +4,93 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-10 (3): PART C - remaining pages in the 5-track layout; summary of this session
+
+### Pages
+
+| Page | State | What changed |
+|---|---|---|
+| Vision ROI | **rebuilt** | Cards: ROIS AND DECISION LINE (coordinates, DRAW / RESET, SET LINE, shift), **CALIBRATION** (ROI 1 length in mm -> px per mm), IMAGE SENSOR (gain, exposure, FPS limit, colour gain ALL / R / G / B), CAMERA SOURCE, WHITE CALIBRATION, RECORD TEST FRAMES. One **SAVE VISION SETTINGS**. |
+| Colour Size | **rebuilt** | Left: colour engines (OFF / SHADOW / ACTIVE), old OpenCV filter limits, LAST CASHEWS (measured L, W, area, solidity, decision). Right: size / shape engines, **SIZE GRADES READY** switch, size table, **TEACH FROM CAMERA** (3 histograms, mean -/+ k x std, k = 3, at least 30 cashews), shape limits, longest single cashew (double rule). One **SAVE COLOUR & SIZE**. |
+| Dataset Capture | **rebuilt** | Same 20 folders, counts, OPEN, CAPTURE IMAGE TO FOLDER, AUTO CAPTURE (limit, CROP / FULL FRAME / BOTH). |
+| Teaching YOLO | **rebuilt** | Steps 1 IMAGES, 2 CLASS TO MARK, 3 MARKS IN THIS IMAGE, 4 TRAIN. Same functions as before. |
+| Network | **rebuilt** | PLC card (IP, port, unit, ejector 1 address, register type, status, SAVE & CONNECT - STOPPED only, PLC DIAGNOSTICS) and a CAMERA status card. |
+| Programs (NEW / COPY / DELETE) | **not done - needs your OK** | See "Open" below. |
+| Speed panel | **not done** | Belongs to step (c3): it needs the encoder / measured belt speed. |
+| Test Console | unchanged | Old page (not on the 5-track machine). |
+
+### Calibration (new, important)
+
+- The program was using **10 px per mm, a placeholder**. All mm values (size, shape limits, double rule 45 mm, mm/s) were based on it.
+- Vision ROI -> CALIBRATION: measure the real length of ROI 1 on the roller along the travel direction, type it, SAVE.
+  px per mm = ROI 1 length in pixels / mm. The page shows NOT CALIBRATED in yellow until this is done. I did not enter a value.
+- TEACH a size and SIZE GRADES READY are refused until the calibration is saved.
+
+### Size grades: what is real and what is not
+
+- Which grade a GOOD cashew gets is still the old table ("L below / W below", your earlier values). Unchanged.
+- TEACH stores min / max of length, width and area per grade. **These taught limits are stored only; the decision does not use
+  them yet** (step c2, with your grade rules). I did not invent a rule for them.
+- SIZE GRADES READY off (as now) = every GOOD cashew goes to the reject ejector A01 / A21. Switching it on asks first.
+- Teaching a size needs the machine RUNNING (cashews are only measured then), so the valves fire while teaching.
+- Colour and SW / WW engines still do not measure (c2). The page says so.
+
+### Tested (fake PLC, simulated belt, off-screen window, temporary settings file)
+
+- `ast` check, **172 unit tests pass** (new: `tests/test_size_teach.py`).
+- `tools/ui_selftest.py` with `tools/selftest_pages.py` and `tools/selftest_teaching.py`: calibration 300 mm -> 8.07 px per mm saved, a wrong
+  entry keeps the saved value; teach and SIZE READY refused before calibration; teach with 44 simulated measurements + 1 double
+  -> limits applied and saved, shape limit saved, old table kept; every page and window photographed (27 pictures, `design/pages/`).
+
+### Not tested
+
+- Real camera, real PLC, real cashews. Camera gain / exposure fields against the real camera after the rebuild (same code
+  as before, new widgets). Buttons of Dataset Capture and Teaching YOLO were not pressed in the self-test (only drawn).
+
+### Open - please answer
+
+1. **Programs (NEW / COPY / DELETE).** This machine has one settings file (`pneumatic_config.json`) and one program folder
+   (`programs/Default`). Real programs mean: settings, mapping, delays and dataset per program, and switching between them. A
+   mistake there loads the wrong ejector mapping, so I want your OK on the plan first: each program = `programs/<name>/` with its
+   own settings file; NEW = factory defaults, COPY = copy of the settings (not the images), DELETE = moved to a `deleted/` folder,
+   never erased; switching only when STOPPED; the PLC coil table stays shared. OK, or different?
+2. **KNIEF_MARK and SW classes** (you added them in Teaching CNN): they are not in the priority list, so a cashew decided as
+   KNIEF_MARK is "Undefined" -> reject ejector. Which ejector should KNIEF_MARK get, and is SW again a CNN class (earlier you
+   merged it into GOOD_CASHEW)?
+3. **ROI 1 length in mm** for the calibration.
+
+### Commits of this session
+
+| Commit | Content |
+|---|---|
+| `cf0ed5b` | PART A: DRY-RUN and MASTER EJECTOR removed, START / STOP only, pulse buttons, real PLC when STOPPED |
+| `e7b0dc5` | PART B: CHECK CONFUSION, CONFUSION folder, multi-step undo, large view, training graphs, 98 % warning |
+| `66bd3fb` | PART C (1): Vision ROI and Colour Size |
+| (this one) | PART C (2): Dataset Capture, Teaching YOLO, Network; report |
+
+Earlier commits that had no report entry: `c021c1d` clean dataset + DOUBLE class, `7c903fa` AUTO LEARNING switch, `c557b61`
+full ejector mapping (1/21 reject, 2 UPW, 3 PKW2, 4 PKW1, 5 OIL, 6 BROWN, 7 DW1+DW2, 8 WHITE_DW, 9 TESTA SMALL, 10 TESTA,
+11-15 W180...W450, 16-20 SW180...SW450; ROI 2 = +20; BUDDS no fire) + branding, `da54f5d` AI Model Select + Info,
+`99d9676` Pneumatic page + PLC mapping window. Training time on the RTX 3050: about 11.5 s per epoch on 2,000 images
+(30 epochs about 6 minutes; your 3,200 images about 18 s per epoch).
+
+### Assumptions I made (correct me)
+
+1. A pulse = coil ON, re-written every 50 ms, then OFF - also for grading, not only for the buttons.
+2. Pulse per ejector 5-2000 ms; FIRE ALL uses each row's own pulse.
+3. LOW CONFIDENCE in CHECK CONFUSION = below 60 %.
+4. "Delete" in Teaching CNN moves to `programs/Default/trash/` so UNDO can work; the trash is never emptied by the program.
+5. UNDO history lasts until the program is closed (the log file stays).
+6. FIRE class = every class that is not a PASS class on the Pneumatic page; 98 % is compared with recall on validation images.
+7. CONFUSION is stored as `programs/Default/confusion/<class it came from>/`.
+8. Calibration uses ROI 1 only; ROI 2 is assumed to have the same px per mm.
+9. Size teach: k = 3, at least 30 cashews, doubles ignored.
+10. Logo: the file from `~/Downloads/1001402664.png` (the name you gave did not exist).
+11. I did not commit the 1,307 `cnn_final/golden_crops` files that git shows as deleted (you labelled them into the dataset),
+    nor your new model files, nor `pneumatic_config.json` / `inovance_config.json` as changed by your own runs.
+
+---
+
 ## 2026-10-10 (2): PART B - Teaching CNN: CHECK CONFUSION, CONFUSION folder, multi-step UNDO, large view, training graphs
 
 | # | Asked | What is there now |

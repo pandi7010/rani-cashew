@@ -2650,42 +2650,42 @@ class App(tk.Tk):
         tree_scroll.pack(side="right", fill="y")
         
 
-        # PAGE: Dataset Capture
-        p_cap = tk.Frame(self.page_container, bg=self.colors["surface"])
+        # PAGE: Dataset Capture (5-track layout: cards, flat buttons; same functions as before)
+        F = ui.FONT
+        p_cap = tk.Frame(self.page_container, bg=ui.BG)
         self.pages["Dataset Capture"] = p_cap
-        cap_canvas = tk.Canvas(p_cap, bg=self.colors["surface"], highlightthickness=0)
-        cap_scroll = ttk.Scrollbar(p_cap, orient="vertical", command=cap_canvas.yview)
-        cap_inner = tk.Frame(cap_canvas, bg=self.colors["surface"], padx=15, pady=15)
-        cap_inner.bind("<Configure>", lambda e: cap_canvas.configure(scrollregion=cap_canvas.bbox("all")))
-        cap_canvas.create_window((0, 0), window=cap_inner, anchor="nw", width=520)
-        cap_canvas.configure(yscrollcommand=cap_scroll.set)
-        cap_canvas.pack(side="left", fill="both", expand=True)
-        cap_scroll.pack(side="right", fill="y")
-        
-        ttk.Label(cap_inner, text="DATASET CAPTURE FOLDERS", style="Title.TLabel").pack(anchor="w", pady=(0,15))
-        
-        # Capture button at top of capture page
-        ttk.Button(cap_inner, text="CAPTURE IMAGE TO FOLDER", style="Success.TButton", command=self.shared_state.trigger_capture).pack(fill=tk.X, pady=(0, 20))
-        
+
+        def cap_card(title, note=""):
+            box = tk.Frame(p_cap, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
+            box.pack(fill=tk.X, pady=(0, 10))
+            head = tk.Frame(box, bg=ui.PANEL)
+            head.pack(fill=tk.X, padx=14, pady=(10, 4))
+            tk.Label(head, text=title, font=(F, ui.F_SMALL, "bold"), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT)
+            if note:
+                tk.Label(head, text=note, font=(F, -11), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT, padx=12)
+            body = tk.Frame(box, bg=ui.PANEL)
+            body.pack(fill=tk.X, padx=14, pady=(0, 12))
+            return body
+
+        folders = cap_card("CAPTURE FOLDERS", "choose a folder, then CAPTURE saves the camera image into it")
         self.capture_class_vars = {}
         self.capture_count_vars = {}
         self.active_capture_var = tk.StringVar(value=self.shared_state.active_capture_class_id)
-        
+
         def update_all_counts():
             for i in range(1, 21):
                 folder_name = self.shared_state.capture_classes.get(str(i), f"Class_{i}")
                 target_dir = os.path.join(DATASET_DIR, folder_name)
                 count = len([f for f in os.listdir(target_dir) if f.endswith('.jpg')]) if os.path.exists(target_dir) else 0
                 if str(i) in self.capture_count_vars:
-                    self.capture_count_vars[str(i)].set(f"[{count}]")
+                    self.capture_count_vars[str(i)].set(str(count))
             self.after(1000, update_all_counts)
-                
+
         self.after(1000, update_all_counts)
-        
-        cap_grid = tk.Frame(cap_inner, bg=self.colors["surface"])
+        cap_grid = tk.Frame(folders, bg=ui.PANEL)
         cap_grid.pack(fill=tk.X)
-        cap_grid.columnconfigure(0, weight=1); cap_grid.columnconfigure(1, weight=1)
-        
+        cap_grid.columnconfigure(0, weight=1, uniform="cap"); cap_grid.columnconfigure(1, weight=1, uniform="cap")
+
         def update_capture_class_name(cid, var):
             try:
                 val = var.get().strip()
@@ -2693,76 +2693,62 @@ class App(tk.Tk):
                 with self.shared_state.lock:
                     self.shared_state.capture_classes[str(cid)] = val
             except (ValueError, tk.TclError): pass
-            
+
         def on_capture_select():
             with self.shared_state.lock:
                 self.shared_state.active_capture_class_id = self.active_capture_var.get()
                 self.shared_state.save_to_config(CFG_PATH)
-        
+
         for i in range(1, 21):
             col = 0 if i <= 10 else 1
             row = i if i <= 10 else i - 10
-            
-            f1 = tk.Frame(cap_grid, bg=self.colors["surface"])
-            f1.grid(row=row, column=col, sticky="ew", padx=(0,10) if col==0 else (10,0), pady=4)
-            
-            rb = tk.Radiobutton(f1, text=f"{i:02d}", variable=self.active_capture_var, value=str(i), 
-                                bg=self.colors["surface"], fg=self.colors["text"], selectcolor=self.colors["bg"],
-                                activebackground=self.colors["surface"], activeforeground=self.colors["text"],
-                                font=("Roboto", 10, "bold"), command=on_capture_select)
-            rb.pack(side=tk.LEFT)
-            
+            f1 = tk.Frame(cap_grid, bg=ui.PANEL)
+            f1.grid(row=row, column=col, sticky="ew", padx=(0, 8) if col == 0 else (8, 0), pady=2)
+            tk.Radiobutton(f1, text=f"{i:02d}", variable=self.active_capture_var, value=str(i), bg=ui.PANEL, fg=ui.TEXT, selectcolor=ui.FIELD,
+                           activebackground=ui.PANEL, activeforeground=ui.ACCENT, highlightthickness=0, bd=0,
+                           font=(F, ui.F_SMALL, "bold"), command=on_capture_select).pack(side=tk.LEFT)
             nm = tk.StringVar(value=self.shared_state.capture_classes.get(str(i), f"Class_{i}"))
-            ent = tk.Entry(f1, textvariable=nm, width=10, bg=self.colors["surface_light"], fg=self.colors["text"], bd=0)
-            ent.pack(side=tk.LEFT, padx=(5,0))
+            tk.Entry(f1, textvariable=nm, width=13, bg=ui.FIELD, fg=ui.TEXT, insertbackground=ui.TEXT, bd=0, font=(F, -13),
+                     highlightthickness=1, highlightbackground=ui.BORDER, highlightcolor=ui.ACCENT).pack(side=tk.LEFT, padx=(4, 0), ipady=4)
             self.capture_class_vars[str(i)] = nm
             nm.trace_add("write", lambda *_, cid=i, v=nm: update_capture_class_name(cid, v))
-            
-            cnt_var = tk.StringVar(value="[0]")
+            cnt_var = tk.StringVar(value="0")
             self.capture_count_vars[str(i)] = cnt_var
-            tk.Label(f1, textvariable=cnt_var, bg=self.colors["surface"], fg=self.colors["text"], font=("Roboto", 8)).pack(side=tk.LEFT, padx=(2,2))
-            
+
             def open_dir(cid=i):
                 import subprocess
                 folder_name = self.shared_state.capture_classes.get(str(cid), f"Class_{cid}")
                 target_dir = os.path.join(DATASET_DIR, folder_name)
                 os.makedirs(target_dir, exist_ok=True)
                 subprocess.Popen(['xdg-open', target_dir])
-                
-            tk.Button(f1, text="VIEW", bg=self.colors["bg"], fg=self.colors["text"], bd=0, font=("Roboto", 7), padx=2, pady=0, command=open_dir).pack(side=tk.LEFT)
-            
-        ttk.Button(cap_inner, text="SAVE CLASS NAMES", style="Primary.TButton", command=lambda: self.shared_state.save_to_config(CFG_PATH)).pack(fill=tk.X, pady=(20, 40))
 
-        # ── AUTO CAPTURE CONSOLE ──
-        ttk.Label(cap_inner, text="AUTO CAPTURE CONSOLE", style="Title.TLabel").pack(anchor="w", pady=(0, 10))
-        
-        console_frm = tk.Frame(cap_inner, bg=self.colors["surface_light"], padx=15, pady=15)
-        console_frm.pack(fill=tk.X, pady=(0, 20))
-        
-        # Limit
-        limit_frm = tk.Frame(console_frm, bg=self.colors["surface_light"])
-        limit_frm.pack(fill=tk.X, pady=(0, 15))
-        tk.Label(limit_frm, text="Capture Image Limit:", bg=self.colors["surface_light"], fg=self.colors["text"], font=("Roboto", 10, "bold")).pack(side=tk.LEFT)
-        ttk.Combobox(limit_frm, textvariable=self.golden_count_var, values=["100", "500", "1000", "2000", "5000"], width=10, font=("Roboto", 10)).pack(side=tk.LEFT, padx=10)
-        
-        # Mode
-        mode_frm = tk.Frame(console_frm, bg=self.colors["surface_light"])
-        mode_frm.pack(fill=tk.X, pady=(0, 20))
-        tk.Label(mode_frm, text="Capture Mode:", bg=self.colors["surface_light"], fg=self.colors["text"], font=("Roboto", 10, "bold")).pack(side=tk.LEFT, padx=(0, 10))
-        
-        style_rb = {"bg": self.colors["surface_light"], "fg": self.colors["text"], "selectcolor": self.colors["bg"], "activebackground": self.colors["surface_light"], "activeforeground": self.colors["text"], "font": ("Roboto", 10)}
-        tk.Radiobutton(mode_frm, text="Cropped images", variable=self.capture_mode_var, value="cropped", **style_rb).pack(side=tk.LEFT, padx=5)
-        tk.Radiobutton(mode_frm, text="Full frame", variable=self.capture_mode_var, value="full", **style_rb).pack(side=tk.LEFT, padx=5)
-        tk.Radiobutton(mode_frm, text="Both", variable=self.capture_mode_var, value="both", **style_rb).pack(side=tk.LEFT, padx=5)
-        
-        # Toggle Button
-        self.golden_prod_btn = tk.Button(console_frm, text="START AUTO CAPTURE", 
-                                         bg=self.colors["info"], fg="white", font=("Roboto", 12, "bold"),
-                                         bd=0, cursor="hand2", pady=10)
-                                         
+            ui.FlatButton(f1, "OPEN", open_dir, kind="muted", height=26, width=56, font=(F, -11, "bold")).pack(side=tk.RIGHT)
+            tk.Label(f1, textvariable=cnt_var, bg=ui.PANEL, fg=ui.MUTED, font=(F, ui.F_SMALL, "bold"), width=5, anchor="e").pack(side=tk.RIGHT, padx=(0, 8))
+
+        buttons = tk.Frame(folders, bg=ui.PANEL)
+        buttons.pack(fill=tk.X, pady=(12, 0))
+        ui.FlatButton(buttons, "SAVE FOLDER NAMES", lambda: self.shared_state.save_to_config(CFG_PATH), kind="muted", height=40, width=200).pack(side=tk.LEFT)
+        ui.FlatButton(buttons, "CAPTURE IMAGE TO FOLDER", self.shared_state.trigger_capture, kind="primary", height=40,
+                      font=(F, ui.F_BODY, "bold")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 0))
+
+        console_frm = cap_card("AUTO CAPTURE", "saves cashew images by itself until the limit is reached; label them on the Teaching CNN page")
+        limit_frm = tk.Frame(console_frm, bg=ui.PANEL)
+        limit_frm.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(limit_frm, text="Limit", bg=ui.PANEL, fg=ui.TEXT, font=(F, ui.F_BODY)).pack(side=tk.LEFT)
+        tk.Entry(limit_frm, textvariable=self.golden_count_var, width=8, bg=ui.FIELD, fg=ui.TEXT, insertbackground=ui.TEXT, bd=0, justify="center",
+                 font=(F, -14), highlightthickness=1, highlightbackground=ui.BORDER, highlightcolor=ui.ACCENT).pack(side=tk.LEFT, padx=10, ipady=5)
+        tk.Label(limit_frm, text="images", bg=ui.PANEL, fg=ui.MUTED, font=(F, ui.F_SMALL)).pack(side=tk.LEFT)
+        mode_names = {"cropped": "CROP", "full": "FULL FRAME", "both": "BOTH"}
+        self.capture_mode_selector = ui.Segmented(limit_frm, list(mode_names.values()), mode_names.get(self.capture_mode_var.get(), "CROP"),
+                                                  lambda value: self.capture_mode_var.set(next(k for k, v in mode_names.items() if v == value)))
+        self.capture_mode_selector.pack(side=tk.RIGHT)
+        self.capture_mode_var.trace_add("write", lambda *_: self.capture_mode_selector.set(mode_names.get(self.capture_mode_var.get(), "CROP")))
+        tk.Label(limit_frm, text="Mode", bg=ui.PANEL, fg=ui.TEXT, font=(F, ui.F_BODY)).pack(side=tk.RIGHT, padx=10)
+        self.golden_prod_btn = tk.Button(console_frm, text="START AUTO CAPTURE", bg=self.colors["info"], fg="#06222A", activeforeground="#06222A",
+                                         font=(F, ui.F_BODY, "bold"), bd=0, relief="flat", highlightthickness=0, cursor="hand2", pady=10)
         self.golden_prod_btn.config(command=toggle_golden)
         self.golden_prod_btn.pack(fill=tk.X)
-        
+
         # Add updater to the main UI loop checking golden_prod_btn
         def check_golden_btn():
             is_active = self.shared_state.is_golden_capture_active()
@@ -3140,54 +3126,54 @@ class App(tk.Tk):
 
         self._build_pneumatic_page()
 
-        p_net = tk.Frame(self.page_container, bg=self.colors["surface"], padx=15, pady=15)
+        # PAGE: Network (5-track layout)
+        F = ui.FONT
+        p_net = tk.Frame(self.page_container, bg=ui.BG)
         self.pages["Network"] = p_net
-        ttk.Label(p_net, text="NETWORK CONFIGURATION", style="Title.TLabel").pack(anchor="w", pady=(0,15))
-        
-        # --- Inovance PLC (Modbus TCP) Configuration ---
-        ttk.Label(p_net, text="Inovance EC320 PLC (Modbus TCP)", style="Header.TLabel").pack(anchor="w", pady=(0, 10))
 
-        plc_card = tk.Frame(p_net, bg=self.colors["surface_light"], padx=12, pady=12)
-        plc_card.pack(fill=tk.X, pady=(0, 15))
+        def net_card(title, note=""):
+            box = tk.Frame(p_net, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
+            box.pack(fill=tk.X, pady=(0, 12))
+            head = tk.Frame(box, bg=ui.PANEL)
+            head.pack(fill=tk.X, padx=16, pady=(12, 6))
+            tk.Label(head, text=title, font=(F, ui.F_SMALL, "bold"), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT)
+            if note:
+                tk.Label(head, text=note, font=(F, -11), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT, padx=12)
+            body = tk.Frame(box, bg=ui.PANEL)
+            body.pack(fill=tk.X, padx=16, pady=(0, 14))
+            return body
 
-        # Row 1: IP & Port
-        pr1 = tk.Frame(plc_card, bg=self.colors["surface_light"])
-        pr1.pack(fill=tk.X, pady=4)
-        ttk.Label(pr1, text="PLC IP:", font=("Roboto", 10, "bold"), width=16, style="Surface.TLabel").pack(side=tk.LEFT)
+        def net_field(parent, row, column, label, var, width=16):
+            tk.Label(parent, text=label, font=(F, ui.F_BODY), fg=ui.TEXT, bg=ui.PANEL, anchor="w").grid(row=row, column=column, sticky="w", pady=5, padx=(0, 12))
+            tk.Entry(parent, textvariable=var, width=width, bg=ui.FIELD, fg=ui.TEXT, insertbackground=ui.TEXT, bd=0, justify="center", font=(F, -14),
+                     highlightthickness=1, highlightbackground=ui.BORDER, highlightcolor=ui.ACCENT).grid(row=row, column=column + 1, sticky="w", pady=5, padx=(0, 40), ipady=5)
+
+        plc_card = net_card("PLC", "Inovance EC320, Modbus TCP. Ejector 1 = M100 ... ejector 40 = M139; M140 conveyor and M141 feeder are never ejectors")
+        fields = tk.Frame(plc_card, bg=ui.PANEL)
+        fields.pack(fill=tk.X)
         self.net_plc_ip_var = tk.StringVar(value=getattr(self.controller, 'plc_ip', '192.168.1.88'))
-        tk.Entry(pr1, textvariable=self.net_plc_ip_var, width=16, bg=self.colors["surface"], fg=self.colors["text"], bd=0, font=("Roboto", 11)).pack(side=tk.LEFT, padx=(0, 20))
-
-        ttk.Label(pr1, text="Port:", font=("Roboto", 10, "bold"), width=6, style="Surface.TLabel").pack(side=tk.LEFT)
         self.net_plc_port_var = tk.StringVar(value=str(getattr(self.controller, 'plc_port', 502)))
-        tk.Entry(pr1, textvariable=self.net_plc_port_var, width=8, bg=self.colors["surface"], fg=self.colors["text"], bd=0, font=("Roboto", 11)).pack(side=tk.LEFT)
-
-        # Row 2: Unit ID & Register Type
-        pr2 = tk.Frame(plc_card, bg=self.colors["surface_light"])
-        pr2.pack(fill=tk.X, pady=4)
-        ttk.Label(pr2, text="Unit ID:", font=("Roboto", 10, "bold"), width=16, style="Surface.TLabel").pack(side=tk.LEFT)
         self.net_plc_unit_var = tk.StringVar(value=str(getattr(self.controller, 'plc_unit_id', 1)))
-        tk.Entry(pr2, textvariable=self.net_plc_unit_var, width=8, bg=self.colors["surface"], fg=self.colors["text"], bd=0, font=("Roboto", 11)).pack(side=tk.LEFT, padx=(0, 28))
-
-        ttk.Label(pr2, text="Register Type:", font=("Roboto", 10, "bold"), width=14, style="Surface.TLabel").pack(side=tk.LEFT)
         self.net_plc_regtype_var = tk.StringVar(value=getattr(self.controller, 'register_type', 'Coil (FC01/05/15)'))
-        ttk.Combobox(pr2, textvariable=self.net_plc_regtype_var, values=["Coil (FC01/05/15)", "Holding Reg (FC03/06/16)"], width=22, state="readonly").pack(side=tk.LEFT)
-
-        # Row 3: Base Register (M100) & Status
-        pr3 = tk.Frame(plc_card, bg=self.colors["surface_light"])
-        pr3.pack(fill=tk.X, pady=4)
-        ttk.Label(pr3, text="Relay 1 Addr (M100):", font=("Roboto", 10, "bold"), width=16, style="Surface.TLabel").pack(side=tk.LEFT)
-        self.net_plc_basereg_var = tk.StringVar(value=str(getattr(self.controller, 'relay1_register', 100)))
-        tk.Entry(pr3, textvariable=self.net_plc_basereg_var, width=8, bg=self.colors["surface"], fg=self.colors["text"], bd=0, font=("Roboto", 11)).pack(side=tk.LEFT, padx=(0, 20))
-
-        ttk.Label(pr3, text="PLC Status:", font=("Roboto", 10, "bold"), width=12, style="Surface.TLabel").pack(side=tk.LEFT)
-        self.net_plc_status = ttk.Label(pr3, text="● CHECKING...", style="Surface.TLabel", foreground=self.colors["warning"])
-        self.net_plc_status.pack(side=tk.LEFT)
-
-        # Row 4: Buttons
-        pr4 = tk.Frame(plc_card, bg=self.colors["surface_light"])
-        pr4.pack(fill=tk.X, pady=(10, 0))
+        base_register = getattr(self.controller, 'relay1_register', 100)
+        self.net_plc_basereg_var = tk.StringVar(value=str(base_register if isinstance(base_register, int) else 100))
+        net_field(fields, 0, 0, "PLC IP address", self.net_plc_ip_var)
+        net_field(fields, 0, 2, "Port", self.net_plc_port_var, 8)
+        net_field(fields, 1, 0, "Unit ID", self.net_plc_unit_var, 8)
+        net_field(fields, 1, 2, "Ejector 1 address (M100)", self.net_plc_basereg_var, 8)
+        tk.Label(fields, text="Register type", font=(F, ui.F_BODY), fg=ui.TEXT, bg=ui.PANEL, anchor="w").grid(row=2, column=0, sticky="w", pady=5, padx=(0, 12))
+        ttk.Combobox(fields, textvariable=self.net_plc_regtype_var, values=["Coil (FC01/05/15)", "Holding Reg (FC03/06/16)"], width=24,
+                     state="readonly").grid(row=2, column=1, columnspan=2, sticky="w", pady=5)
+        status_row = tk.Frame(plc_card, bg=ui.PANEL)
+        status_row.pack(fill=tk.X, pady=(8, 0))
+        tk.Label(status_row, text="Status", font=(F, ui.F_BODY), fg=ui.TEXT, bg=ui.PANEL).pack(side=tk.LEFT)
+        self.net_plc_status = tk.Label(status_row, text="● CHECKING...", font=(F, ui.F_BODY, "bold"), fg=ui.WARN, bg=ui.PANEL)
+        self.net_plc_status.pack(side=tk.LEFT, padx=14)
 
         def _apply_plc_settings():
+            if self.shared_state.phase == "RUNNING":
+                messagebox.showwarning("Stop first", "Stop the machine before changing the PLC connection.")
+                return
             try:
                 ip = self.net_plc_ip_var.get().strip()
                 port = int(self.net_plc_port_var.get().strip())
@@ -3200,8 +3186,14 @@ class App(tk.Tk):
             except Exception as e:
                 messagebox.showerror("PLC Config Error", f"Failed to save PLC settings: {e}")
 
-        ttk.Button(pr4, text="Save & Connect PLC", style="Primary.TButton", command=_apply_plc_settings).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(pr4, text="Open PLC Diagnostics Tool", style="Warning.TButton", command=self._open_plc_diagnostics).pack(side=tk.LEFT)
+        net_buttons = tk.Frame(plc_card, bg=ui.PANEL)
+        net_buttons.pack(fill=tk.X, pady=(14, 0))
+        ui.FlatButton(net_buttons, "SAVE & CONNECT PLC", _apply_plc_settings, kind="primary", height=40, width=240, font=(F, ui.F_BODY, "bold")).pack(side=tk.LEFT)
+        ui.FlatButton(net_buttons, "PLC DIAGNOSTICS / EJECTOR MAPPING ...", self._open_plc_diagnostics, height=40, width=330).pack(side=tk.LEFT, padx=12)
+
+        cam_card = net_card("CAMERA", "USB3 Vision through Aravis; settings are on the Vision ROI page")
+        self.lbl_net_camera = tk.Label(cam_card, text="", font=(F, ui.F_BODY), fg=ui.TEXT, bg=ui.PANEL, anchor="w", justify="left")
+        self.lbl_net_camera.pack(fill=tk.X)
 
         self._build_tcm_studio_page()
         self._build_annotate_page()
@@ -5366,6 +5358,12 @@ except Exception as e:
         a_conn = self.controller.is_connected()
         self._refresh_camera_status()
         self.ard_indicator.config(fg=self.colors["success"] if a_conn else self.colors["danger"])
+        if hasattr(self, 'lbl_net_camera'):
+            cam, info = self.camera_thread, (self.camera_thread.info or {})
+            shown = (f"{cam.state}     {info.get('vendor', '')} {info.get('model', '')}     {info.get('width', '?')} x {info.get('height', '?')}"
+                     f"     {info.get('pixel_format', '')}     {cam.fps:.0f} fps") if cam.is_connected else f"{cam.state}     {cam.last_error}"
+            if self.lbl_net_camera.cget("text") != shown:
+                self.lbl_net_camera.config(text=shown, fg=ui.TEXT if cam.is_connected else ui.WARN)
         if hasattr(self, 'net_plc_status'):
             plc_ip = getattr(self.controller, 'plc_ip', 'PLC')
             plc_port = getattr(self.controller, 'plc_port', 502)
@@ -5421,74 +5419,65 @@ except Exception as e:
         self.after(30, self._update_loop)
 
     def _build_teaching_console_page(self):
-        p_teach = tk.Frame(self.page_container, bg=self.colors["bg"])
+        """Teaching YOLO page in the 5-track layout: open saved images, mark the cashews with a class, train."""
+        F = ui.FONT
+        p_teach = tk.Frame(self.page_container, bg=ui.BG)
         self.pages["Teaching YOLO"] = p_teach
-        
-        canvas = tk.Canvas(p_teach, bg=self.colors["bg"], highlightthickness=0)
-        scroll = ttk.Scrollbar(p_teach, orient="vertical", command=canvas.yview)
-        inner = tk.Frame(canvas, bg=self.colors["bg"], padx=15, pady=15)
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
-        
-        def _on_canvas_resize(e):
-            canvas.itemconfig(window_id, width=e.width)
-        canvas.bind("<Configure>", _on_canvas_resize)
-        
-        canvas.configure(yscrollcommand=scroll.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-        
-        # --- CNN (DEFECTS) ---
-        ttk.Label(inner, text="CNN (DEFECTS) - MANUAL ANNOTATION", style="Title.TLabel").pack(anchor="w", pady=(0, 10))
-        cnn_frm = tk.Frame(inner, bg=self.colors["surface"], padx=10, pady=10)
-        cnn_frm.pack(fill=tk.X, pady=(0, 20))
-        
-        ctrl_row = tk.Frame(cnn_frm, bg=self.colors["surface"])
-        ctrl_row.pack(fill=tk.X, pady=5)
-        ttk.Button(ctrl_row, text="Open Folder", command=self._ann_open_folder).pack(side=tk.LEFT, padx=2)
-        ttk.Button(ctrl_row, text="◄ Prev", command=self._ann_prev).pack(side=tk.LEFT, padx=2)
-        ttk.Button(ctrl_row, text="Next ►", command=self._ann_next).pack(side=tk.LEFT, padx=2)
-        self.ann_lbl_file = tk.Label(ctrl_row, text="No image loaded", bg=self.colors["surface"], fg=self.colors["text"])
-        self.ann_lbl_file.pack(side=tk.LEFT, padx=15)
-        
-        fast_row = tk.Frame(cnn_frm, bg=self.colors["surface"], pady=10)
-        fast_row.pack(fill=tk.X)
-        
-        hdr_row = tk.Frame(fast_row, bg=self.colors["surface"])
-        hdr_row.pack(fill=tk.X, pady=(0, 5))
-        ttk.Label(hdr_row, text="Select Class to Mark:", style="Header.TLabel").pack(side=tk.LEFT)
-        
-        btn_row = tk.Frame(fast_row, bg=self.colors["surface"])
-        btn_row.pack(fill=tk.X, pady=(0, 10))
-        ttk.Button(btn_row, text="Add", style="Primary.TButton", command=self._add_label_class).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="Rename", command=self._rename_label_class).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="Delete", style="Danger.TButton", command=self._delete_label_class).pack(side=tk.LEFT, padx=2)
-        
+
+        def card(title, note="", expand=False):
+            box = tk.Frame(p_teach, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
+            box.pack(fill=tk.BOTH if expand else tk.X, expand=expand, pady=(0, 10))
+            head = tk.Frame(box, bg=ui.PANEL)
+            head.pack(fill=tk.X, padx=14, pady=(10, 4))
+            tk.Label(head, text=title, font=(F, ui.F_SMALL, "bold"), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT)
+            if note:
+                tk.Label(head, text=note, font=(F, -11), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT, padx=12)
+            body = tk.Frame(box, bg=ui.PANEL)
+            body.pack(fill=tk.BOTH if expand else tk.X, expand=expand, padx=14, pady=(0, 12))
+            return body
+
+        images = card("1   IMAGES", "open a folder of saved camera images")
+        ui.FlatButton(images, "OPEN FOLDER", self._ann_open_folder, height=34, width=140).pack(side=tk.LEFT)
+        ui.FlatButton(images, "< PREV", self._ann_prev, kind="muted", height=34, width=84).pack(side=tk.LEFT, padx=(10, 0))
+        ui.FlatButton(images, "NEXT >", self._ann_next, kind="muted", height=34, width=84).pack(side=tk.LEFT, padx=(8, 0))
+        self.ann_lbl_file = tk.Label(images, text="No image loaded", font=(F, ui.F_SMALL), bg=ui.PANEL, fg=ui.MUTED)
+        self.ann_lbl_file.pack(side=tk.LEFT, padx=14)
+
+        classes = card("2   CLASS TO MARK", "tick a class, then click a cashew in the image")
+        btn_row = tk.Frame(classes, bg=ui.PANEL)
+        btn_row.pack(fill=tk.X, pady=(0, 8))
+        ui.FlatButton(btn_row, "ADD", self._add_label_class, height=30, width=70).pack(side=tk.LEFT)
+        ui.FlatButton(btn_row, "RENAME", self._rename_label_class, kind="muted", height=30, width=90).pack(side=tk.LEFT, padx=8)
+        ui.FlatButton(btn_row, "DELETE", self._delete_label_class, kind="danger", height=30, width=84).pack(side=tk.LEFT)
         self.ann_fast_class_var = tk.StringVar()
         self._class_check_vars = {}  # {class_name: tk.BooleanVar}
-        self.class_btn_grid = tk.Frame(fast_row, bg=self.colors["bg"])
+        self.class_btn_grid = tk.Frame(classes, bg=ui.PANEL)
         self.class_btn_grid.pack(fill=tk.X)
         self._refresh_class_grid()
-            
-        tree_frm = tk.Frame(cnn_frm, bg=self.colors["surface"])
-        tree_frm.pack(fill=tk.X, pady=10)
-        ttk.Label(tree_frm, text="Current Annotations:", style="Header.TLabel").pack(anchor="w", pady=(0, 5))
-        
-        # We reuse the existing tree variables
-        self.ann_tree = ttk.Treeview(tree_frm, columns=("ID", "Class Name"), show="headings", height=4)
-        self.ann_tree.heading("ID", text="ID"); self.ann_tree.column("ID", width=50, anchor="center")
-        self.ann_tree.heading("Class Name", text="Class Name"); self.ann_tree.column("Class Name", width=200, anchor="w")
-        self.ann_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb = ttk.Scrollbar(tree_frm, orient=tk.VERTICAL, command=self.ann_tree.yview)
+
+        train = tk.Frame(p_teach, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
+        train.pack(side=tk.BOTTOM, fill=tk.X)
+        head = tk.Frame(train, bg=ui.PANEL)
+        head.pack(fill=tk.X, padx=14, pady=(10, 4))
+        tk.Label(head, text="4   TRAIN", font=(F, ui.F_SMALL, "bold"), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT)
+        tk.Label(head, text="machine STOPPED; a new model is not active until you activate it", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT, padx=12)
+        row = tk.Frame(train, bg=ui.PANEL)
+        row.pack(fill=tk.X, padx=14, pady=(0, 12))
+        ui.FlatButton(row, "START TRAINING", self._start_yolo_train, kind="primary", height=40, width=220, font=(F, ui.F_BODY, "bold")).pack(side=tk.LEFT)
+        ui.FlatButton(row, "ACTIVATE A MODEL ...", lambda: self._switch_page("AI Model Select"), height=40, width=210).pack(side=tk.RIGHT)
+
+        marks = card("3   MARKS IN THIS IMAGE", expand=True)
+        edit_row = tk.Frame(marks, bg=ui.PANEL)
+        edit_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        ui.FlatButton(edit_row, "RENAME SELECTED", self._ann_rename, kind="muted", height=30, width=170).pack(side=tk.LEFT)
+        ui.FlatButton(edit_row, "DELETE SELECTED", self._ann_delete, kind="danger", height=30, width=170).pack(side=tk.LEFT, padx=8)
+        self.ann_tree = ttk.Treeview(marks, columns=("ID", "Class Name"), show="headings", height=4, style="Home.Treeview")
+        self.ann_tree.heading("ID", text="ID", anchor="w"); self.ann_tree.column("ID", width=60, anchor="w")
+        self.ann_tree.heading("Class Name", text="CLASS", anchor="w"); self.ann_tree.column("Class Name", width=300, anchor="w")
+        sb = ttk.Scrollbar(marks, orient=tk.VERTICAL, command=self.ann_tree.yview)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.ann_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.ann_tree.configure(yscrollcommand=sb.set)
-        
-        edit_row = tk.Frame(cnn_frm, bg=self.colors["surface"], pady=5)
-        edit_row.pack(fill=tk.X)
-        ttk.Button(edit_row, text="Rename Selected", command=self._ann_rename).pack(side=tk.LEFT, padx=(0,5))
-        ttk.Button(edit_row, text="Delete Selected", command=self._ann_delete, style="Danger.TButton").pack(side=tk.LEFT)
-        ttk.Button(edit_row, text="START TRAINING", style="Success.TButton", command=self._start_yolo_train).pack(side=tk.RIGHT, padx=10)
-        
 
     # ------------------------------------------------------------------ grading rules (step c1)
     def _build_grading_section(self, parent, bar_parent=None):
@@ -6111,14 +6100,12 @@ except Exception as e:
                     self.class_btn_grid, text=cname, variable=var,
                     onvalue=True, offvalue=False,
                     command=lambda cn=cname: self._on_class_check_toggle(cn),
-                    bg=self.colors["bg"], fg=self.colors["text"],
-                    selectcolor=self.colors.get("surface", "#333"),
-                    activebackground=self.colors["bg"],
-                    activeforeground=self.colors["text"],
-                    font=("Segoe UI", 10), anchor="w", width=14,
-                    relief=tk.RIDGE, bd=1, padx=4, pady=2
+                    bg=ui.FIELD, fg=ui.TEXT, selectcolor=ui.BG, activebackground=ui.FIELD, activeforeground=ui.ACCENT,
+                    font=(ui.FONT, ui.F_SMALL, "bold"), anchor="w", width=14, relief=tk.FLAT, bd=0, padx=8, pady=6,
+                    highlightthickness=1, highlightbackground=ui.BORDER
                 )
-                cb.grid(row=r, column=c, padx=4, pady=3, sticky="ew")
+                self.class_btn_grid.columnconfigure(c, weight=1, uniform="cls")
+                cb.grid(row=r, column=c, padx=(0, 6), pady=3, sticky="ew")
             self.class_btn_grid.update_idletasks()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to refresh grid: {e}")
