@@ -4,6 +4,41 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-09 (7): Sorting Logic page full width with SAVE; settings pages without the camera; new start values
+
+### What changed
+
+| Area | Change |
+|---|---|
+| Sorting Logic | No camera on this page; the whole width in three columns with bigger text: GRADING RULES + PRIORITY, VIEW LIMITS + LIVE VALUES, BELT COLOUR + TRACKER + OTHER. |
+| Live preview | Kept, small: next to LIVE VALUES one picture of the latest measured cashew per ROI with its values. It is needed to see which cashew the numbers belong to while you set the view limits. |
+| SAVE | A bar that is always on screen at the bottom: **SAVE SORTING LOGIC**. It shows "All changes saved", "UNSAVED CHANGES" after any edit, "Saved hh:mm:ss" after saving, or "NOT SAVED: wrong value ..." (nothing is stored then). |
+| Start values | **NECK M = 0** (not-rolled rule on hold) and **"One defect frame blocks GOOD" = OFF**. With M = 0 a cashew whose NECK was never seen stays GOOD and is written to the log column `shadow` as `VIEW_NOT_ROLLED` ("would be not rolled"). |
+| Old settings files | A file written by the earlier program (M = 1, blocks = ON) gets the two new start values once; after you save the page yourself, your own values are kept. |
+| Pages without the camera now | **Sorting Logic, AI Model Select, Network** (new) besides Pneumatic, Colour Size, Teaching CNN (already so). The camera stays on Home, Vision ROI and Dataset Capture; Teaching YOLO and Test Console have their own picture. AI Model Select and Network only got the full width; their layout is rebuilt in (e4). |
+
+The older blocks of the Sorting Logic page (combination rules, per-class confidence sliders of the old logic)
+are still under the new part; the sliders are marked "not used by the grading rules".
+
+### Tested
+
+- `ast` check; 105 unit tests pass (3 new: start values, M = 0 still notes "not rolled", old files get the new start values once).
+- Real window off-screen, fake PLC: page has no camera and is 1711 px wide; an edit shows UNSAVED CHANGES; a wrong
+  value is refused; SAVE shows "Saved"; **after closing and starting the program again** M = 0, GOOD frames = 4
+  and a NECK limit of 0.2 were still there (read from the screen and from the file).
+  Screenshot: `design/sorting_logic_full_width_simulated.png`.
+
+### Not tested
+
+- On your screen with the real camera.
+
+### Note
+
+`assets/cashew_x_ai_logo_clean.png` (for the branding you asked for with (e2b)) is not in this project and I did
+not find it on this PC or the external drive. Please copy it into `assets/`.
+
+---
+
 ## 2026-10-09 (6): Safety fix - every manual fire button follows DRY-RUN; PLC diagnostics tool gated
 
 Owner's report: with DRY-RUN ON the single relay test says "NOT sent", but FIRE 1-40 fired real valves.

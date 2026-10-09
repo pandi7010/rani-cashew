@@ -52,11 +52,11 @@ class AlwaysRejectTest(unittest.TestCase):
         self.assertEqual(decide(GOOD, lost_ms=300).result, dc.GOOD)     # exactly the limit is still fine
 
     def test_view_engine_modes(self):
-        active = decide(NO_NECK, view_engine=dc.ACTIVE)
+        active = decide(NO_NECK, {"neck_min_frames": 1}, view_engine=dc.ACTIVE)
         self.assertEqual((active.result, active.reason), (dc.UNDEFINED, dc.NOT_ROLLED))
-        shadow = decide(NO_NECK, view_engine=dc.SHADOW)
+        shadow = decide(NO_NECK, {"neck_min_frames": 1}, view_engine=dc.SHADOW)
         self.assertEqual((shadow.result, shadow.reject, shadow.shadow), (dc.GOOD, False, [dc.VIEW_NOT_ROLLED]))
-        off = decide(NO_NECK, view_engine=dc.OFF)
+        off = decide(NO_NECK, {"neck_min_frames": 1}, view_engine=dc.OFF)
         self.assertEqual((off.result, off.shadow), (dc.GOOD, []))
         self.assertEqual(decide(GOOD, view_engine=dc.SHADOW).shadow, [])
 
@@ -86,6 +86,16 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(engines.is_double([460, 470, 255, 260], 10.0))          # two frames and half of them
         self.assertFalse(engines.is_double([460, 470], 10.0, {"enabled": False}))
         self.assertTrue(engines.is_double([300, 310], 6.57))                    # 45.7 mm at the 5-track scale
+
+    def test_new_start_values_reach_a_settings_file_written_before_them(self):
+        old = {"voting": {"neck_min_frames": 1, "single_defect_blocks_good": True, "good_min_frames": 4}}
+        cfg = grading_config.merged(old)
+        self.assertEqual((cfg["voting"]["neck_min_frames"], cfg["voting"]["single_defect_blocks_good"]), (0, False))
+        self.assertEqual(cfg["voting"]["good_min_frames"], 4)           # other stored values are kept
+        # once saved with the new version, the owner's own choice is kept
+        kept = grading_config.merged({"defaults_version": 2, "voting": {"neck_min_frames": 2, "single_defect_blocks_good": True}})
+        self.assertEqual((kept["voting"]["neck_min_frames"], kept["voting"]["single_defect_blocks_good"]), (2, True))
+        self.assertEqual(grading_config.defaults()["voting"]["neck_min_frames"], 0)
 
     def test_all_engines_start_in_shadow(self):
         cfg = grading_config.defaults()

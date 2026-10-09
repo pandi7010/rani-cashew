@@ -8,6 +8,11 @@ import segmentation
 import view_features
 
 
+# Raised when the owner changes a start value that must also reach a settings file written before the change.
+# 2 (2026-10-09): NECK M = 0 and "one defect frame blocks GOOD" = OFF.
+DEFAULTS_VERSION = 2
+
+
 def defaults() -> dict:
     return {
         "voting": dict(decision.VOTING_DEFAULTS),
@@ -25,6 +30,7 @@ def defaults() -> dict:
         "double": dict(engines.DOUBLE_DEFAULTS),
         "rules": dict(engines.RULE_DEFAULTS),
         "avg_cashew_weight_g": 1.8,         # for kg/hr only (5-track default); sorting is not affected
+        "defaults_version": DEFAULTS_VERSION,
     }
 
 
@@ -36,6 +42,10 @@ def merged(stored) -> dict:
             out[key] = {**out[key], **copy.deepcopy(value)}
         else:
             out[key] = copy.deepcopy(value)
+    if int((stored or {}).get("defaults_version", 1)) < 2 and stored:
+        out["voting"]["neck_min_frames"] = 0
+        out["voting"]["single_defect_blocks_good"] = False
+    out["defaults_version"] = DEFAULTS_VERSION
     rules = out["views"].setdefault("rules", {})
     for view in view_features.VIEWS:
         rules.setdefault(view, {})

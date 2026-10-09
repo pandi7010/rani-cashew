@@ -456,6 +456,7 @@ class SharedState:
         self.result_counts: Dict[str, int] = {}
         self.recent_decisions = OrderedDict()               # cashew ID -> text with its frame-by-frame votes
         self.view_live = {1: "", 2: ""}                     # latest measured values per ROI (view tuning)
+        self.view_thumb = {}                                # ROI -> small picture of that cashew (BGR)
         self.lane_speed = {1: 0.0, 2: 0.0}                  # px/ms, from the tracker
         self.teach_belt_requested = False
         self.teach_belt_message = ""
@@ -1276,6 +1277,11 @@ class ProcessingThread(threading.Thread):
                 self.shared_state.belt_stopped[rid] = tracker.stopped
                 if live is not None:
                     self.shared_state.view_live[rid] = f"{live['view']}  {view_features.short_text(live['feat'])}"
+                    bx1, by1, bx2, by2 = live["box"]
+                    crop = clean_frame[by1:by2, bx1:bx2]
+                    if crop.size:
+                        scale = 110.0 / max(crop.shape[:2])
+                        self.shared_state.view_thumb[rid] = cv2.resize(crop, (max(1, int(crop.shape[1] * scale)), max(1, int(crop.shape[0] * scale))))
 
             line = lines[rid]
             for trk in tracks:
@@ -2443,15 +2449,19 @@ class App(tk.Tk):
         self.pages["Sorting Logic"] = p_sort
         sort_canvas = tk.Canvas(p_sort, bg=self.colors["surface"], highlightthickness=0)
         sort_scroll = ttk.Scrollbar(p_sort, orient="vertical", command=sort_canvas.yview)
-        sort_inner = tk.Frame(sort_canvas, bg=self.colors["surface"], padx=15, pady=15)
-        sort_inner.bind("<Configure>", lambda e: sort_canvas.configure(scrollregion=sort_canvas.bbox("all")))
-        sort_canvas.create_window((0, 0), window=sort_inner, anchor="nw", width=430)
+        sort_canvas.configure(bg=ui.BG)
+        sort_outer = tk.Frame(sort_canvas, bg=ui.BG)
+        sort_outer.bind("<Configure>", lambda e: sort_canvas.configure(scrollregion=sort_canvas.bbox("all")))
+        sort_window = sort_canvas.create_window((0, 0), window=sort_outer, anchor="nw")
+        sort_canvas.bind("<Configure>", lambda e: sort_canvas.itemconfig(sort_window, width=e.width))
+        self._build_grading_section(sort_outer, bar_parent=p_sort)
+        # Older blocks (combination rules, per-class confidence sliders of the old logic) stay below, unchanged.
+        sort_inner = tk.Frame(sort_outer, bg=self.colors["surface"], padx=15, pady=15, width=520)
+        sort_inner.pack(anchor="w")
         sort_canvas.configure(yscrollcommand=sort_scroll.set)
         sort_canvas.pack(side="left", fill="both", expand=True)
         sort_scroll.pack(side="right", fill="y")
         
-        self._build_grading_section(sort_inner)
-
         ttk.Label(sort_inner, text="COMBINATION RULES (classes seen together -> final)", style="Title.TLabel").pack(anchor="w", pady=(0,10))
         classes = ["Any", "Good", "UPW", "PKW", "White", "Defect_Skin"] + self.all_class_names
         classes = list(set(classes))
@@ -2496,7 +2506,7 @@ class App(tk.Tk):
         ttk.Button(prio_acts, text="Delete", command=self._delete_selected_priority_logic).pack(side=tk.LEFT, padx=2)
         ttk.Button(prio_acts, text="Clear", command=self._clear_all_priority_rules).pack(side=tk.LEFT, padx=2)
         
-        ttk.Label(sort_inner, text="CONFIDENCE THRESHOLDS", style="Title.TLabel").pack(anchor="w", pady=(20,10))
+        ttk.Label(sort_inner, text="CONFIDENCE THRESHOLDS (old logic: not used by the grading rules above)", style="Title.TLabel").pack(anchor="w", pady=(20,10))
         self.conf_vars = {}
         for cname in sorted(self.all_class_names):
             cname_low = cname.lower()
@@ -3846,6 +3856,10 @@ except Exception as e:
             self.test_play_btn.config(text="Play")
             self.test_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
+    # Settings-only pages use the whole width; the camera picture is shown where it is needed
+    # (Home, Vision ROI, Dataset Capture; Teaching YOLO and Test Console have their own picture).
+    PAGES_WITHOUT_CAMERA = ("Pneumatic", "Teaching CNN", "Colour Size", "Sorting Logic", "AI Model Select", "Network")
+
     def _switch_page(self, page_name):
         if hasattr(self, 'active_page'): self.active_page.set(page_name)
         for name, btn in self.nav_buttons.items():
@@ -3857,7 +3871,7 @@ except Exception as e:
             self.pages[page_name].pack(fill=tk.BOTH, expand=True)
             
         # Full Screen Logic for specific pages
-        if page_name in ["Pneumatic", "Teaching CNN", "Colour Size"]:
+        if page_name in self.PAGES_WITHOUT_CAMERA:
             if hasattr(self, 'center_frm'):
                 self.center_frm.pack_forget()
             if hasattr(self, 'right_frm'):
@@ -4865,41 +4879,84 @@ except Exception as e:
         
 
     # ------------------------------------------------------------------ grading rules (step c1)
-    def _build_grading_section(self, parent):
-        """Voting limits, priority order, view limits, belt colour, tracker and live values."""
-        surf, light, text, muted = self.colors["surface"], self.colors["surface_light"], self.colors["text"], self.colors["text_muted"]
-        g = self.shared_state.grading
+    def _build_grading_section(self, parent, bar_parent=None):
+        """Sorting Logic page, full width (no camera): grading rules and priority, view limits with live values
+        and a small live picture per ROI, belt colour and tracker. One SAVE button for the page."""
+        F, g = ui.FONT, self.shared_state.grading
         self.grading_vars = {}
+        self._sorting_dirty = False
 
-        def entry_row(frame, section, key, label, row, col=0):
-            tk.Label(frame, text=label, bg=surf, fg=text, font=("Roboto", 9), anchor="w").grid(row=row, column=col, sticky="w", padx=(0, 6), pady=2)
+        def changed(*_):
+            if not getattr(self, "_sorting_loading", False):
+                self._sorting_dirty = True
+                self.lbl_grading_status.config(text="●  UNSAVED CHANGES", fg=ui.WARN)
+
+        def panel(column, title, note=""):
+            box = tk.Frame(column, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
+            box.pack(fill=tk.X, pady=(0, 2 * ui.GRID))
+            head = tk.Frame(box, bg=ui.PANEL)
+            head.pack(fill=tk.X, padx=20, pady=(16, 6))
+            tk.Label(head, text=title, font=(F, ui.F_SMALL, "bold"), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT)
+            if note:
+                tk.Label(box, text=note, font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.PANEL, justify="left", anchor="w",
+                         wraplength=480).pack(fill=tk.X, padx=20, pady=(0, 8))
+            body = tk.Frame(box, bg=ui.PANEL)
+            body.pack(fill=tk.X, padx=20, pady=(0, 16))
+            return body
+
+        def number(body, section, key, label, unit=""):
+            row = tk.Frame(body, bg=ui.PANEL)
+            row.pack(fill=tk.X, pady=5)
+            tk.Label(row, text=label, font=(F, ui.F_BODY), fg=ui.TEXT, bg=ui.PANEL, anchor="w").pack(side=tk.LEFT)
+            tk.Label(row, text=unit, font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.PANEL, width=7, anchor="w").pack(side=tk.RIGHT)
             var = tk.StringVar(value=f"{g[section].get(key, ''):g}")
-            tk.Entry(frame, textvariable=var, width=7, bg=light, fg=text, insertbackground=text, bd=0, font=("Roboto", 10)).grid(row=row, column=col + 1, sticky="w", pady=2)
+            tk.Entry(row, textvariable=var, width=7, bg=ui.FIELD, fg=ui.TEXT, insertbackground=ui.TEXT, bd=0, justify="center",
+                     font=(F, ui.F_BODY, "bold"), highlightthickness=1, highlightbackground=ui.BORDER, highlightcolor=ui.ACCENT
+                     ).pack(side=tk.RIGHT, padx=(8, 8), ipady=4)
+            var.trace_add("write", changed)
             self.grading_vars[(section, key)] = var
 
-        def check(label, var):
-            tk.Checkbutton(parent, text=label, variable=var, bg=surf, fg=text, selectcolor=light, activebackground=surf,
-                           activeforeground=text, font=("Roboto", 9), anchor="w", wraplength=400, justify="left").pack(fill=tk.X)
+        def switch(body, label, var, note=""):
+            row = tk.Frame(body, bg=ui.PANEL)
+            row.pack(fill=tk.X, pady=6)
+            tk.Checkbutton(row, variable=var, command=changed, bg=ui.PANEL, activebackground=ui.PANEL, selectcolor=ui.FIELD,
+                           fg=ui.ACCENT, bd=0, highlightthickness=0).pack(side=tk.LEFT)
+            text = tk.Frame(row, bg=ui.PANEL)
+            text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            tk.Label(text, text=label, font=(F, ui.F_BODY), fg=ui.TEXT, bg=ui.PANEL, anchor="w", justify="left", wraplength=470).pack(fill=tk.X)
+            if note:
+                tk.Label(text, text=note, font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.PANEL, anchor="w", justify="left", wraplength=470).pack(fill=tk.X)
 
-        ttk.Label(parent, text="GRADING RULES", style="Title.TLabel").pack(anchor="w", pady=(0, 4))
-        tk.Label(parent, text="One decision per cashew at its Decision line. A class is \"seen\" with enough frames at or above its confidence.",
-                 bg=surf, fg=muted, font=("Roboto", 9), wraplength=410, justify="left").pack(anchor="w")
+        columns = tk.Frame(parent, bg=ui.BG)
+        columns.pack(fill=tk.BOTH, expand=True)
+        cols = []
+        for i in range(3):
+            columns.columnconfigure(i, weight=1, uniform="sorting")
+            col = tk.Frame(columns, bg=ui.BG)
+            col.grid(row=0, column=i, sticky="new", padx=(0 if i == 0 else 2 * ui.GRID, 0))
+            cols.append(col)
 
-        vote = tk.Frame(parent, bg=surf); vote.pack(fill=tk.X, pady=6)
-        for row, (key, label) in enumerate((
-                ("defect_conf", "Defect: confidence at least (0-1)"), ("defect_min_frames", "Defect: in at least N frames"),
-                ("good_conf", "GOOD: confidence at least (0-1)"), ("good_min_frames", "GOOD: in at least N frames"),
-                ("neck_min_frames", "GOOD: NECK view in at least M frames (0 = off)"),
-                ("neck_weight", "TESTA vote from a NECK frame counts as"),
-                ("rejection_conf", "REJECTION (YOLO): confidence at least"), ("rejection_min_frames", "REJECTION (YOLO): in at least N frames"))):
-            entry_row(vote, "voting", key, label, row)
-        self.single_defect_var = tk.BooleanVar(value=bool(g["voting"].get("single_defect_blocks_good", True)))
-        check("One defect frame (below N) blocks GOOD -> Undefined", self.single_defect_var)
+        # ── column 1: grading rules, priority ──
+        body = panel(cols[0], "GRADING RULES", "One decision per cashew at its Decision line. A class is \"seen\" with enough frames at or above its confidence.")
+        number(body, "voting", "defect_conf", "Defect: confidence at least", "0 - 1")
+        number(body, "voting", "defect_min_frames", "Defect: in at least", "frames")
+        number(body, "voting", "good_conf", "GOOD: confidence at least", "0 - 1")
+        number(body, "voting", "good_min_frames", "GOOD: in at least", "frames")
+        number(body, "voting", "neck_min_frames", "GOOD: NECK view in at least (M)", "frames")
+        tk.Label(body, text="M = 0: the not-rolled rule is on hold. A cashew whose NECK was never seen is still written to the log as \"would be not rolled\".",
+                 font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.PANEL, justify="left", anchor="w", wraplength=500).pack(fill=tk.X, pady=(0, 6))
+        number(body, "voting", "neck_weight", "TESTA vote from a NECK frame counts as", "frames")
+        number(body, "voting", "rejection_conf", "REJECTION (YOLO): confidence at least", "0 - 1")
+        number(body, "voting", "rejection_min_frames", "REJECTION (YOLO): in at least", "frames")
+        self.single_defect_var = tk.BooleanVar(value=bool(g["voting"].get("single_defect_blocks_good", False)))
+        switch(body, "One defect frame blocks GOOD", self.single_defect_var,
+               "ON: a single defect frame (below the frame limit) makes the cashew Undefined. OFF: it is ignored.")
 
-        ttk.Label(parent, text="PRIORITY (highest first)", style="Header.TLabel").pack(anchor="w", pady=(12, 4))
-        prio = tk.Frame(parent, bg=surf); prio.pack(fill=tk.X)
-        self.priority_list = tk.Listbox(prio, height=10, width=22, bg=light, fg=text, selectbackground=self.colors["info"], bd=0,
-                                        highlightthickness=0, font=("Roboto", 10), exportselection=False)
+        body = panel(cols[0], "PRIORITY (highest first)", "Before this list: tracking faults, DOUBLE and REJECTION go to the reject relay; skin together with another defect is UPW.")
+        prio = tk.Frame(body, bg=ui.PANEL)
+        prio.pack(fill=tk.X)
+        self.priority_list = tk.Listbox(prio, height=10, width=24, bg=ui.FIELD, fg=ui.TEXT, selectbackground=ui.ACCENT, selectforeground="#06222A",
+                                        bd=0, highlightthickness=1, highlightbackground=ui.BORDER, font=(F, ui.F_BODY), exportselection=False, activestyle="none")
         for name in g["priority"]:
             self.priority_list.insert(tk.END, name)
         self.priority_list.pack(side=tk.LEFT)
@@ -4913,70 +4970,96 @@ except Exception as e:
             self.priority_list.delete(i)
             self.priority_list.insert(i + step, name)
             self.priority_list.selection_set(i + step)
-        side = tk.Frame(prio, bg=surf); side.pack(side=tk.LEFT, padx=8, anchor="n")
-        ttk.Button(side, text="UP", command=lambda: move(-1)).pack(fill=tk.X, pady=2)
-        ttk.Button(side, text="DOWN", command=lambda: move(1)).pack(fill=tk.X, pady=2)
-        tk.Label(side, text="Before this list:\nDOUBLE, REJECTION\n-> reject relay.\nSkin + other defect\n-> UPW.", bg=surf, fg=muted,
-                 font=("Roboto", 8), justify="left").pack(anchor="w", pady=(6, 0))
+            changed()
+        side = tk.Frame(prio, bg=ui.PANEL)
+        side.pack(side=tk.LEFT, padx=16, anchor="n")
+        ui.FlatButton(side, "▲  UP", command=lambda: move(-1), height=36, width=120).pack(pady=(0, 8))
+        ui.FlatButton(side, "▼  DOWN", command=lambda: move(1), height=36, width=120).pack()
 
-        ttk.Label(parent, text="VIEW LIMITS (empty = not used)", style="Header.TLabel").pack(anchor="w", pady=(12, 2))
-        tk.Label(parent, text="A frame is NECK, BACK or TOP when all filled limits of that view hold (checked in this order), otherwise OTHER. "
-                              "The letters are the values drawn under each cashew.",
-                 bg=surf, fg=muted, font=("Roboto", 9), wraplength=410, justify="left").pack(anchor="w")
-        grid = tk.Frame(parent, bg=surf); grid.pack(fill=tk.X, pady=4)
-        tk.Label(grid, text="", bg=surf).grid(row=0, column=0)
+        # ── column 2: view limits, live values ──
+        body = panel(cols[1], "VIEW LIMITS (empty = not used)",
+                     "A frame is NECK, BACK or TOP when all filled limits of that view hold (checked in this order), otherwise OTHER. "
+                     "The letters are the values drawn under each cashew.")
+        grid = tk.Frame(body, bg=ui.PANEL)
+        grid.pack(fill=tk.X)
         for c, view in enumerate(view_features.VIEWS):
-            tk.Label(grid, text=f"{view} min / max", bg=surf, fg=self.colors["info"], font=("Roboto", 8, "bold")).grid(row=0, column=1 + 2 * c, columnspan=2)
+            tk.Label(grid, text=view, font=(F, ui.F_SMALL, "bold"), fg=ui.ACCENT, bg=ui.PANEL).grid(row=0, column=1 + 2 * c, columnspan=2, pady=(0, 2))
+            for k, word in enumerate(("min", "max")):
+                tk.Label(grid, text=word, font=(F, -11), fg=ui.MUTED, bg=ui.PANEL).grid(row=1, column=1 + 2 * c + k)
         self.view_vars = {}
-        for r, (name, (letter, description)) in enumerate(view_features.FEATURES.items(), start=1):
-            tk.Label(grid, text=f"{letter} {name}", bg=surf, fg=text, font=("Roboto", 9), anchor="w").grid(row=r, column=0, sticky="w", padx=(0, 4))
+        for r, (name, (letter, description)) in enumerate(view_features.FEATURES.items(), start=2):
+            tk.Label(grid, text=f"{letter}  {name}", font=(F, ui.F_BODY), fg=ui.TEXT, bg=ui.PANEL, anchor="w").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=4)
             for c, view in enumerate(view_features.VIEWS):
                 limits = (g["views"]["rules"].get(view) or {}).get(name) or [None, None]
                 for k in (0, 1):
                     var = tk.StringVar(value="" if limits[k] is None else f"{limits[k]:g}")
-                    tk.Entry(grid, textvariable=var, width=5, bg=light, fg=text, insertbackground=text, bd=0, font=("Roboto", 9)).grid(row=r, column=1 + 2 * c + k, padx=1, pady=1)
+                    tk.Entry(grid, textvariable=var, width=5, bg=ui.FIELD, fg=ui.TEXT, insertbackground=ui.TEXT, bd=0, justify="center",
+                             font=(F, ui.F_BODY), highlightthickness=1, highlightbackground=ui.BORDER, highlightcolor=ui.ACCENT
+                             ).grid(row=r, column=1 + 2 * c + k, padx=(8 if k == 0 else 2, 2), pady=4, ipady=3)
+                    var.trace_add("write", changed)
                     self.view_vars[(view, name, k)] = var
+        legend = "   ".join(f"{letter} = {description}" for name, (letter, description) in view_features.FEATURES.items())
+        tk.Label(body, text=legend, font=(F, -11), fg=ui.MUTED, bg=ui.PANEL, justify="left", anchor="w", wraplength=480).pack(fill=tk.X, pady=(8, 0))
         self.show_values_var = tk.BooleanVar(value=bool(g["views"].get("show_values", True)))
-        check("Draw the values under each cashew", self.show_values_var)
+        switch(body, "Draw the values under each cashew in the camera picture", self.show_values_var)
 
-        ttk.Label(parent, text="LIVE VALUES", style="Header.TLabel").pack(anchor="w", pady=(12, 2))
-        self.lbl_view_live = tk.Label(parent, text="", bg=surf, fg=self.colors["warning"], font=("Roboto Mono", 9), justify="left", anchor="w", wraplength=410)
-        self.lbl_view_live.pack(fill=tk.X)
-        self.lbl_result_counts = tk.Label(parent, text="", bg=surf, fg=text, font=("Roboto", 9), justify="left", anchor="w", wraplength=410)
-        self.lbl_result_counts.pack(fill=tk.X, pady=(4, 0))
-        ttk.Button(parent, text="RESET COUNTERS", command=self.shared_state.reset_result_counts).pack(anchor="w", pady=4)
+        body = panel(cols[1], "LIVE VALUES", "The latest measured cashew of each ROI while the machine is RUNNING (for tuning the view limits).")
+        self.lbl_view_thumb, self.lbl_view_live_roi, self._thumb_images = {}, {}, {}
+        for rid in (1, 2):
+            row = tk.Frame(body, bg=ui.PANEL)
+            row.pack(fill=tk.X, pady=4)
+            thumb = tk.Label(row, bg=ui.FIELD, width=14, height=6, highlightthickness=1, highlightbackground=ui.BORDER)
+            thumb.pack(side=tk.LEFT)
+            text = tk.Label(row, text=f"ROI {rid}:  -", font=(F, ui.F_BODY), fg=ui.WARN, bg=ui.PANEL, justify="left", anchor="nw", wraplength=380)
+            text.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=12)
+            self.lbl_view_thumb[rid], self.lbl_view_live_roi[rid] = thumb, text
+        self.lbl_view_live = self.lbl_view_live_roi[1]      # marks "this page has live values"
+        self.lbl_result_counts = tk.Label(body, text="", font=(F, ui.F_SMALL), fg=ui.TEXT, bg=ui.PANEL, justify="left", anchor="w", wraplength=520)
+        self.lbl_result_counts.pack(fill=tk.X, pady=(8, 6))
+        ui.FlatButton(body, "RESET COUNTERS", command=self.shared_state.reset_result_counts, kind="muted", height=32).pack(anchor="w")
 
-        ttk.Label(parent, text="BELT COLOUR (cashew mask)", style="Header.TLabel").pack(anchor="w", pady=(12, 2))
-        seg = tk.Frame(parent, bg=surf); seg.pack(fill=tk.X)
-        for row, (key, label) in enumerate((("blue_h_min", "Belt hue from (0-179)"), ("blue_h_max", "Belt hue to"),
-                                            ("blue_s_min", "Belt saturation at least"), ("dark_v_max", "Dark (gap) brightness up to"),
-                                            ("min_area_px", "Smallest cashew area (px)"), ("edge_margin_px", "Cut-off: box within px of ROI edge"))):
-            entry_row(seg, "segmentation", key, label, row)
+        # ── column 3: belt colour, tracker, other switches ──
+        body = panel(cols[2], "BELT COLOUR (cashew mask)", "The cashew is everything that is not belt blue and not a dark roller gap.")
+        number(body, "segmentation", "blue_h_min", "Belt hue from", "0 - 179")
+        number(body, "segmentation", "blue_h_max", "Belt hue to", "0 - 179")
+        number(body, "segmentation", "blue_s_min", "Belt saturation at least", "0 - 255")
+        number(body, "segmentation", "dark_v_max", "Dark (gap) brightness up to", "0 - 255")
+        number(body, "segmentation", "min_area_px", "Smallest cashew area", "px")
+        number(body, "segmentation", "edge_margin_px", "Cut-off: box this close to the ROI edge", "px")
 
         def teach():
             if messagebox.askyesno("Teach belt colour", "The belt must be EMPTY and lit as in production.\n\nTeach the belt colour from the picture now?"):
                 with self.shared_state.lock:
                     self.shared_state.teach_belt_requested = True
                     self.shared_state.teach_belt_message = "Teaching..."
-        ttk.Button(parent, text="TEACH BELT COLOUR (empty belt)", command=teach).pack(anchor="w", pady=4)
-        self.lbl_teach_belt = tk.Label(parent, text="", bg=surf, fg=muted, font=("Roboto", 9), justify="left", anchor="w", wraplength=410)
+        ui.FlatButton(body, "TEACH BELT COLOUR (empty belt)", command=teach, height=36).pack(anchor="w", pady=(8, 4))
+        self.lbl_teach_belt = tk.Label(body, text="", font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.PANEL, justify="left", anchor="w", wraplength=520)
         self.lbl_teach_belt.pack(fill=tk.X)
 
-        ttk.Label(parent, text="TRACKER", style="Header.TLabel").pack(anchor="w", pady=(12, 2))
-        trk = tk.Frame(parent, bg=surf); trk.pack(fill=tk.X)
-        for row, (key, label) in enumerate((("max_step_px", "Largest step per frame, speed unknown (px)"), ("gate_extra_px", "Allowed error around prediction (px)"),
-                                            ("speed_factor", "... plus this x predicted step"), ("back_tol_px", "Backward tolerance (px)"),
-                                            ("max_lateral_px", "Sideways limit (px)"), ("hold_ms", "Keep a missed cashew's ID for (ms)"))):
-            entry_row(trk, "tracker", key, label, row)
+        body = panel(cols[2], "TRACKER", "First values; they are tuned on a recording with real cashews.")
+        number(body, "tracker", "max_step_px", "Largest step per frame (speed unknown)", "px")
+        number(body, "tracker", "gate_extra_px", "Allowed error around the prediction", "px")
+        number(body, "tracker", "speed_factor", "... plus this x the predicted step", "x")
+        number(body, "tracker", "back_tol_px", "Backward tolerance", "px")
+        number(body, "tracker", "max_lateral_px", "Sideways limit", "px")
+        number(body, "tracker", "hold_ms", "Keep a missed cashew's ID for", "ms")
 
+        body = panel(cols[2], "OTHER")
         self.old_filter_var = tk.BooleanVar(value=bool(self.shared_state.opencv_filter.get("enabled", False)))
-        check("Old dark-spot filter for CNN SW / WHITE_DW (Colour Size page values)", self.old_filter_var)
+        switch(body, "Old dark-spot filter for CNN SW / WHITE_DW", self.old_filter_var, "Uses the values of the Colour Size page. Default OFF.")
         self.frame_log_var = tk.BooleanVar(value=bool(g["frame_log"].get("enabled", True)))
-        check("Per-frame log (logs/frames_*.jsonl, kept 7 days)", self.frame_log_var)
+        switch(body, "Per-frame log", self.frame_log_var, "logs/frames_*.jsonl, kept 7 days.")
 
-        ttk.Button(parent, text="APPLY GRADING SETTINGS", style="Primary.TButton", command=self._apply_grading_settings).pack(fill=tk.X, pady=(10, 2))
-        self.lbl_grading_status = tk.Label(parent, text="", bg=surf, fg=muted, font=("Roboto", 9), anchor="w", wraplength=410, justify="left")
-        self.lbl_grading_status.pack(fill=tk.X, pady=(0, 20))
+        # ── save bar: outside the scrolling part, so it is always on screen ──
+        bar = tk.Frame(bar_parent or parent, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
+        bar.pack(side=tk.BOTTOM, fill=tk.X, pady=(ui.GRID, 0))
+        ui.FlatButton(bar, "SAVE SORTING LOGIC", command=self._apply_grading_settings, kind="primary", height=44, width=300,
+                      font=(F, ui.F_BODY, "bold")).pack(side=tk.RIGHT, padx=16, pady=12)
+        self.lbl_grading_status = tk.Label(bar, text="All changes saved", font=(F, ui.F_BODY, "bold"), fg=ui.MUTED, bg=ui.PANEL, anchor="e",
+                                           justify="right", wraplength=900)
+        self.lbl_grading_status.pack(side=tk.RIGHT, padx=16)
+        tk.Label(bar, text="Saved with the settings file pneumatic_config.json (block \"grading\").", font=(F, ui.F_SMALL), fg=ui.MUTED,
+                 bg=ui.PANEL).pack(side=tk.LEFT, padx=16)
 
     def _apply_grading_settings(self):
         g = copy.deepcopy(self.shared_state.grading)
@@ -5006,7 +5089,8 @@ except Exception as e:
                             raise ValueError(f"{view} {name}: min is above max")
                         rules[view][name] = limits
         except ValueError as e:
-            messagebox.showerror("Grading settings", f"Not applied. Wrong value: {e}")
+            messagebox.showerror("Sorting Logic", f"NOT saved. Wrong value: {e}")
+            self.lbl_grading_status.config(text=f"NOT SAVED: wrong value ({e})", fg=ui.BAD)
             return
         g["voting"]["single_defect_blocks_good"] = bool(self.single_defect_var.get())
         g["priority"] = list(self.priority_list.get(0, tk.END))
@@ -5018,9 +5102,13 @@ except Exception as e:
         self.shared_state.set_grading(g)
         self.processing_thread.cashew_log.frames_enabled = g["frame_log"]["enabled"]
         used = [view for view in view_features.VIEWS if rules[view]]
-        note = "" if "NECK" in used or g["voting"]["neck_min_frames"] == 0 else "  NOTE: NECK has no limits, so no cashew can become GOOD while M is above 0."
-        self.lbl_grading_status.config(text=f"Applied {datetime.now().strftime('%H:%M:%S')}. Views with limits: {', '.join(used) or 'none'}.{note}",
-                                       fg=self.colors["warning"] if note else self.colors["success"])
+        view_mode = g.get("engines", {}).get("view", engines.SHADOW)
+        note = ""
+        if "NECK" not in used and g["voting"]["neck_min_frames"] > 0 and view_mode == engines.ACTIVE:
+            note = "   NOTE: NECK has no limits and the View engine is ACTIVE, so no cashew can become GOOD."
+        self._sorting_dirty = False
+        self.lbl_grading_status.config(text=f"✔  Saved {datetime.now().strftime('%H:%M:%S')}   (views with limits: {', '.join(used) or 'none'}){note}",
+                                       fg=ui.WARN if note else ui.GOOD)
         log.info("Grading settings applied: %s", g)
 
     def _refresh_grading_live(self):
@@ -5030,8 +5118,16 @@ except Exception as e:
             counts = dict(ss.result_counts)
             seg = dict(ss.grading["segmentation"])
         px_per_mm = float(ss.size_config.get("px_per_mm", 10.0)) or 10.0
-        self.lbl_view_live.config(text="\n".join(
-            f"ROI {r}: {live[r] or '-'}\n       lane speed {speed[r] * 1000:.0f} px/s = {speed[r] * 1000 / px_per_mm:.0f} mm/s at {px_per_mm:g} px/mm" for r in (1, 2)))
+        with ss.lock:
+            thumbs = dict(ss.view_thumb)
+        for r in (1, 2):
+            self.lbl_view_live_roi[r].config(text=f"ROI {r}:  {live[r] or '-'}\nlane speed {speed[r] * 1000:.0f} px/s = "
+                                                  f"{speed[r] * 1000 / px_per_mm:.0f} mm/s at {px_per_mm:g} px/mm")
+            crop = thumbs.get(r)
+            if crop is not None and crop is not self._thumb_images.get((r, "src")):
+                image = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)))
+                self._thumb_images[r], self._thumb_images[(r, "src")] = image, crop
+                self.lbl_view_thumb[r].config(image=image, width=image.width(), height=image.height())
         total = sum(n for k, n in counts.items() if not k.startswith("UNDEFINED: "))
         self.lbl_result_counts.config(text=f"Decided: {total}   " + "   ".join(f"{k} {n}" for k, n in sorted(counts.items())))
         if teach_msg != self.lbl_teach_belt.cget("text"):

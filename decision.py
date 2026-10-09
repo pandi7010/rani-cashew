@@ -35,10 +35,11 @@ VIEW_NOT_ROLLED = "VIEW_NOT_ROLLED"
 VOTING_DEFAULTS = {
     "defect_conf": 0.50, "defect_min_frames": 2,
     "good_conf": 0.80, "good_min_frames": 3,
-    "neck_min_frames": 1,               # M: GOOD needs the NECK view in at least this many frames (0 = not required)
+    "neck_min_frames": 0,               # M: GOOD needs the NECK view in at least this many frames. 0 = rule on hold
+                                        # (owner, 2026-10-09); a cashew whose NECK was never seen is still noted.
     "neck_weight": 2,                   # a skin vote from a NECK frame counts as this many frames
     "rejection_conf": 0.50, "rejection_min_frames": 2,
-    "single_defect_blocks_good": True,  # "no defect in any frame": one defect frame is not a defect, but not GOOD either
+    "single_defect_blocks_good": False, # True: one defect frame (below the frame limit) makes the cashew Undefined
 }
 PRIORITY_DEFAULT = ["UPW", "PKW2", "PKW1", "OIL", "BROWN", "DW2", "DW1", "TESTA", "TESTA SMALL", "WHITE_DW"]
 GOOD_CLASSES_DEFAULT = ["GOOD_CASHEW", "GOOD", "SW"]       # "no defect" votes; SW / WW is decided by colour
@@ -167,10 +168,12 @@ def decide(votes: List[FrameVote], voting: Optional[dict] = None, priority: Opti
     if weighted and v["single_defect_blocks_good"]:
         return done(UNDEFINED, SINGLE_DEFECT_FRAME, True)
     if d.good_frames >= v["good_min_frames"]:
-        if d.neck_frames >= v["neck_min_frames"] or view_engine == OFF:
+        if view_engine == OFF or d.neck_frames >= max(1, v["neck_min_frames"]):
             return done(GOOD, "good", False)
-        if view_engine == SHADOW:
-            d.shadow.append(VIEW_NOT_ROLLED)
-            return done(GOOD, "good", False)
-        return done(UNDEFINED, NOT_ROLLED, True)
+        # NECK not seen often enough. It rejects only with M above 0 and the View engine ACTIVE;
+        # otherwise the cashew stays GOOD and "would be not rolled" is noted for the log.
+        if v["neck_min_frames"] > 0 and view_engine == ACTIVE:
+            return done(UNDEFINED, NOT_ROLLED, True)
+        d.shadow.append(VIEW_NOT_ROLLED)
+        return done(GOOD, "good", False)
     return done(UNDEFINED, TOO_FEW_FRAMES if len(used) < v["good_min_frames"] else LOW_CONFIDENCE, True)

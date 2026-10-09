@@ -5,7 +5,15 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import decision as dc
-from decision import FrameVote, decide
+from decision import FrameVote
+
+# These tests check the rules themselves, with the NECK rule and the single-defect rule switched ON.
+# The start values of the machine (both off, owner 2026-10-09) are checked in StartValueTest.
+STRICT = {"neck_min_frames": 1, "single_defect_blocks_good": True}
+
+
+def decide(votes, voting=None, *args, **kwargs):
+    return dc.decide(votes, {**STRICT, **(voting or {})}, *args, **kwargs)
 
 
 def frames(*specs):
@@ -140,6 +148,24 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual((d.result, d.reason), ("DW2", "combination_rule"))
         d = decide(frames(("PKW1", 0.9), ("PKW1", 0.9)), combination_rules=rules)
         self.assertEqual(d.result, "PKW1")
+
+
+class StartValueTest(unittest.TestCase):
+    def test_neck_rule_is_on_hold_but_still_noted(self):
+        self.assertEqual(dc.VOTING_DEFAULTS["neck_min_frames"], 0)
+        no_neck = frames(("GOOD_CASHEW", 0.9, "TOP"), ("GOOD_CASHEW", 0.9, "BACK"), ("GOOD_CASHEW", 0.9, "TOP"))
+        for mode in (dc.ACTIVE, dc.SHADOW):
+            d = dc.decide(no_neck, view_engine=mode)
+            self.assertEqual((d.result, d.reject, d.shadow), (dc.GOOD, False, [dc.VIEW_NOT_ROLLED]), mode)
+        self.assertEqual(dc.decide(no_neck, view_engine=dc.OFF).shadow, [])
+        self.assertEqual(dc.decide(frames(*GOOD3_NECK)).shadow, [])
+
+    def test_one_defect_frame_does_not_block_good(self):
+        self.assertFalse(dc.VOTING_DEFAULTS["single_defect_blocks_good"])
+        d = dc.decide(frames(*GOOD3_NECK, ("BROWN", 0.9)))
+        self.assertEqual((d.result, d.reject), (dc.GOOD, False))
+        d = dc.decide(frames(*GOOD3_NECK, ("BROWN", 0.9), ("BROWN", 0.9)))
+        self.assertEqual(d.result, "BROWN")                     # two frames are still a defect
 
 
 if __name__ == "__main__":
