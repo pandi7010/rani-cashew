@@ -12,12 +12,34 @@ from statistics import median
 
 WW, SW = "WW", "SW"
 METRICS = {"b": "b* (yellow)", "a": "a* (red)", "L": "L* (lightness)"}
-COLOUR_DEFAULTS = {"metric": "b", "threshold": None, "sw_above": True}
+COLOUR_DEFAULTS = {"metric": "b", "threshold": None, "sw_above": True, "enabled": False}     # enabled = COLOUR SPLIT switch
 SIZES = ("180", "210", "240", "320", "450")
 WW_GRADES = tuple(f"W{s}" for s in SIZES)
 SW_GRADES = tuple(f"SW{s}" for s in SIZES)
-BUDDS = "BUDDS"
-ALL_GRADES = WW_GRADES + SW_GRADES + (BUDDS,)
+BUDDS, SW_BUDDS = "BUDDS", "SW_BUDDS"
+ALL_GRADES = WW_GRADES + (BUDDS,) + SW_GRADES + (SW_BUDDS,)
+# Start values (owner, 2026-10-10, from the old length table), length in mm: min <= length < max; None = no limit.
+START_LENGTHS = {"180": (30.0, None), "210": (28.0, 30.0), "240": (26.0, 28.0), "320": (24.5, 26.0), "450": (18.0, 24.5)}
+BUDDS_BELOW = 18.0
+
+
+def default_grades():
+    """The size table before the owner changes it: W and SW grades with the same lengths, BUDDS below 18 mm."""
+    out = {}
+    for prefix in ("W", "SW"):
+        for size, (low, high) in START_LENGTHS.items():
+            out[f"{prefix}{size}"] = {"l_min": low, "l_max": high}
+    out[BUDDS] = {"l_min": None, "l_max": BUDDS_BELOW}
+    out[SW_BUDDS] = {"l_min": None, "l_max": BUDDS_BELOW}
+    return out
+
+
+def grades_or_default(grades):
+    return grades if grades else default_grades()
+
+
+def has_limits(row):
+    return bool(row) and (row.get("l_min") is not None or row.get("l_max") is not None)
 LIMIT_KEYS = ("l_min", "l_max", "w_min", "w_max", "a_min", "a_max")
 OUT_OF_RANGE, NOT_TAUGHT, COLOUR_NOT_TAUGHT = "SIZE_OUT_OF_RANGE", "SIZE_NOT_TAUGHT", "COLOUR_NOT_TAUGHT"
 MIN_COLOUR_SAMPLES = 20
@@ -33,8 +55,11 @@ def track_colour(features):
 
 
 def colour_of(values, cfg):
-    """(SW or WW or None, value used). None while no threshold is taught or the cashew has no colour value."""
+    """(SW or WW or None, value used). COLOUR SPLIT off: always WW (all GOOD cashews use the W grades).
+    None while the split is on but no threshold is set or the cashew has no colour value."""
     cfg = {**COLOUR_DEFAULTS, **(cfg or {})}
+    if not cfg.get("enabled"):
+        return WW, (values or {}).get(cfg["metric"])
     if not values or cfg["threshold"] is None:
         return None, (values or {}).get(cfg["metric"])
     value = values[cfg["metric"]]
@@ -74,59 +99,85 @@ def suggest(ww_samples, sw_samples):
 
 # ------------------------------------------------------------------ size
 def grades_of(colour):
-    return SW_GRADES if colour == SW else WW_GRADES
+    """Grade names of a colour, with its BUDDS row."""
+    return SW_GRADES + (SW_BUDDS,) if colour == SW else WW_GRADES + (BUDDS,)
 
 
 def _fits(limits, length, width, area):
-    """True when every taught limit of the grade holds (a missing limit is not checked; length is required)."""
-    if limits.get("l_min") is None or limits.get("l_max") is None:
+    """True when the cashew is inside the grade: min <= value < max for the length; width and area limits
+    (set only by an older TEACH) are checked when present. A missing limit is an open end."""
+    if not has_limits(limits):
         return False
     for value, low, high in ((length, "l_min", "l_max"), (width, "w_min", "w_max"), (area, "a_min", "a_max")):
         if limits.get(low) is not None and value < limits[low]:
             return False
-        if limits.get(high) is not None and value > limits[high]:
+        if limits.get(high) is not None and value >= limits[high]:
             return False
     return True
 
 
-def _distance(limits, length, width, area):
-    """How far from the middle of the grade, in half-widths of its ranges (for cashews that fit two grades)."""
-    total, count = 0.0, 0
-    for value, low, high in ((length, "l_min", "l_max"), (width, "w_min", "w_max"), (area, "a_min", "a_max")):
-        if limits.get(low) is not None and limits.get(high) is not None and limits[high] > limits[low]:
-            total += abs(value - (limits[low] + limits[high]) / 2.0) / ((limits[high] - limits[low]) / 2.0)
-            count += 1
-    return total / max(1, count)
+def _distance(limits, length):
+    """How far the length is from the middle of the grade (for a cashew that fits two overlapping grades)."""
+    low, high = limits.get("l_min"), limits.get("l_max")
+    if low is not None and high is not None:
+        return abs(length - (low + high) / 2.0) / max((high - low) / 2.0, 1e-6)
+    return 1.0                      # an open-ended grade (>= 30 mm, < 18 mm): the closed one wins when both fit
 
 
 def grade_of(colour, length_mm, width_mm, area_mm2, grades):
-    """(grade name or None, reason). Grades of the cashew's colour plus BUDDS; the best fitting one when the
-    taught ranges overlap. reason: "" | SIZE_NOT_TAUGHT (no grade of this colour has limits) | SIZE_OUT_OF_RANGE."""
-    grades = grades or {}
-    names = [n for n in grades_of(colour) + (BUDDS,) if grades.get(n, {}).get("l_min") is not None]
-    if not [n for n in names if n != BUDDS]:
+    """(grade name or None, reason). Grades of the cashew's colour (with its BUDDS row); the best fitting one when
+    ranges overlap. reason: "" | SIZE_NOT_TAUGHT (no grade of this colour has limits) | SIZE_OUT_OF_RANGE."""
+    grades = grades_or_default(grades)
+    names = [n for n in grades_of(colour) if has_limits(grades.get(n))]
+    if not [n for n in names if n not in (BUDDS, SW_BUDDS)]:
         return None, NOT_TAUGHT
+    if not length_mm or length_mm <= 0:
+        return None, OUT_OF_RANGE
     fitting = [n for n in names if _fits(grades[n], length_mm, width_mm, area_mm2)]
     if not fitting:
         return None, OUT_OF_RANGE
-    return min(fitting, key=lambda n: _distance(grades[n], length_mm, width_mm, area_mm2)), ""
+    return min(fitting, key=lambda n: _distance(grades[n], length_mm)), ""
 
 
 def mapping_name(colour, grade):
-    """Name in the ejector mapping: W240, SW210, BUDDS for WW and SW_BUDDS for SW."""
-    return "SW_BUDDS" if (grade == BUDDS and colour == SW) else grade
+    """Name in the ejector mapping (the grade names are the mapping names: W240, SW210, BUDDS, SW_BUDDS)."""
+    return grade
 
 
 def copy_w_to_sw(grades):
-    """New grades dict in which every SW grade has the limits of its W grade (taught note says so)."""
-    out = {name: dict(row) for name, row in (grades or {}).items()}
+    """New grades dict in which every SW grade (and SW_BUDDS) has the limits of its W grade."""
+    out = {name: dict(row) for name, row in grades_or_default(grades).items()}
     copied = []
-    for size in SIZES:
-        source = out.get(f"W{size}")
-        if source and source.get("l_min") is not None:
-            out[f"SW{size}"] = {**{k: source[k] for k in LIMIT_KEYS if k in source}, "taught": f"copied from W{size}"}
-            copied.append(f"SW{size}")
+    for source_name, target in [(f"W{size}", f"SW{size}") for size in SIZES] + [(BUDDS, SW_BUDDS)]:
+        source = out.get(source_name)
+        if has_limits(source):
+            out[target] = {**{k: source.get(k) for k in LIMIT_KEYS if k in source}, "taught": f"copied from {source_name}"}
+            copied.append(target)
     return out, copied
+
+
+def text_of(row):
+    """Short text of a grade's length range: ">= 30", "28 - 30", "< 18", "-"."""
+    low, high = (row or {}).get("l_min"), (row or {}).get("l_max")
+    if low is None and high is None:
+        return "-"
+    if high is None:
+        return f">= {low:g}"
+    if low is None:
+        return f"< {high:g}"
+    return f"{low:g} - {high:g}"
+
+
+def changes(old, new, prefix=""):
+    """["key: old -> new", ...] for two (nested) settings dicts; only what differs."""
+    out = []
+    for key in sorted(set(old or {}) | set(new or {}), key=str):
+        a, b = (old or {}).get(key), (new or {}).get(key)
+        if isinstance(a, dict) or isinstance(b, dict):
+            out += changes(a if isinstance(a, dict) else {}, b if isinstance(b, dict) else {}, f"{prefix}{key}.")
+        elif a != b:
+            out.append(f"{prefix}{key}: {'-' if a is None else a} -> {'-' if b is None else b}")
+    return out
 
 
 def would_be(colour, grade, reason):

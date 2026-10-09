@@ -92,6 +92,32 @@ class Decision:
     shadow: List[str] = field(default_factory=list)             # "would reject" notes of engines in SHADOW
 
 
+ALWAYS_PASS = ("GOOD_CASHEW", "GOOD")
+ALWAYS_FIRE = (REJECTION, DOUBLE_CLASS, DOUBLE, UNDEFINED)      # plus the reject classes of the settings (EDGECUT ...)
+
+
+def can_change_pass(name, reject_classes=()) -> str:
+    """"" when the PASS / FIRE chip of this class may be changed, otherwise the reason why not."""
+    key = normalize_name(name)
+    if key in {normalize_name(n) for n in ALWAYS_PASS}:
+        return f"{name} is always PASS."
+    if key in {normalize_name(n) for n in tuple(ALWAYS_FIRE) + tuple(reject_classes or ())}:
+        return f"{name} always goes to the reject ejector and cannot be set to PASS."
+    return ""
+
+
+def passed_class(votes, good_classes) -> str:
+    """For a cashew decided GOOD: the PASS class it was really seen as (e.g. "TESTA SMALL"), or "" when that is
+    GOOD_CASHEW itself. votes = {class: frames}; the PASS class with the most frames."""
+    always = {normalize_name(n) for n in ALWAYS_PASS}
+    good = {normalize_name(c) for c in (good_classes or ())}
+    counted = {name: n for name, n in (votes or {}).items() if normalize_name(name) in good}
+    if not counted:
+        return ""
+    top = max(counted, key=lambda name: (counted[name], normalize_name(name) in always))
+    return "" if normalize_name(top) in always else str(top)
+
+
 def _blank(name) -> bool:
     return normalize_name(name) in ("", "none", "-", "any")
 
@@ -105,6 +131,8 @@ def decide(votes: List[FrameVote], voting: Optional[dict] = None, priority: Opti
     priority = [normalize_name(c) for c in (priority if priority is not None else PRIORITY_DEFAULT)]
     display = {normalize_name(c): c for c in (PRIORITY_DEFAULT + GOOD_CLASSES_DEFAULT)}
     good_set = {normalize_name(c) for c in (good_classes if good_classes is not None else GOOD_CLASSES_DEFAULT)}
+    # REJECTION, DOUBLE and the reject classes can never count as "no defect", whatever the PASS list says.
+    good_set -= {normalize_name(c) for c in tuple(ALWAYS_FIRE) + tuple(reject_classes if reject_classes is not None else REJECT_CLASSES_DEFAULT)}
     skin_set = {normalize_name(c) for c in (skin_classes if skin_classes is not None else SKIN_CLASSES_DEFAULT)}
     rejection, upw = normalize_name(REJECTION), normalize_name(UPW)
 

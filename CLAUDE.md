@@ -51,8 +51,12 @@
   `source/design/`) and `CNN/CNN/app/` (the same project, 11 commits newer). Also
   `/home/phoenix/Documents/RaniVision_Latest`, `v2_snapshot/`. Never modify any of them.
 - px per mm comes from the Vision ROI calibration (`size_config.roi_length_mm`); 10.0 is only a placeholder.
-- Step (c2) is built: `colour_size.py` (SW / WW from a LAB value with a taught threshold in `size_config.colour`; grade from
-  the taught limits in `size_config.grades`). SHADOW until `size_config.size_ready`; that switch is the owner's.
+- Step (c2) is built: `colour_size.py`. Size table = MIN / MAX length per grade in `size_config.grades` (owner's start
+  values in `colour_size.START_LENGTHS`, he tunes them himself); SW / WW threshold in `size_config.colour` with the COLOUR
+  SPLIT switch (`enabled`); `size_config.size_ready` = SIZE GRADES READY. All three switches and the table are the owner's:
+  never change them from code. Changes are logged in `logs/settings_changes.log`.
+- PASS class (Pneumatic chips, `grading.good_classes`) = treated like GOOD -> size grade ejector. REJECTION, DOUBLE,
+  Undefined and the reject classes can never be PASS (`decision.can_change_pass`, also enforced inside `decide`).
 - Tracking rule: one cashew = one ID = one decision = at most one fire. Fragments are MERGED, tiny boxes are NOISE
   (`lane_tracker.py`, `_close_fragment`). `tests/test_tracking_replay.py` must stay green; real runs can be replayed with
   `tools/replay_tracks.py`.

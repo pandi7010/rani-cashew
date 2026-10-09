@@ -4,6 +4,65 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-10 (6): Manual size table, SIZE GRADES READY, COLOUR SPLIT, PASS classes to size sorting
+
+This replaces parts of entry (5): the size table is now MIN / MAX length only, and SIZE GRADES READY no longer needs
+teaching. Where (5) and this entry differ, this one is right.
+
+### What changed
+
+| # | Asked | Now |
+|---|---|---|
+| 1 | Editable size table | Colour Size page: rows W180, W210, W240, W320, W450, BUDDS, SW180 ... SW450, SW_BUDDS with **MIN length mm, MAX length mm, EJECTOR ROI 1 / ROI 2** (read-only, from the ejector mapping; "no fire" for BUDDS). Start values as you gave them: W180 >= 30, W210 28-30, W240 26-28, W320 24.5-26, W450 18-24.5, BUDDS < 18; SW the same. Rule: MIN <= length < MAX, empty = no limit. **COPY WW -> SW**. **SAVE COLOUR & SIZE** asks with the list old -> new. TEACH is still there, optional (sets MIN / MAX of one grade). |
+| 2 | Big switch | **SIZE GRADES READY: ON / OFF** at the top of the size card. ON: GOOD cashews go to their grade ejector from this table (no SIZE_NOT_READY). It works with the start table at once. A red warning stays on the page while px per mm is not calibrated, and the confirmation says so; it is not blocked. |
+| 3 | Calibration | Vision ROI: **ROI 1 real length (mm)** and **ROI 2 real length (mm)**, each shows its px per mm (ROI 2 empty = same as ROI 1). **MEASURE OBJECT**: measures the largest object in each ROI of the picture on screen and shows its length and width in mm (works STOPPED, nothing fires). |
+| 4 | SW / WW | Threshold field + slider, live value of the current cashew, **COLOUR SPLIT: ON / OFF**. OFF (start state): all GOOD cashews use the W grades. Start value in the field: **b\* 23, SW BELOW** - see the note. |
+| 5 | Live view / results | Under every cashew: `24.6 mm  b* 23.1  W320`. RECENT RESULTS: CLASS / RESULT, SW/WW, COLOUR, L mm, GRADE, EJECTOR. Double click: median length and the length of every frame, and per frame L, W, b\*. |
+| 6 | Change log | `logs/settings_changes.log`: every change of the size table, threshold, value, side, shape limits, calibration, SIZE GRADES READY, COLOUR SPLIT and PASS / FIRE, each line `old -> new` with the time. |
+| - | PASS classes | Pneumatic page chips. A class set to PASS (e.g. TESTA SMALL) is treated like GOOD: colour -> size grade -> grade ejector, **not** its own ejector. RECENT RESULTS: `TESTA SMALL (PASS) -> W240 -> A13`. GOOD_CASHEW is always PASS; REJECTION, DOUBLE, Undefined and the reject classes (EDGECUT) can never be PASS. Every chip change asks first, is logged and saved in the program's settings. |
+
+**Note on the b\* start value.** In entry (5) I proposed a method, not a number. The 23 / BELOW comes from your dataset (SW b\* 22.4,
+GOOD 24.8) and separates those images badly, which is why COLOUR SPLIT starts OFF. Set the real value on the machine
+(watch the live b\* of known WW and SW cashews, or use TEACH WW / TEACH SW).
+
+**Found by the new tests and fixed:** if DOUBLE had been written into the PASS list, the decision would have treated a
+double as GOOD. REJECTION, DOUBLE and the reject classes are now ignored in the PASS list by the decision itself.
+
+### Tested (fake PLC, simulated belt, temporary settings)
+
+- `ast` check; **203 unit tests pass** (`tests/test_colour_size.py` start table and boundaries, gaps, changes old -> new;
+  `tests/test_pass_classes.py`: TESTA SMALL as FIRE -> ejector 9 / 29, as PASS -> W240 -> 13 / 33, SW240 -> 18 with the split on,
+  BUDDS size not fired, other defects unchanged, REJECTION / DOUBLE never PASS).
+- Self-test `tools/selftest_pages.py`: calibration of both ROIs and MEASURE OBJECT; SHADOW shows "would be"; table change + COPY +
+  SAVE (6 changes logged); READY on -> every cashew at the ejector of its grade (W240 -> A13, W320 -> A34); COLOUR SPLIT on -> SW
+  grades and SW ejectors (A18, A19, A39); TESTA SMALL as FIRE -> A09 / A29, as PASS -> `TESTA SMALL (PASS) -> W240 -> A13`; 17 log lines.
+  (The test forces the class of the simulated cashews.) Pictures: `design/pages/04_colour_size.png`, `01_home_live.png`, `05_vision_roi.png`, `02_pneumatic.png`.
+
+### Not tested
+
+- The real machine: lengths in mm against real cashews, the b\* of real SW / WW, timing of the grade ejectors A11-A20 / A31-A40
+  (their delays are still the ones calculated for 300 mm/s).
+
+### Exact buttons
+
+**Calibrate (once):** STOP -> **Vision ROI** -> type the real length of the yellow ROI 1 box into **ROI 1 real length** (and ROI 2 if
+it differs) -> **SAVE VISION SETTINGS**. Check: lay an object of known length on the belt -> **MEASURE OBJECT** -> read "ROI 1: xx.x mm long".
+
+**Tune the size table:** **Colour Size** -> edit **MIN length mm / MAX length mm** -> (**COPY WW -> SW** if SW should be the same) ->
+**SAVE COLOUR & SIZE** -> read the old -> new list -> Yes.
+
+**Switch size sorting on:** STOP -> **Colour Size** -> switch **SIZE GRADES READY** -> read the table in the question -> Yes -> **START**.
+Watch RECENT RESULTS: L mm, GRADE, EJECTOR. To go back: STOP -> switch it OFF.
+
+**Colour split:** STOP -> **Colour Size** -> set **Threshold** (and **SW is ABOVE / BELOW**) -> **SAVE COLOUR & SIZE** -> switch
+**COLOUR SPLIT** -> Yes. While OFF, watch the live "CURRENT CASHEW b\*" and the b\* under each cashew to find the value.
+
+**PASS a class:** STOP -> **Pneumatic** -> click the chip of the class (e.g. TESTA SMALL) -> Yes. Click again for FIRE.
+
+The machine must be STOPPED for SAVE and for all three switches.
+
+---
+
 ## 2026-10-10 (5): Step (c2) - SW / WW colour and size grades; machine instructions
 
 ### What works now

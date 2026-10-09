@@ -574,10 +574,11 @@ class SharedState:
             self.recent_decisions[track_id] = detail
             now = time.time()
             self.decision_times.append(now)
-            if label.startswith("GOOD"):
+            accepted = label.startswith("GOOD") or "(PASS) ->" in label
+            if accepted:
                 self.good_times.append(now)
             if track_id[:1] == "R" and track_id[1:2].isdigit():
-                self.last_result[int(track_id[1])] = (now, label.startswith("GOOD"))
+                self.last_result[int(track_id[1])] = (now, accepted)
             while len(self.recent_decisions) > 300:
                 self.recent_decisions.popitem(last=False)
 
@@ -1268,6 +1269,7 @@ class ProcessingThread(threading.Thread):
 
         clean_frame = frame.copy()                      # for inference and saved images (no overlay)
         self._clean_frame = clean_frame
+        self._live_size_cfg = state["size_config"]
         flow, grading = state["flow"], state["grading"]
         lines = {1: state["line_pos"], 2: state.get("line_pos2")}
         self._draw_lines(frame, state, 2)
@@ -1447,7 +1449,7 @@ class ProcessingThread(threading.Thread):
         map_dict = state["mapping_t1"] if rid == 1 else state["mapping_t2"]
 
         engine_mode = {**engines.ENGINE_DEFAULTS, **grading.get("engines", {})}
-        px_per_mm = float(state["size_config"].get("px_per_mm", 10.0)) or 10.0
+        px_per_mm = px_per_mm_of(state["size_config"], rid)
         feats = [f["feat"] for f in trk.frames if f["feat"]]
         first = trk.path[0]
         past_at_first = fg.progress(flow, line, first[1], first[2])
@@ -1498,11 +1500,15 @@ class ProcessingThread(threading.Thread):
             if not colour_taught:           # no threshold yet: what the CNN voted, only to show a "would be"
                 colour = colour_size.SW if sw_votes * 2 > d.good_frames else colour_size.WW
             size_grade, why = colour_size.grade_of(colour, mm_length, mm_width, mm_area, size_cfg.get("grades"))
+            trk.info["grade"] = size_grade
+            # A class the owner set to PASS (e.g. TESTA SMALL) is graded like GOOD; its name is kept for the display.
+            pass_name = decision.passed_class(d.votes, grading.get("good_classes"))
+            good_text = f"{pass_name} (PASS)" if pass_name else "GOOD"
             grade = colour_size.would_be(colour, size_grade, why)
             if not size_cfg.get("size_ready", False):
                 # SHADOW: colour and size are measured and logged ("would be SW210"); the cashew goes to the reject ejector.
                 d.reason, d.reject = f"{decision.SIZE_NOT_READY}:{grade}", True
-                relay, label, d.result = REJECT_RELAY[rid], f"UNDEF SIZE_NOT_READY (would be {grade})", decision.UNDEFINED
+                relay, label, d.result = REJECT_RELAY[rid], f"UNDEF SIZE_NOT_READY ({good_text}, would be {grade})", decision.UNDEFINED
             elif not colour_taught:         # no threshold, or no frame of this cashew had a mask to measure the colour in
                 why_colour = colour_size.COLOUR_NOT_TAUGHT if colour_values else "COLOUR_NOT_MEASURED"
                 d.reason, d.reject = why_colour, True
@@ -1513,11 +1519,15 @@ class ProcessingThread(threading.Thread):
                 self.shared_state.count_engine("size")
             else:
                 relay, assigned = relay_mapping.target_of(map_dict, rid, [grade, colour, "GOOD_CASHEW", "GOOD"], state.get("no_fire"))
-                label = f"GOOD {grade}" + (" (no fire)" if relay is None else "")
+                label = (f"{good_text} -> {grade} -> " + ("no fire" if relay is None else f"A{relay:02d}")) if pass_name \
+                    else f"GOOD {grade}" + (" (no fire)" if relay is None else "")
+                if pass_name:
+                    d.reason = f"PASS:{pass_name}"
                 if not assigned:            # a grade without an ejector goes to the reject ejector
                     d.reason, d.reject = f"{decision.NOT_MAPPED}:{grade}", True
                     label, d.result = f"UNDEF no ejector ({grade})", decision.UNDEFINED
         else:
+            colour = None                   # a defect class goes to its own ejector: no SW / WW, no size grade
             relay, assigned = relay_mapping.target_of(map_dict, rid, [d.result])
             label = d.result
             if not assigned:        # a class without an ejector goes to the reject ejector
@@ -1548,15 +1558,20 @@ class ProcessingThread(threading.Thread):
                        "at": round(f["t"], 1), "box": f["box"],
                        "feat": {k: round(v, 3) for k, v in f["feat"].items()} if f["feat"] else None} for f in trk.frames]
         detail = [f"{trk.id}   {label}   relay {relay if relay else '-'}   {fire_result}",
+                  f"length {mm_length:.1f} mm (median of {len(feats)} frames: " + " ".join(f"{x['length_px'] / px_per_mm:.1f}" for x in feats) + ")   "
+                  f"width {mm_width:.1f} mm   colour {'-' if colour_value is None else format(colour_value, '.1f')}   {colour or '-'}   grade {grade or '-'}",
                   f"result {d.result}, reason {d.reason}; frames {d.frames_used} used of {d.frames_total}; "
                   f"GOOD frames {d.good_frames}, NECK frames {d.neck_frames}",
                   f"seen (weighted frames): {d.seen or '-'}", f"views: {d.views or '-'}",
                   f"engines in SHADOW would reject: {', '.join(shadow) or '-'}", ""]
         for r in frame_rows:
-            feat_txt = view_features.short_text(r["feat"]) + f" dark%{r['feat']['dark_pct']:.1f} red%{r['feat']['red_pct']:.1f}" if r["feat"] else "(no mask)"
+            feat_txt = (f"L {r['feat']['length_px'] / px_per_mm:5.1f} mm  W {r['feat']['width_px'] / px_per_mm:4.1f} mm  b* {r['feat']['b']:5.1f}   "
+                        + view_features.short_text(r["feat"]) + f" dark%{r['feat']['dark_pct']:.1f} red%{r['feat']['red_pct']:.1f}") if r["feat"] else "(no mask)"
             detail.append(f"+{r['t']:6.0f} ms  CNN {str(r['cnn']):<12} {r['cnn_conf']:.2f}  YOLO {str(r['yolo']):<12} {r['yolo_conf']:.2f}  "
                           f"{r['view']:<5}{' EDGE' if r['edge_cut'] else ''}  {feat_txt}")
-        shown_class = label.replace("UNDEF SIZE_NOT_READY ", "GOOD ") if d.reason.startswith(decision.SIZE_NOT_READY) else label
+        shown_class = label
+        if d.reason.startswith(decision.SIZE_NOT_READY):        # SHADOW: "GOOD (would be W240)" / "TESTA SMALL (PASS) (would be W240)"
+            shown_class = label.replace("UNDEF SIZE_NOT_READY (", "").rstrip(")").replace(", would be ", " (would be ") + ")"
         self.shared_state.add_decision(trk.id, label, f"{d.frames_used}f", relay or 0, count_keys, "\n".join(detail), row=(
             shown_class, colour or "-", "-" if colour_value is None else f"{colour_value:.1f}", f"{mm_length:.1f}" if mm_length else "-", grade or "-"))
         if len(trk.frames) >= 5:
@@ -1574,7 +1589,7 @@ class ProcessingThread(threading.Thread):
         with self.shared_state.lock:
             self.shared_state.size_samples.append({
                 "id": trk.id, "t": time.time(), "l": mm_length, "w": mm_width, "a": mm_area, "solidity": med("solidity") or 0.0,
-                "double": d.result == decision.DOUBLE or decision.DOUBLE in str(d.reason), "label": label,
+                "double": d.result == decision.DOUBLE or decision.DOUBLE in str(d.reason), "label": label, "shown": shown_class,
                 "lab": colour_values, "colour": colour or "", "colour_value": colour_value, "grade": grade, "relay": relay or 0})
         self.cashew_log.write({
             "id": trk.id, "roi": rid, "frames": d.frames_total, "frames_used": d.frames_used, "result": d.result, "reason": d.reason,
@@ -1678,8 +1693,20 @@ class ProcessingThread(threading.Thread):
         cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 1 if trk.missed else 2)
         text = f"{trk.id} {str(name).upper()[:12]} {conf:.2f} {last.get('view', '')}" + (" (PRED)" if trk.missed else "")
         cv2.putText(frame, text, (x1, max(12, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, colour, 2)
+        line_y = y2 + 24
+        measured = [f["feat"] for f in trk.frames if f.get("feat")]
+        if measured:                        # what this cashew would get now: median length, colour value, grade
+            size_cfg = getattr(self, "_live_size_cfg", None) or {}
+            px_per_mm = px_per_mm_of(size_cfg, trk.roi)
+            length = float(np.median([m["length_px"] for m in measured])) / px_per_mm
+            values = colour_size.track_colour(measured)
+            which, value = colour_size.colour_of(values, size_cfg.get("colour"))
+            size_grade, why = colour_size.grade_of(which or colour_size.WW, length, 0.0, 0.0, size_cfg.get("grades"))
+            cv2.putText(frame, f"{length:.1f} mm  b* {values['b']:.1f}  {colour_size.would_be(which, size_grade, why)}",
+                        (x1, line_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            line_y += 24
         if last.get("feat") and not trk.missed and grading.get("views", {}).get("show_values", True):
-            cv2.putText(frame, view_features.short_text(last["feat"]), (x1, y2 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(frame, view_features.short_text(last["feat"]), (x1, line_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
 
     def _get_size_data(self, length: float, width: float, cfg: dict, track_id: int) -> Tuple[Optional[int], str]:
         prefix = "T1_" if track_id == 1 else "T2_"
@@ -1689,6 +1716,12 @@ class ProcessingThread(threading.Thread):
         elif length < cfg.get("W240_L", 27) and width < cfg.get("W240_W", 16): return cfg.get(f"{prefix}Act_W240", 0), "W240"
         elif length < cfg.get("W210_L", 28) and width < cfg.get("W210_W", 18): return cfg.get(f"{prefix}Act_W210", 0), "W210"
         else: return cfg.get(f"{prefix}Act_W180", 0), "W180"
+
+
+def px_per_mm_of(size_config, rid=1) -> float:
+    """px per mm of a ROI: ROI 2 has its own value when it was calibrated, otherwise the one of ROI 1 (10 = not calibrated)."""
+    value = size_config.get("px_per_mm_2") if rid == 2 else None
+    return float(value or size_config.get("px_per_mm", 10.0) or 10.0)
 
 
 # ---------------- ScrolledFrame (GUI Helper) ----------------
@@ -2345,19 +2378,37 @@ class App(tk.Tk):
         log.info("Inspection engine %s -> %s", name, mode)
 
     def _toggle_class_pass(self, name):
-        """A class chip was clicked: PASS (a "no defect" class) <-> FIRE (a defect class)."""
-        g = copy.deepcopy(self.shared_state.grading)
+        """A class chip was clicked. PASS: a cashew decided as this class is treated like GOOD (SW / WW -> size grade ->
+        grade ejector, not the class's own ejector). FIRE: the class goes to its own ejector."""
+        ss = self.shared_state
+        g = copy.deepcopy(ss.grading)
+        blocked = decision.can_change_pass(name, g.get("reject_classes"))
+        if blocked:
+            messagebox.showinfo("PASS / FIRE", blocked)
+            return
+        if ss.phase == "RUNNING":
+            messagebox.showwarning("Stop first", "Stop the machine before changing PASS / FIRE of a class.")
+            return
         good = [c for c in g.get("good_classes", [])]
-        if any(normalize_name(c) == normalize_name(name) for c in good):
+        is_pass = any(normalize_name(c) == normalize_name(name) for c in good)
+        relay = ss.mapping_t1.get(normalize_name(name))
+        own = f"its own ejector A{relay:02d} / A{relay + 20:02d}" if relay else "the reject ejector (it has no ejector in the mapping)"
+        if is_pass:
+            question = (f"Set {name} to FIRE?\n\nA cashew decided as {name} then goes to {own}.")
+        else:
+            question = (f"Set {name} to PASS?\n\nA cashew decided as {name} is then treated like GOOD: colour SW / WW -> size grade -> the ejector of "
+                        f"that grade. It no longer goes to {own}.")
+        if not messagebox.askyesno("PASS / FIRE", question, icon="warning"):
+            return
+        if is_pass:
             good = [c for c in good if normalize_name(c) != normalize_name(name)]
             if not any(normalize_name(c) == normalize_name(name) for c in g.get("priority", []) + g.get("reject_classes", [])):
                 g["priority"] = list(g.get("priority", [])) + [name]
         else:
-            if not messagebox.askyesno("PASS", f"Set {name} to PASS?\n\nA cashew of this class then counts as \"no defect\" and is graded as GOOD."):
-                return
             good.append(name)
         g["good_classes"] = good
-        self.shared_state.set_grading(g)
+        ss.set_grading(g)                           # saved in the settings file of the program
+        self._log_settings("PASS / FIRE", [f"{name}: {'PASS' if is_pass else 'FIRE'} -> {'FIRE' if is_pass else 'PASS'}"])
         self._refresh_pneumatic(force=True)
 
     def _refresh_pneumatic(self, force=False):
@@ -4530,19 +4581,29 @@ except Exception as e:
         self.shared_state._notify_line()
 
         # ── Calibration: ROI length in mm -> px per mm ──
-        cal = card("CALIBRATION", "used for mm sizes, the double rule, belt speed and valve timing")
-        row = line(cal)
-        text(row, "ROI 1 length", size=ui.F_BODY).pack(side=tk.LEFT)
-        length = self.shared_state.size_config.get("roi_length_mm")
-        self.roi_length_var = tk.StringVar(value="" if not length else f"{float(length):g}")
-        entry(row, self.roi_length_var, 7).pack(side=tk.LEFT, padx=10, ipady=5)
-        text(row, "mm", colour=ui.MUTED).pack(side=tk.LEFT)
-        self.lbl_px_per_mm = text(row, "", bold=True, colour=ui.ACCENT, size=ui.F_HEAD)
-        self.lbl_px_per_mm.pack(side=tk.RIGHT)
-        self.lbl_roi_px = text(row, "", colour=ui.MUTED)
-        self.lbl_roi_px.pack(side=tk.RIGHT, padx=14)
+        cal = card("CALIBRATION", "px per mm: used for mm sizes, the size grades, the double rule and speeds")
+        self.roi_length_vars, self.lbl_px_per_mm_roi, self.lbl_roi_px_roi = {}, {}, {}
+        for number, key in ((1, "roi_length_mm"), (2, "roi2_length_mm")):
+            row = line(cal)
+            text(row, f"ROI {number} real length", size=ui.F_BODY, width=16, anchor="w").pack(side=tk.LEFT)
+            length = self.shared_state.size_config.get(key)
+            var = tk.StringVar(value="" if not length else f"{float(length):g}")
+            self.roi_length_vars[number] = var
+            entry(row, var, 7).pack(side=tk.LEFT, padx=10, ipady=5)
+            text(row, "mm", colour=ui.MUTED).pack(side=tk.LEFT)
+            self.lbl_px_per_mm_roi[number] = text(row, "", bold=True, colour=ui.ACCENT, size=ui.F_BODY)
+            self.lbl_px_per_mm_roi[number].pack(side=tk.RIGHT)
+            self.lbl_roi_px_roi[number] = text(row, "", colour=ui.MUTED)
+            self.lbl_roi_px_roi[number].pack(side=tk.RIGHT, padx=14)
+            var.trace_add("write", lambda *_: self._refresh_calibration())
+        self.roi_length_var = self.roi_length_vars[1]
+        self.lbl_px_per_mm, self.lbl_roi_px = self.lbl_px_per_mm_roi[1], self.lbl_roi_px_roi[1]
         self.lbl_calibration = note(cal, "")
-        self.roi_length_var.trace_add("write", lambda *_: self._refresh_calibration())
+        check = line(cal, pady=(8, 0))
+        ui.FlatButton(check, "MEASURE OBJECT", self._measure_object, height=32, width=170).pack(side=tk.LEFT)
+        self.lbl_measure = text(check, "quick check: lay an object of known length on the belt (machine STOPPED), press the button",
+                                colour=ui.MUTED, size=-12, justify="left", anchor="w", wraplength=400)
+        self.lbl_measure.pack(side=tk.LEFT, padx=12)
 
         # ── Image sensor ──
         sensor = card("IMAGE SENSOR", "camera exposure and gain, software colour gain")
@@ -4687,20 +4748,20 @@ except Exception as e:
                       font=(F, ui.F_BODY, "bold")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 6))
         self._refresh_calibration()
 
-    def _roi_length_px(self):
-        """Length of ROI 1 along the direction the cashews move, in pixels of the full image (0 when not drawn)."""
-        roi = self.shared_state.roi1
+    def _roi_length_px(self, number=1):
+        """Length of a ROI along the direction the cashews move, in pixels of the full image (0 when not drawn)."""
+        roi = self.shared_state.roi1 if number == 1 else self.shared_state.roi2
         if not roi:
             return 0
         return abs(roi[2] - roi[0]) if self.shared_state.line_is_vertical else abs(roi[3] - roi[1])
 
-    def _calibration_from_ui(self):
-        """(ROI length mm, px per mm) from the field, or (None, None) when it is empty or not a number above 0."""
+    def _calibration_from_ui(self, number=1):
+        """(ROI length mm, px per mm) from the field of that ROI, or (None, None) when it is empty or not a number above 0."""
         try:
-            mm = float(self.roi_length_var.get().strip().replace(",", "."))
+            mm = float(self.roi_length_vars[number].get().strip().replace(",", "."))
         except ValueError:
             return None, None
-        px = self._roi_length_px()
+        px = self._roi_length_px(number)
         return (mm, px / mm) if mm > 0 and px > 0 else (None, None)
 
     def _refresh_calibration(self):
@@ -4711,36 +4772,78 @@ except Exception as e:
             shown = f"x {roi[0]} - {roi[2]}    y {roi[1]} - {roi[3]}" if roi else "not drawn"
             if self.lbl_roi_coords[number].cget("text") != shown:
                 self.lbl_roi_coords[number].config(text=shown)
-        px = self._roi_length_px()
-        mm, px_mm = self._calibration_from_ui()
+            px = self._roi_length_px(number)
+            _, px_mm = self._calibration_from_ui(number)
+            self.lbl_roi_px_roi[number].config(text=f"{px} px" if px else "not drawn")
+            if px_mm:
+                self.lbl_px_per_mm_roi[number].config(text=f"{px_mm:.2f} px per mm", fg=ui.ACCENT)
+            else:
+                self.lbl_px_per_mm_roi[number].config(text="- px per mm" if number == 1 else "as ROI 1", fg=ui.WARN if number == 1 else ui.MUTED)
+        mm, px_mm = self._calibration_from_ui(1)
         saved = float(ss.size_config.get("px_per_mm", 0) or 0)
         calibrated = bool(ss.size_config.get("roi_length_mm"))
-        self.lbl_roi_px.config(text=f"{px} px in the image" if px else "ROI 1 is not drawn")
-        self.lbl_px_per_mm.config(text=f"{px_mm:.2f} px per mm" if px_mm else "- px per mm", fg=ui.ACCENT if px_mm else ui.WARN)
         if not calibrated:
-            state, colour = (f"NOT CALIBRATED: the program is using {saved:g} px per mm, which is only a placeholder. Sizes in mm, the double rule "
-                             "and speeds are wrong until this is set."), ui.WARN
+            state, colour = (f"NOT CALIBRATED: the program is using {saved:g} px per mm, which is only a placeholder. Lengths in mm and the size "
+                             "grades are wrong until this is set."), ui.WARN
         elif px_mm and abs(px_mm - saved) > 0.005:
             state, colour = f"In use now: {saved:.2f} px per mm. The new value is used after SAVE VISION SETTINGS.", ui.WARN
         else:
-            state, colour = f"In use: {saved:.2f} px per mm.", ui.MUTED
-        self.lbl_calibration.config(text="Measure the real length of ROI 1 on the roller, along the direction the cashews move, with a ruler and enter it. "
-                                         + state, fg=colour)
+            state, colour = f"In use: ROI 1 {saved:.2f}, ROI 2 {px_per_mm_of(ss.size_config, 2):.2f} px per mm.", ui.MUTED
+        self.lbl_calibration.config(text="Measure with a ruler on the rollers how long each ROI box really is, along the direction the cashews move. "
+                                         "ROI 2 empty = the same px per mm as ROI 1. " + state, fg=colour)
+
+    def _measure_object(self):
+        """Quick check of the calibration: the largest object (not belt-blue) in each ROI of the picture now on screen,
+        with its length in pixels and in mm. Works while STOPPED; nothing is fired."""
+        with self.shared_state.lock:
+            frame = None if self.shared_state.frame is None else self.shared_state.frame.copy()
+            seg_params = dict(self.shared_state.grading["segmentation"])
+            rois = {1: self.shared_state.roi1, 2: self.shared_state.roi2}
+            size_config = dict(self.shared_state.size_config)
+        if frame is None:
+            self.lbl_measure.config(text="No camera picture yet.", fg=ui.WARN)
+            return None
+        results = {}
+        for number, roi in rois.items():
+            if not roi:
+                continue
+            seg = segmentation.segment(frame[roi[1]:roi[3], roi[0]:roi[2]], seg_params)
+            if seg is None:
+                results[number] = None
+                continue
+            (_, _), (w, h), _ = cv2.minAreaRect(seg.contour)
+            px = float(max(w, h))
+            typed = self._calibration_from_ui(number)[1] or (self._calibration_from_ui(1)[1] if number == 2 else None)
+            results[number] = (px, px / (typed or px_per_mm_of(size_config, number)), min(w, h) / (typed or px_per_mm_of(size_config, number)))
+        parts = [f"ROI {n}: " + ("nothing found" if r is None else f"{r[1]:.1f} mm long, {r[2]:.1f} mm wide ({r[0]:.0f} px)") for n, r in sorted(results.items())]
+        calibrated = bool(self._calibration_from_ui(1)[1] or size_config.get("roi_length_mm"))
+        self.lbl_measure.config(text="   ".join(parts) + ("" if calibrated else "   (NOT CALIBRATED: 10 px per mm)") + f"   {datetime.now():%H:%M:%S}",
+                                fg=ui.TEXT if calibrated else ui.WARN)
+        return results
 
     def _save_vision_settings(self):
         """SAVE VISION SETTINGS: calibration, colour gain and the camera settings; ROIs and line are saved with them."""
         if self.shared_state.phase == "RUNNING":
             messagebox.showwarning("Stop first", "Stop the machine before saving the vision settings.")
             return
-        mm, px_mm = self._calibration_from_ui()
-        typed = self.roi_length_var.get().strip()
-        if typed and px_mm is None:
-            messagebox.showerror("Calibration", "ROI length must be a number above 0 in mm, and ROI 1 must be drawn.")
-            return
+        mm, px_mm = self._calibration_from_ui(1)
+        mm2, px_mm2 = self._calibration_from_ui(2)
+        for number, value in ((1, px_mm), (2, px_mm2)):
+            if self.roi_length_vars[number].get().strip() and value is None:
+                messagebox.showerror("Calibration", f"ROI {number} length must be a number above 0 in mm, and ROI {number} must be drawn.")
+                return
+        old = {k: self.shared_state.size_config.get(k) for k in ("roi_length_mm", "px_per_mm", "roi2_length_mm", "px_per_mm_2")}
         with self.shared_state.lock:
+            size_config = self.shared_state.size_config
             if px_mm:
-                self.shared_state.size_config["roi_length_mm"] = mm
-                self.shared_state.size_config["px_per_mm"] = round(px_mm, 4)
+                size_config["roi_length_mm"], size_config["px_per_mm"] = mm, round(px_mm, 4)
+            if px_mm2:
+                size_config["roi2_length_mm"], size_config["px_per_mm_2"] = mm2, round(px_mm2, 4)
+            elif not self.roi_length_vars[2].get().strip():
+                size_config.pop("roi2_length_mm", None)
+                size_config.pop("px_per_mm_2", None)
+            new = {k: size_config.get(k) for k in old}
+        self._log_settings("CALIBRATION", colour_size.changes(old, new))
         if px_mm and hasattr(self, "sz_vars") and "px_per_mm" in self.sz_vars:
             self.sz_vars["px_per_mm"].set(f"{px_mm:.4f}")
         self._on_cam_setting_change()               # colour gain, and writes the config file
@@ -5946,16 +6049,23 @@ except Exception as e:
         colour_cfg = {**colour_size.COLOUR_DEFAULTS, **ss.size_config.get("colour", {})}
         self._metric_names = {"b": "b*  YELLOW", "a": "a*  RED", "L": "L*  LIGHT"}
         row = row_of(left)
+        self.cs_split_switch = ui.ToggleSwitch(row, ui.PANEL, bool(colour_cfg.get("enabled")), self._set_colour_split)
+        self.cs_split_switch.pack(side=tk.LEFT)
+        self.lbl_cs_split = text(row, "", bold=True, size=ui.F_BODY)
+        self.lbl_cs_split.pack(side=tk.LEFT, padx=12)
+        row = row_of(left)
         text(row, "Value", size=ui.F_BODY, width=11, anchor="w").pack(side=tk.LEFT)
         self.cs_metric = ui.Segmented(row, list(self._metric_names.values()), self._metric_names[colour_cfg["metric"]], self._cs_set_metric)
         self.cs_metric.pack(side=tk.LEFT)
         text(row, "SW is", size=ui.F_BODY).pack(side=tk.LEFT, padx=(24, 8))
+        if colour_cfg["threshold"] is None:
+            colour_cfg["sw_above"] = self.DEFAULT_SW_ABOVE
         self.cs_side = ui.Segmented(row, ("ABOVE", "BELOW"), "ABOVE" if colour_cfg["sw_above"] else "BELOW", lambda v: (self.cs_side.set(v), changed(), self._refresh_colour_size(force=True)))
         self.cs_side.pack(side=tk.LEFT)
         text(row, "the threshold", colour=ui.MUTED).pack(side=tk.LEFT, padx=8)
         row = row_of(left)
         text(row, "Threshold", size=ui.F_BODY, width=11, anchor="w").pack(side=tk.LEFT)
-        self.cs_threshold_var = tk.StringVar(value="" if colour_cfg["threshold"] is None else f"{float(colour_cfg['threshold']):g}")
+        self.cs_threshold_var = tk.StringVar(value=f"{self.DEFAULT_B_THRESHOLD:g}" if colour_cfg["threshold"] is None else f"{float(colour_cfg['threshold']):g}")
         self.cs_threshold_state = text(row, "", bold=True, colour=ui.WARN)
         self.cs_threshold_state.pack(side=tk.RIGHT)
         entry(row, self.cs_threshold_var, 7).pack(side=tk.RIGHT, padx=8, ipady=5)
@@ -5999,47 +6109,57 @@ except Exception as e:
 
         # ───────────────────────────── right: size ─────────────────────────────
         right = card(body, "SIZE GRADES", "length, width, area in mm from the contour, median over the frames", side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ready = row_of(right, pady=0)
-        self.cs_ready_switch = ui.ToggleSwitch(ready, ui.PANEL, bool(ss.size_config.get("size_ready", False)), self._set_size_ready)
-        self.cs_ready_switch.pack(side=tk.LEFT)
-        self.lbl_cs_ready = text(ready, "", bold=True)
-        self.lbl_cs_ready.pack(side=tk.LEFT, padx=12)
-        self.lbl_cs_calibration = text(ready, "", colour=ui.MUTED)
-        self.lbl_cs_calibration.pack(side=tk.RIGHT)
+        ready = tk.Frame(right, bg=ui.FIELD, highlightthickness=1, highlightbackground=ui.BORDER)
+        ready.pack(fill=tk.X, padx=16, pady=(0, 4))
+        self.cs_ready_switch = ui.ToggleSwitch(ready, ui.FIELD, bool(ss.size_config.get("size_ready", False)), self._set_size_ready)
+        self.cs_ready_switch.pack(side=tk.LEFT, padx=12, pady=10)
+        self.lbl_cs_ready = tk.Label(ready, text="", font=(F, ui.F_HEAD, "bold"), fg=ui.WARN, bg=ui.FIELD)
+        self.lbl_cs_ready.pack(side=tk.LEFT, padx=4)
+        self.lbl_cs_ready_note = text(right, "", colour=ui.MUTED, size=-12, anchor="w", justify="left", wraplength=780)
+        self.lbl_cs_ready_note.pack(fill=tk.X, padx=16)
+        self.lbl_cs_calibration = text(right, "", bold=True, colour=ui.MUTED, anchor="w", justify="left", wraplength=780)
+        self.lbl_cs_calibration.pack(fill=tk.X, padx=16, pady=(2, 0))
 
         # The table is built from plain rows (pack), every cell with a fixed width: no grid spans or weights.
-        widths = (8, 7, 7, 7, 7, 7, 7)
         table = tk.Frame(right, bg=ui.PANEL)
         table.pack(fill=tk.X, padx=16, pady=(8, 0))
         header = tk.Frame(table, bg=ui.PANEL)
         header.pack(fill=tk.X)
-        for title, width in zip(("GRADE", "L min", "L max", "W min", "W max", "AREA min", "AREA max"), widths):
-            text(header, title, bold=True, colour=ui.MUTED, size=-11, width=width + 1, anchor="w").pack(side=tk.LEFT)
-        text(header, "TAUGHT", bold=True, colour=ui.MUTED, size=-11, anchor="w").pack(side=tk.LEFT, padx=6)
-        self.cs_grade_taught, self.cs_teach_buttons = {}, {}
-        grades = ss.size_config.get("grades", {})
-        for grade in colour_size.WW_GRADES + (colour_size.BUDDS,) + colour_size.SW_GRADES:
+        for title, width in (("GRADE", 10), ("MIN length mm", 14), ("MAX length mm", 14), ("EJECTOR  ROI 1 / ROI 2", 24)):
+            text(header, title, bold=True, colour=ui.MUTED, size=-11, width=width, anchor="w").pack(side=tk.LEFT)
+        text(header, "TAUGHT", bold=True, colour=ui.MUTED, size=-11, anchor="w").pack(side=tk.LEFT)
+        self.cs_grade_taught, self.cs_teach_buttons, self.cs_grade_ejector = {}, {}, {}
+        grades = colour_size.grades_or_default(ss.size_config.get("grades"))
+        for grade in colour_size.ALL_GRADES:
             if grade == colour_size.SW_GRADES[0]:
                 gap = tk.Frame(table, bg=ui.PANEL)
                 gap.pack(fill=tk.X, pady=(6, 2))
                 text(gap, "SW grades", bold=True, colour=ui.MUTED, size=-11).pack(side=tk.LEFT)
-                ui.FlatButton(gap, "COPY W LIMITS TO SW", self._copy_w_to_sw, kind="muted", height=24, width=190, font=(F, -11, "bold")).pack(side=tk.LEFT, padx=12)
+                ui.FlatButton(gap, "COPY WW -> SW", self._copy_w_to_sw, kind="muted", height=24, width=150, font=(F, -11, "bold")).pack(side=tk.LEFT, padx=12)
+                self.lbl_cs_sw_note = text(gap, "", colour=ui.MUTED, size=-11)
+                self.lbl_cs_sw_note.pack(side=tk.LEFT)
             line = tk.Frame(table, bg=ui.PANEL)
             line.pack(fill=tk.X, pady=1)
-            text(line, grade, bold=True, size=ui.F_BODY, width=7, anchor="w").pack(side=tk.LEFT)
-            for key in colour_size.LIMIT_KEYS:
+            text(line, grade, bold=True, size=ui.F_BODY, width=9, anchor="w").pack(side=tk.LEFT)
+            for key in ("l_min", "l_max"):
                 value = grades.get(grade, {}).get(key)
                 var = tk.StringVar(value="" if value is None else f"{value:g}")
                 self.cs_vars[("grade", grade, key)] = var
-                entry(line, var, 6).pack(side=tk.LEFT, padx=(0, 6), ipady=3)
+                cell = tk.Frame(line, bg=ui.PANEL, width=112, height=28)
+                cell.pack(side=tk.LEFT)
+                cell.pack_propagate(False)
+                entry(cell, var, 8).pack(side=tk.LEFT, ipady=3)
                 var.trace_add("write", changed)
-            button = ui.FlatButton(line, "TEACH", lambda g=grade: self._size_teach_toggle(g), height=26, width=72)
+            self.cs_grade_ejector[grade] = text(line, "", bold=True, colour=ui.ACCENT, width=22, anchor="w")
+            self.cs_grade_ejector[grade].pack(side=tk.LEFT)
+            button = ui.FlatButton(line, "TEACH", lambda g=grade: self._size_teach_toggle(g), kind="muted", height=26, width=72)
             button.pack(side=tk.RIGHT)
             self.cs_teach_buttons[grade] = button
             self.cs_grade_taught[grade] = text(line, "", colour=ui.MUTED, anchor="w")
             self.cs_grade_taught[grade].pack(side=tk.LEFT, padx=6)
-        text(right, "BUDDS: one row for both colours (no fire: end of belt). A cashew outside every grade of its colour goes to the reject ejector.",
-             colour=ui.MUTED, size=-11, anchor="w").pack(fill=tk.X, padx=16, pady=(4, 0))
+        text(right, "A grade holds a cashew when MIN <= length < MAX (empty = no limit). Outside every grade of its colour: reject ejector. "
+                    "The ejector comes from the ejector mapping (Pneumatic page). TEACH is optional.",
+             colour=ui.MUTED, size=-11, anchor="w", justify="left", wraplength=780).pack(fill=tk.X, padx=16, pady=(4, 0))
 
         teach = row_of(right, pady=(8, 0))
         self.lbl_cs_teach = text(teach, "TEACH FROM CAMERA", bold=True, colour=ui.MUTED)
@@ -6061,7 +6181,7 @@ except Exception as e:
         self.btn_cs_apply = ui.FlatButton(apply_row, "APPLY", self._size_teach_apply, kind="primary", height=30, width=170)
         self.btn_cs_apply.pack(side=tk.LEFT)
         self.btn_cs_apply.set_enabled(False)
-        text(apply_row, f"Run only cashews of that grade. At least {size_teach.MIN_SAMPLES} cashews. Yellow lines = the min / max that will be set.",
+        text(apply_row, f"Optional. Run only cashews of that grade, at least {size_teach.MIN_SAMPLES}. APPLY sets MIN / MAX length from the yellow lines.",
              colour=ui.MUTED, size=-11).pack(side=tk.LEFT, padx=12)
 
         rule(right)
@@ -6083,6 +6203,19 @@ except Exception as e:
         self._refresh_colour_size(force=True)
 
     # ── colour: metric, threshold, teach ──
+    def _log_settings(self, what, lines):
+        """Every change of the size table, the colour threshold or the switches: old -> new, in logs/settings_changes.log."""
+        if not lines:
+            return
+        try:
+            os.makedirs(str(app_paths.LOGS_DIR), exist_ok=True)
+            with open(os.path.join(str(app_paths.LOGS_DIR), "settings_changes.log"), "a", encoding="utf-8") as f:
+                for line in lines:
+                    f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {what}  {line}\n")
+        except OSError:
+            log.exception("Could not write settings_changes.log")
+        log.info("%s: %s", what, "; ".join(lines))
+
     def _cs_metric(self):
         return next(k for k, v in self._metric_names.items() if v == self.cs_metric.value)
 
@@ -6091,13 +6224,53 @@ except Exception as e:
         self._cs_changed()
         self._refresh_colour_size(force=True)
 
+    # Shown in the threshold field while nothing is saved. From the owner's own dataset (65 SW, 400 GOOD images):
+    # b* of SW 22.4 +/- 2.9, of GOOD 24.8 +/- 9.8 -> the point between them is 23, SW below. A weak start value.
+    DEFAULT_B_THRESHOLD, DEFAULT_SW_ABOVE = 23.0, False
+
     def _cs_colour_cfg(self):
         """Colour settings as shown on the page (threshold None while the field is empty or not a number)."""
         try:
             threshold = float(self.cs_threshold_var.get().strip().replace(",", "."))
         except ValueError:
             threshold = None
-        return {"metric": self._cs_metric(), "threshold": threshold, "sw_above": self.cs_side.value == "ABOVE"}
+        return {"metric": self._cs_metric(), "threshold": threshold, "sw_above": self.cs_side.value == "ABOVE",
+                "enabled": bool(self.shared_state.size_config.get("colour", {}).get("enabled", False))}
+
+    def _cs_grades_from_fields(self):
+        """{grade: {"l_min", "l_max"}} as typed (ValueError when a field is not a number)."""
+        out = {}
+        for grade in colour_size.ALL_GRADES:
+            row = {}
+            for key in ("l_min", "l_max"):
+                typed = self.cs_vars[("grade", grade, key)].get().strip().replace(",", ".")
+                row[key] = float(typed) if typed else None
+            out[grade] = row
+        return out
+
+    def _set_colour_split(self, on):
+        """COLOUR SPLIT: off = every GOOD cashew uses the WW (W) grades; on = SW / WW by the threshold."""
+        ss = self.shared_state
+        saved = {**colour_size.COLOUR_DEFAULTS, **ss.size_config.get("colour", {})}
+        if ss.phase == "RUNNING":
+            messagebox.showwarning("Stop first", "Stop the machine before switching the colour split.")
+            self.cs_split_switch.set(saved["enabled"])
+            return
+        if on and saved.get("threshold") is None:
+            messagebox.showwarning("Colour split", "No SW / WW threshold is saved yet.\n\nSet the threshold (type it, or TEACH WW / TEACH SW and "
+                                                   "APPLY SUGGESTION), press SAVE COLOUR & SIZE, then switch COLOUR SPLIT on.")
+            self.cs_split_switch.set(False)
+            return
+        if on and not messagebox.askyesno("Colour split", f"Switch COLOUR SPLIT on?\n\nGOOD cashews with {saved['metric']}* "
+                                          f"{'above' if saved['sw_above'] else 'below'} {saved['threshold']:g} become SW and use the SW grades and SW ejectors.", icon="warning"):
+            self.cs_split_switch.set(False)
+            return
+        with ss.lock:
+            ss.size_config["colour"] = {**saved, "enabled": bool(on)}
+        ss.save_to_config(CFG_PATH)
+        if bool(saved["enabled"]) != bool(on):
+            self._log_settings("COLOUR SPLIT", [f"enabled: {bool(saved['enabled'])} -> {bool(on)}"])
+        self._refresh_colour_size(force=True)
 
     def _colour_teach_toggle(self, colour):
         """TEACH WW / TEACH SW: collect the colour of every cashew measured from now on; a second press stops."""
@@ -6143,37 +6316,38 @@ except Exception as e:
         self._refresh_colour_size(force=True)
 
     def _copy_w_to_sw(self):
-        """COPY W LIMITS TO SW: the fields of SW180 ... SW450 get the values of W180 ... W450 (saved with SAVE)."""
-        copied = []
-        for size in colour_size.SIZES:
-            values = [self.cs_vars[("grade", f"W{size}", key)].get().strip() for key in colour_size.LIMIT_KEYS]
-            if values[0] and values[1]:
-                for key, value in zip(colour_size.LIMIT_KEYS, values):
-                    self.cs_vars[("grade", f"SW{size}", key)].set(value)
-                self._size_taught_pending = getattr(self, "_size_taught_pending", {})
-                self._size_taught_pending[f"SW{size}"] = {"taught": f"copied from W{size}"}
-                copied.append(f"SW{size}")
-        if not copied:
-            messagebox.showinfo("Copy W limits", "No W grade has limits yet. Teach or type the W grades first.")
+        """COPY WW -> SW: the fields of SW180 ... SW450 and SW_BUDDS get the values of W180 ... W450 and BUDDS (saved with SAVE)."""
+        pairs = [(f"W{size}", f"SW{size}") for size in colour_size.SIZES] + [(colour_size.BUDDS, colour_size.SW_BUDDS)]
+        for source, target in pairs:
+            for key in ("l_min", "l_max"):
+                self.cs_vars[("grade", target, key)].set(self.cs_vars[("grade", source, key)].get())
+            self._size_taught_pending = getattr(self, "_size_taught_pending", {})
+            self._size_taught_pending[target] = {"taught": f"copied from {source}"}
         self._refresh_colour_size(force=True)
 
     def _size_ready_blockers(self):
-        """What is still missing before SIZE GRADES READY may be switched on."""
+        """What must be done before SIZE GRADES READY can be switched on (calibration is only a warning)."""
         size_config = self.shared_state.size_config
         missing = []
-        if not size_config.get("roi_length_mm"):
-            missing.append("px per mm is not calibrated (Vision ROI page: ROI 1 length in mm, SAVE VISION SETTINGS)")
-        if size_config.get("colour", {}).get("threshold") is None:
-            missing.append("the SW / WW threshold is not set (TEACH WW, TEACH SW, APPLY SUGGESTION, or type it and SAVE)")
-        grades = size_config.get("grades", {})
-        for colour, names in ((colour_size.WW, colour_size.WW_GRADES), (colour_size.SW, colour_size.SW_GRADES)):
-            if not any(grades.get(n, {}).get("l_min") is not None for n in names):
-                missing.append(f"no {colour} grade has limits (TEACH a grade and SAVE" + ("; or COPY W LIMITS TO SW)" if colour == colour_size.SW else ")"))
+        colour = {**colour_size.COLOUR_DEFAULTS, **size_config.get("colour", {})}
+        if colour["enabled"] and colour["threshold"] is None:
+            missing.append("COLOUR SPLIT is on but no SW / WW threshold is saved")
+        grades = colour_size.grades_or_default(size_config.get("grades"))
+        if not any(colour_size.has_limits(grades.get(n)) for n in colour_size.WW_GRADES):
+            missing.append("no W grade has a MIN or MAX length")
+        if colour["enabled"] and not any(colour_size.has_limits(grades.get(n)) for n in colour_size.SW_GRADES):
+            missing.append("COLOUR SPLIT is on but no SW grade has a MIN or MAX length (COPY WW -> SW, SAVE)")
         return missing
 
     def _set_size_ready(self, on):
-        """SIZE GRADES READY: off = SHADOW (every GOOD cashew goes to the reject ejector, the grade is only logged)."""
+        """SIZE GRADES READY. ON: a GOOD cashew goes to the ejector of its grade from the size table.
+        OFF: SHADOW - the grade is only logged ("would be W240") and GOOD goes to the reject ejector."""
         ss = self.shared_state
+        was = bool(ss.size_config.get("size_ready", False))
+        if ss.phase == "RUNNING":
+            messagebox.showwarning("Stop first", "Stop the machine before switching SIZE GRADES READY.")
+            self.cs_ready_switch.set(was)
+            return
         if on:
             missing = self._size_ready_blockers()
             if missing:
@@ -6184,11 +6358,15 @@ except Exception as e:
                 messagebox.showwarning("Size grades", "There are unsaved changes on this page. Press SAVE COLOUR & SIZE first.")
                 self.cs_ready_switch.set(False)
                 return
-            taught = [n for n in colour_size.ALL_GRADES if ss.size_config.get("grades", {}).get(n, {}).get("l_min") is not None]
-            if not messagebox.askyesno("Size grades", "Switch SIZE GRADES READY on?\n\nGOOD cashews will then be fired by the ejector of their colour "
-                                       "and size grade instead of the reject ejector.\n\nGrades with limits: " + ", ".join(taught) +
-                                       "\nA GOOD cashew outside every grade of its colour goes to the reject ejector.\n\n"
-                                       "Do this only after the \"would be\" grades in RECENT RESULTS were checked with real cashews.", icon="warning"):
+            warning = ""
+            if not ss.size_config.get("roi_length_mm"):
+                warning = ("\n\nWARNING: px per mm is NOT CALIBRATED (the program uses 10 px per mm, a placeholder). The lengths in mm, and so "
+                           "the grades, will be wrong until the ROI length is entered on the Vision ROI page.")
+            grades = colour_size.grades_or_default(ss.size_config.get("grades"))
+            table = "\n".join(f"   {name}:  {colour_size.text_of(grades.get(name))} mm   ->  {self.cs_grade_ejector[name].cget('text')}"
+                              for name in colour_size.ALL_GRADES if colour_size.has_limits(grades.get(name)))
+            if not messagebox.askyesno("Size grades", "Switch SIZE GRADES READY on?\n\nGOOD cashews will be fired by the ejector of their grade:\n\n"
+                                       + table + warning, icon="warning"):
                 self.cs_ready_switch.set(False)
                 return
         with ss.lock:
@@ -6197,7 +6375,7 @@ except Exception as e:
         for name in ("sw_ww", "size"):
             g["engines"][name] = engines.ACTIVE if on else engines.SHADOW
         ss.set_grading(g)                           # also writes the settings file
-        log.info("SIZE GRADES READY -> %s", bool(on))
+        self._log_settings("SIZE GRADES READY", [f"size_ready: {was} -> {bool(on)}"])
         self._refresh_pneumatic()
         self._refresh_colour_size(force=True)
 
@@ -6229,7 +6407,7 @@ except Exception as e:
             return size_teach.K_DEFAULT
 
     def _size_teach_apply(self):
-        """APPLY: write mean -/+ k x std of the taught cashews into the grade's limit fields (saved with SAVE)."""
+        """APPLY: MIN / MAX length of the grade = mean -/+ k x std of the taught cashews (saved with SAVE)."""
         import size_teach
         if not self._size_teach:
             return
@@ -6237,7 +6415,7 @@ except Exception as e:
         result = size_teach.limits(self._size_teach_samples(), self._size_teach_k())
         if not result:
             return
-        for key in colour_size.LIMIT_KEYS:
+        for key in ("l_min", "l_max"):
             self.cs_vars[("grade", grade, key)].set(f"{result[key]:g}")
         self._size_taught_pending = getattr(self, "_size_taught_pending", {})
         self._size_taught_pending[grade] = {"n": result["n"], "k": result["k"], "taught": f"{datetime.now():%d.%m %H:%M}"}
@@ -6245,7 +6423,8 @@ except Exception as e:
         self._refresh_colour_size(force=True)
 
     def _save_colour_size(self):
-        """SAVE COLOUR & SIZE: colour metric / threshold / side, grade limits, shape limits and the double length."""
+        """SAVE COLOUR & SIZE: asks with the list old -> new, saves the size table, the colour value / threshold / side,
+        shape limits and the double length, and logs every change."""
         ss = self.shared_state
         if ss.phase == "RUNNING":
             messagebox.showwarning("Stop first", "Stop the machine before saving colour and size settings.")
@@ -6254,22 +6433,17 @@ except Exception as e:
             number = lambda var: float(var.get().strip().replace(",", "."))
             shape = {key[1]: number(var) for key, var in self.cs_vars.items() if key[0] == "shape"}
             double_length = number(self.cs_vars[("double", "max_single_length_mm")])
-            grades = {}
-            for grade in colour_size.ALL_GRADES:
-                row = {key: self.cs_vars[("grade", grade, key)].get().strip() for key in colour_size.LIMIT_KEYS}
-                if any(row.values()):
-                    grades[grade] = {key: float(value.replace(",", ".")) for key, value in row.items() if value}
+            grades = self._cs_grades_from_fields()
         except ValueError:
             messagebox.showerror("Colour & Size", "Please check the numbers: one field is not a number.")
             return False
         for grade, row in grades.items():
-            if "l_min" not in row or "l_max" not in row:
-                messagebox.showerror("Colour & Size", f"{grade}: L min and L max are needed (width and area limits are optional).")
+            if row["l_min"] is not None and row["l_max"] is not None and row["l_min"] >= row["l_max"]:
+                messagebox.showerror("Colour & Size", f"{grade}: MIN length must be below MAX length.")
                 return False
-            for low, high in (("l_min", "l_max"), ("w_min", "w_max"), ("a_min", "a_max")):
-                if low in row and high in row and row[low] >= row[high]:
-                    messagebox.showerror("Colour & Size", f"{grade}: {low.replace('_', ' ')} must be below {high.replace('_', ' ')}.")
-                    return False
+            if any(v is not None and v < 0 for v in row.values()):
+                messagebox.showerror("Colour & Size", f"{grade}: a length cannot be negative.")
+                return False
         if double_length <= 0:
             messagebox.showerror("Colour & Size", "Sizes must be above 0.")
             return False
@@ -6277,26 +6451,46 @@ except Exception as e:
         if self.cs_threshold_var.get().strip() and colour_cfg["threshold"] is None:
             messagebox.showerror("Colour & Size", "The SW / WW threshold is not a number.")
             return False
-        if ss.size_config.get("size_ready") and (colour_cfg["threshold"] is None or not grades):
-            messagebox.showerror("Colour & Size", "SIZE GRADES READY is on: the threshold and the grade limits cannot be emptied. Switch it off first.")
+        if colour_cfg["enabled"] and colour_cfg["threshold"] is None:
+            messagebox.showerror("Colour & Size", "COLOUR SPLIT is on: the threshold cannot be empty. Switch COLOUR SPLIT off first.")
+            return False
+        if ss.size_config.get("size_ready") and not any(colour_size.has_limits(grades[n]) for n in colour_size.WW_GRADES):
+            messagebox.showerror("Colour & Size", "SIZE GRADES READY is on: the W grades cannot all be empty. Switch it off first.")
+            return False
+        old_grades = {n: {k: r.get(k) for k in ("l_min", "l_max")} for n, r in colour_size.grades_or_default(ss.size_config.get("grades")).items()}
+        old_colour = {**colour_size.COLOUR_DEFAULTS, **ss.size_config.get("colour", {})}
+        keys = ("metric", "threshold", "sw_above")
+        lines = (["size table  " + line for line in colour_size.changes(old_grades, grades)]
+                 + ["colour  " + line for line in colour_size.changes({k: old_colour.get(k) for k in keys}, {k: colour_cfg[k] for k in keys})]
+                 + ["shape  " + line for line in colour_size.changes({k: ss.grading["shape"].get(k) for k in shape}, shape)]
+                 + ["double  " + line for line in colour_size.changes({"max_single_length_mm": ss.grading["double"]["max_single_length_mm"]},
+                                                                         {"max_single_length_mm": double_length})])
+        if not lines:
+            self.lbl_cs_unsaved.config(text="")
+            self.lbl_cs_saved.config(text="Nothing was changed.", fg=ui.MUTED)
+            return True
+        if not messagebox.askyesno("Save colour & size", "Save these changes?\n\n" + "\n".join(lines[:30]) + ("\n..." if len(lines) > 30 else "")
+                                   + ("\n\nSIZE GRADES READY is ON: the new table is used for firing at once." if ss.size_config.get("size_ready") else "")):
             return False
         pending = getattr(self, "_size_taught_pending", {})
         with ss.lock:
-            old_colour = ss.size_config.get("colour", {})
             keep = {k: v for k, v in old_colour.items() if k in ("taught", "ww", "sw", "wrong_pct")} \
-                if all(old_colour.get(k) == colour_cfg[k] for k in colour_cfg) else {}
+                if all(old_colour.get(k) == colour_cfg[k] for k in keys) else {}
             ss.size_config["colour"] = {**colour_cfg, **keep}
-            stored = ss.size_config.get("grades", {})
-            ss.size_config["grades"] = {grade: {**{k: v for k, v in stored.get(grade, {}).items() if k in ("n", "k", "taught") and grade not in pending},
-                                                **row, **pending.get(grade, {})} for grade, row in grades.items()}
+            stored = ss.size_config.get("grades") or {}
+            ss.size_config["grades"] = {
+                grade: {**{k: v for k, v in stored.get(grade, {}).items() if k in ("n", "k", "taught") and grade not in pending
+                           and all(stored.get(grade, {}).get(key) == row[key] for key in ("l_min", "l_max"))}, **row, **pending.get(grade, {})}
+                for grade, row in grades.items()}
             ss.size_config["teach_k"] = self._size_teach_k()
         self._size_taught_pending = {}
         g = copy.deepcopy(ss.grading)
         g["shape"].update(shape)
         g["double"]["max_single_length_mm"] = double_length
         ss.set_grading(g)                           # also writes the settings file
+        self._log_settings("SAVE COLOUR & SIZE", lines)
         self.lbl_cs_unsaved.config(text="")
-        self.lbl_cs_saved.config(text=f"Saved {datetime.now():%H:%M:%S} with the program:  {self.active_program_name}", fg=ui.GOOD)
+        self.lbl_cs_saved.config(text=f"Saved {datetime.now():%H:%M:%S}: {len(lines)} change(s), logged in logs/settings_changes.log", fg=ui.GOOD)
         self._refresh_colour_size(force=True)
         return True
 
@@ -6348,11 +6542,32 @@ except Exception as e:
         # size
         ready, calibrated = bool(size_config.get("size_ready")), bool(size_config.get("roi_length_mm"))
         self.cs_ready_switch.set(ready)
-        self.lbl_cs_ready.config(text="SIZE GRADES READY: GOOD goes to its grade ejector" if ready
-                                 else "SHADOW: grade is logged (\"would be\"), GOOD goes to the reject ejector", fg=ui.GOOD if ready else ui.WARN)
-        self.lbl_cs_calibration.config(text=f"{float(size_config.get('px_per_mm', 0)):.2f} px per mm" if calibrated else "px per mm NOT CALIBRATED (Vision ROI)",
-                                       fg=ui.MUTED if calibrated else ui.BAD)
-        rows = [(s["id"], s["label"].replace("UNDEF SIZE_NOT_READY ", "GOOD "), s.get("colour") or "-",
+        self.lbl_cs_ready.config(text="SIZE GRADES READY:  ON" if ready else "SIZE GRADES READY:  OFF", fg=ui.GOOD if ready else ui.WARN)
+        self.lbl_cs_ready_note.config(text="ON: a GOOD cashew is fired by the ejector of its grade from this table." if ready else
+                                      "OFF (SHADOW): the grade is only shown and logged (\"would be W240\"); every GOOD cashew goes to the reject ejector A01 / A21.")
+        px1, px2 = px_per_mm_of(size_config, 1), px_per_mm_of(size_config, 2)
+        self.lbl_cs_calibration.config(
+            text=(f"px per mm:  ROI 1  {px1:.2f}    ROI 2  {px2:.2f}" + ("" if size_config.get("roi2_length_mm") else "  (same as ROI 1)")) if calibrated
+            else "WARNING: px per mm is NOT CALIBRATED. The lengths in mm are wrong until the ROI length is entered on the Vision ROI page.",
+            fg=ui.MUTED if calibrated else ui.BAD)
+        split = bool(saved.get("enabled"))
+        self.cs_split_switch.set(split)
+        self.lbl_cs_split.config(text="COLOUR SPLIT:  ON   (SW cashews use the SW grades)" if split else "COLOUR SPLIT:  OFF   (all GOOD cashews use the W grades)",
+                                 fg=ui.GOOD if split else ui.WARN)
+        self.lbl_cs_sw_note.config(text="" if split else "not used while COLOUR SPLIT is off")
+        with ss.lock:
+            tables, no_fire = {1: dict(ss.mapping_t1), 2: dict(ss.mapping_t2)}, list(ss.no_fire)
+        for grade in colour_size.ALL_GRADES:
+            shown = []
+            for roi in (1, 2):
+                try:
+                    relay, assigned = relay_mapping.target_of(tables[roi], roi, [grade], no_fire)
+                except Exception:
+                    relay, assigned = None, False
+                shown.append("no fire" if relay is None else (f"A{relay:02d}" if assigned else f"reject A{relay:02d}"))
+            label = "no fire (end of belt)" if shown == ["no fire", "no fire"] else " / ".join(shown)
+            self.cs_grade_ejector[grade].config(text=label, fg=ui.MUTED if "no fire" in label else (ui.WARN if "reject" in label else ui.ACCENT))
+        rows = [(s["id"], s.get("shown") or s["label"], s.get("colour") or "-",
                  "-" if s.get("colour_value") is None else f"{s['colour_value']:.1f}", f"{s['l']:.1f}", f"{s['w']:.1f}", f"{s['a']:.0f}",
                  s.get("grade") or "-", f"A{s['relay']:02d}" if s.get("relay") else "-") for s in reversed(samples)]
         if rows != getattr(self, "_cs_last_rows", None):
