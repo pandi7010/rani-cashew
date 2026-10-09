@@ -1,0 +1,53 @@
+# Extra part of tools/ui_selftest.py for the Vision ROI and Colour Size pages (temporary settings file, fake PLC):
+#     python3 tools/ui_selftest.py design/pages tools/selftest_pages.py
+import random
+print("== Vision ROI: calibration")
+app._switch_page("Vision ROI")
+pump(1.5)
+print("  before:", app.shared_state.size_config.get("px_per_mm"), "px/mm, calibrated", bool(app.shared_state.size_config.get("roi_length_mm")))
+print("== Colour Size: refused while not calibrated")
+app._switch_page("Colour Size")
+pump(0.5)
+app._size_teach_toggle("W320")
+app._set_size_ready(True)
+print("  teach started:", app._size_teach is not None, "| size ready:", app.shared_state.size_config.get("size_ready"))
+app._switch_page("Vision ROI")
+app.roi_length_var.set("300")
+pump(0.3)
+print("  typed 300 mm:", app.lbl_roi_px.cget("text"), "|", app.lbl_px_per_mm.cget("text"))
+app._save_vision_settings()
+pump(0.5)
+shot(app, "05_vision_roi")
+saved = json.load(open(g.CFG_PATH))["size_config"]
+print("  saved px/mm:", saved["px_per_mm"], "| roi_length_mm", saved["roi_length_mm"], "|", app.lbl_vision_saved.cget("text"))
+app.roi_length_var.set("abc")
+app._save_vision_settings()
+print("  bad value keeps the saved one:", json.load(open(g.CFG_PATH))["size_config"]["px_per_mm"] == saved["px_per_mm"])
+app.roi_length_var.set("300")
+
+print("== Colour Size: teach, apply, save")
+app._switch_page("Colour Size")
+app._size_teach_toggle("W320")
+random.seed(3)
+with app.shared_state.lock:
+    for i in range(44):
+        app.shared_state.size_samples.append({"id": f"R1-{i:06d}", "t": time.time(), "l": random.gauss(24.5, 1.0), "w": random.gauss(12.4, 0.7),
+                                              "a": random.gauss(226, 19), "solidity": 0.86, "double": False, "label": "UNDEF SIZE_NOT_READY (would be W320)"})
+    app.shared_state.size_samples.append({"id": "R1-000900", "t": time.time(), "l": 61.0, "w": 14.0, "a": 520.0, "solidity": 0.7, "double": True, "label": "DOUBLE KERNEL"})
+app._refresh_colour_size(force=True)
+pump(0.5)
+print("  teaching:", app.lbl_cs_teach.cget("text")[-40:], "| apply enabled:", app.btn_cs_apply._enabled)
+shot(app, "04_colour_size_teaching")
+app._size_teach_apply()
+app.cs_vars[("shape", "min_solidity")].set("0.78")
+pump(0.3)
+print("  after APPLY:", {k: app.cs_vars[("grade", "W320", k)].get() for k in ("l_min", "l_max", "a_min", "a_max")}, "|", app.cs_grade_taught["W320"].cget("text"),
+      "|", app.lbl_cs_unsaved.cget("text"))
+print("  SAVE:", app._save_colour_size(), "|", app.lbl_cs_saved.cget("text")[:14])
+cfg_now = json.load(open(g.CFG_PATH))
+print("  file: grade W320", cfg_now["size_config"]["grades"]["W320"], "| shape", cfg_now["grading"]["shape"]["min_solidity"], "| old table kept", cfg_now["size_config"]["W320_L"])
+app._set_size_ready(True)
+print("  SIZE READY after calibration:", json.load(open(g.CFG_PATH))["size_config"]["size_ready"], "| asked:", asked[-1][:30])
+app._set_size_ready(False)
+pump(0.5)
+shot(app, "04_colour_size")

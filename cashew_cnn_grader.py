@@ -461,6 +461,7 @@ class SharedState:
         self.grading = grading_config.defaults()
         self.result_counts: Dict[str, int] = {}
         self.recent_decisions = OrderedDict()               # cashew ID -> text with its frame-by-frame votes
+        self.size_samples = deque(maxlen=400)               # measured size of every decided cashew (Colour Size page, teach)
         self.view_live = {1: "", 2: ""}                     # latest measured values per ROI (view tuning)
         self.view_thumb = {}                                # ROI -> small picture of that cashew (BGR)
         self.lane_speed = {1: 0.0, 2: 0.0}                  # px/ms, from the tracker
@@ -1512,6 +1513,11 @@ class ProcessingThread(threading.Thread):
             detail.append(f"+{r['t']:6.0f} ms  CNN {str(r['cnn']):<12} {r['cnn_conf']:.2f}  YOLO {str(r['yolo']):<12} {r['yolo_conf']:.2f}  "
                           f"{r['view']:<5}{' EDGE' if r['edge_cut'] else ''}  {feat_txt}")
         self.shared_state.add_decision(trk.id, label, f"{d.frames_used}f", relay or 0, count_keys, "\n".join(detail))
+        with self.shared_state.lock:
+            self.shared_state.size_samples.append({
+                "id": trk.id, "t": time.time(), "l": (length_px or 0.0) / px_per_mm, "w": (width_px or 0.0) / px_per_mm,
+                "a": (med("area_px") or 0.0) / px_per_mm ** 2, "solidity": med("solidity") or 0.0,
+                "double": d.result == decision.DOUBLE or decision.DOUBLE in str(d.reason), "label": label})
         self.cashew_log.write({
             "id": trk.id, "roi": rid, "frames": d.frames_total, "frames_used": d.frames_used, "result": d.result, "reason": d.reason,
             "reject": int(d.reject), "good_frames": d.good_frames, "neck_frames": d.neck_frames, "seen": d.seen, "votes": d.votes,
@@ -4274,13 +4280,16 @@ except Exception as e:
             self.shared_state.phase = phase
 
     def _build_vision_page(self):
-        """Vision ROI page: ROIs, decision line (either orientation), USB camera / test source, colour gain."""
-        surf, light, text, muted = self.colors["surface"], self.colors["surface_light"], self.colors["text"], self.colors["text_muted"]
-        page = tk.Frame(self.page_container, bg=surf)
+        """Vision ROI page in the 5-track layout: ROIs and decision line, calibration (ROI length -> px per mm),
+        image sensor and colour gain, camera / test source, white calibration, recorder. One SAVE button."""
+        F = ui.FONT
+        page = tk.Frame(self.page_container, bg=ui.BG)
         self.pages["Vision ROI"] = page
-        canvas = tk.Canvas(page, bg=surf, highlightthickness=0)
+        save_bar = tk.Frame(page, bg=ui.BG)
+        save_bar.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        canvas = tk.Canvas(page, bg=ui.BG, highlightthickness=0)
         scroll = ttk.Scrollbar(page, orient="vertical", command=canvas.yview)
-        p_vis = tk.Frame(canvas, bg=surf, padx=15, pady=15)
+        p_vis = tk.Frame(canvas, bg=ui.BG)
         p_vis.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         window_id = canvas.create_window((0, 0), window=p_vis, anchor="nw")
         canvas.bind("<Configure>", lambda e: canvas.itemconfig(window_id, width=e.width))
@@ -4288,37 +4297,63 @@ except Exception as e:
         canvas.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
 
+        def card(title, note=""):
+            box = tk.Frame(p_vis, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
+            box.pack(fill=tk.X, pady=(0, 10), padx=(0, 6))
+            head = tk.Frame(box, bg=ui.PANEL)
+            head.pack(fill=tk.X, padx=14, pady=(10, 4))
+            tk.Label(head, text=title, font=(F, ui.F_SMALL, "bold"), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT)
+            if note:
+                tk.Label(head, text=note, font=(F, -11), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT, padx=12)
+            body = tk.Frame(box, bg=ui.PANEL)
+            body.pack(fill=tk.X, padx=14, pady=(0, 12))
+            return body
+
+        def line(parent, pady=3):
+            row = tk.Frame(parent, bg=ui.PANEL)
+            row.pack(fill=tk.X, pady=pady)
+            return row
+
+        def text(parent, value, bold=False, colour=ui.TEXT, size=ui.F_SMALL, **kw):
+            return tk.Label(parent, text=value, font=(F, size, "bold") if bold else (F, size), fg=colour, bg=ui.PANEL, **kw)
+
         def entry(parent, var, width=8):
-            return tk.Entry(parent, textvariable=var, width=width, bg=light, fg=text, insertbackground=text,
-                            disabledbackground=self.colors["bg"], bd=0, font=("Roboto", 11))
+            return tk.Entry(parent, textvariable=var, width=width, bg=ui.FIELD, fg=ui.TEXT, insertbackground=ui.TEXT, bd=0, justify="center",
+                            disabledbackground=ui.BG, font=(F, -14), highlightthickness=1, highlightbackground=ui.BORDER, highlightcolor=ui.ACCENT)
 
-        def check(parent, label, var, command=None):
-            return tk.Checkbutton(parent, text=label, variable=var, command=command, bg=surf, fg=text, selectcolor=self.colors["bg"],
-                                  activebackground=surf, activeforeground=text, font=("Roboto", 10))
+        def note(parent, value):
+            label = text(parent, value, colour=ui.MUTED, size=-11, justify="left", anchor="w", wraplength=570)
+            label.pack(fill=tk.X, pady=(4, 0))
+            return label
 
-        # ── ROIs ──
-        ttk.Label(p_vis, text="VISION & ROI SETUP", style="Title.TLabel").pack(anchor="w", pady=(0,10))
-        roi_grid = tk.Frame(p_vis, bg=surf)
-        roi_grid.pack(fill=tk.X, pady=5)
-        roi_grid.columnconfigure(0, weight=1); roi_grid.columnconfigure(1, weight=1)
-        ttk.Button(roi_grid, text="Draw ROI 1", command=lambda: self._set_phase("ROI1_START")).grid(row=0, column=0, padx=5, pady=5, sticky="ew")
-        ttk.Button(roi_grid, text="Reset ROI 1", command=self.shared_state.reset_roi1).grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-        ttk.Button(roi_grid, text="Draw ROI 2", command=lambda: self._set_phase("ROI2_START")).grid(row=1, column=0, padx=5, pady=5, sticky="ew")
-        ttk.Button(roi_grid, text="Reset ROI 2", command=self.shared_state.reset_roi2).grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+        # ── ROIs and decision line ──
+        rois = card("ROIS AND DECISION LINE", "press DRAW, then drag on the camera image")
+        self.lbl_roi_coords = {}
+        for number, start, reset in ((1, "ROI1_START", self.shared_state.reset_roi1), (2, "ROI2_START", self.shared_state.reset_roi2)):
+            row = line(rois)
+            text(row, f"ROI {number}", bold=True, size=ui.F_BODY, width=6, anchor="w").pack(side=tk.LEFT)
+            self.lbl_roi_coords[number] = text(row, "", colour=ui.MUTED)
+            self.lbl_roi_coords[number].pack(side=tk.LEFT, padx=(4, 0))
+            ui.FlatButton(row, "RESET", reset, kind="muted", height=30, width=84).pack(side=tk.RIGHT)
+            ui.FlatButton(row, "DRAW", lambda s=start: self._set_phase(s), height=30, width=84).pack(side=tk.RIGHT, padx=8)
+        tk.Frame(rois, bg=ui.BORDER, height=1).pack(fill=tk.X, pady=8)
+        row = line(rois)
+        text(row, "Decision line", bold=True, size=ui.F_BODY).pack(side=tk.LEFT)
+        self.lbl_line_pos = text(row, "", bold=True, colour=ui.ACCENT)
+        self.lbl_line_pos.pack(side=tk.LEFT, padx=14)
+        ui.FlatButton(row, "RESET", self.shared_state.reset_line, kind="muted", height=30, width=84).pack(side=tk.RIGHT)
+        ui.FlatButton(row, "SET LINE", lambda: self._set_phase("LINE_SET_MODE"), height=30, width=84).pack(side=tk.RIGHT, padx=8)
 
-        # ── Decision line ──
-        ttk.Label(p_vis, text="DECISION LINE", style="Header.TLabel").pack(anchor="w", pady=(15,5))
         line_names = {fg.VERTICAL: "Vertical  |", fg.HORIZONTAL: "Horizontal  —"}
-        dir_frm = tk.Frame(p_vis, bg=surf)
-        dir_frm.pack(fill=tk.X, pady=5)
-        ttk.Label(dir_frm, text="Line:", style="Surface.TLabel").pack(side=tk.LEFT)
+        dir_frm = line(rois, pady=6)
+        text(dir_frm, "Line").pack(side=tk.LEFT)
         self.line_orient_var = tk.StringVar(value=line_names[fg.line_orientation(self.shared_state.flow_direction)])
         orient_combo = ttk.Combobox(dir_frm, textvariable=self.line_orient_var, values=list(line_names.values()), state="readonly", width=13)
-        orient_combo.pack(side=tk.LEFT, padx=(5, 15))
-        ttk.Label(dir_frm, text="Cashews move:", style="Surface.TLabel").pack(side=tk.LEFT)
+        orient_combo.pack(side=tk.LEFT, padx=(6, 16))
+        text(dir_frm, "Cashews move").pack(side=tk.LEFT)
         self.flow_var = tk.StringVar(value=fg.FLOW_LABELS[self.shared_state.flow_direction])
         flow_combo = ttk.Combobox(dir_frm, textvariable=self.flow_var, state="readonly", width=14)
-        flow_combo.pack(side=tk.LEFT, padx=5)
+        flow_combo.pack(side=tk.LEFT, padx=6)
 
         def flows_of_selected_line():
             orientation = next(k for k, v in line_names.items() if v == self.line_orient_var.get())
@@ -4351,34 +4386,42 @@ except Exception as e:
         orient_combo.bind("<<ComboboxSelected>>", on_orientation)
         flow_combo.bind("<<ComboboxSelected>>", on_flow)
 
-        line_grid = tk.Frame(p_vis, bg=surf)
-        line_grid.pack(fill=tk.X, pady=5)
-        line_grid.columnconfigure(0, weight=1); line_grid.columnconfigure(1, weight=1)
-        ttk.Button(line_grid, text="Set Decision Line", style="Primary.TButton", command=lambda: self._set_phase("LINE_SET_MODE")).grid(row=0, column=0, padx=5, pady=5, sticky="ew")
-        ttk.Button(line_grid, text="Reset Line", command=self.shared_state.reset_line).grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-        self.link_lines_var = tk.BooleanVar(value=self.shared_state.link_lines)
-        tk.Checkbutton(p_vis, text="One line for both ROIs (untick to set a line per ROI: click or drag inside that ROI)",
-                       variable=self.link_lines_var, command=lambda: self.shared_state.set_link_lines(self.link_lines_var.get()),
-                       bg=surf, fg=text, selectcolor=light, activebackground=surf, activeforeground=text, font=("Roboto", 9),
-                       anchor="w", wraplength=430, justify="left").pack(fill=tk.X)
-
-        man_frm = tk.Frame(p_vis, bg=surf)
-        man_frm.pack(fill=tk.X, pady=5)
+        man_frm = line(rois)
         self.manual_line_var = tk.StringVar()
-        self.btn_line_minus = ttk.Button(man_frm, text="", command=lambda: self._shift_line(-5))
-        self.btn_line_minus.pack(side=tk.LEFT, padx=5)
-        entry(man_frm, self.manual_line_var, 6).pack(side=tk.LEFT, padx=10, fill=tk.Y)
-        self.btn_line_plus = ttk.Button(man_frm, text="", command=lambda: self._shift_line(5))
-        self.btn_line_plus.pack(side=tk.LEFT, padx=5)
-        self.lbl_line_pos = ttk.Label(p_vis, text="", font=("Roboto", 10, "bold"), foreground=self.colors["warning"], style="Surface.TLabel")
-        self.lbl_line_pos.pack(pady=5)
+        self.btn_line_minus = ui.FlatButton(man_frm, "◀ Shift Left", lambda: self._shift_line(-5), height=30, width=120)
+        self.btn_line_minus.pack(side=tk.LEFT)
+        entry(man_frm, self.manual_line_var, 7).pack(side=tk.LEFT, padx=8, ipady=5)
+        self.btn_line_plus = ui.FlatButton(man_frm, "Shift Right ▶", lambda: self._shift_line(5), height=30, width=120)
+        self.btn_line_plus.pack(side=tk.LEFT)
+        text(man_frm, "px", colour=ui.MUTED).pack(side=tk.LEFT, padx=8)
+        self.link_lines_var = tk.BooleanVar(value=self.shared_state.link_lines)
+        link = line(rois, pady=(6, 0))
+        self.link_switch = ui.ToggleSwitch(link, ui.PANEL, self.shared_state.link_lines,
+                                           lambda on: (self.link_lines_var.set(on), self.shared_state.set_link_lines(on)))
+        self.link_switch.pack(side=tk.LEFT)
+        text(link, "One line for both ROIs  (off: a line per ROI, click or drag inside that ROI)", colour=ui.MUTED, size=-11).pack(side=tk.LEFT, padx=10)
         self.manual_line_var.trace_add("write", self._on_manual_line_var_write)
         self.shared_state.line_pixel_callback = self._on_line_change_callback
         show_current_direction()
         self.shared_state._notify_line()
 
-        # ── Camera ──
-        ttk.Label(p_vis, text="CAMERA", style="Header.TLabel").pack(anchor="w", pady=(20,5))
+        # ── Calibration: ROI length in mm -> px per mm ──
+        cal = card("CALIBRATION", "used for mm sizes, the double rule, belt speed and valve timing")
+        row = line(cal)
+        text(row, "ROI 1 length", size=ui.F_BODY).pack(side=tk.LEFT)
+        length = self.shared_state.size_config.get("roi_length_mm")
+        self.roi_length_var = tk.StringVar(value="" if not length else f"{float(length):g}")
+        entry(row, self.roi_length_var, 7).pack(side=tk.LEFT, padx=10, ipady=5)
+        text(row, "mm", colour=ui.MUTED).pack(side=tk.LEFT)
+        self.lbl_px_per_mm = text(row, "", bold=True, colour=ui.ACCENT, size=ui.F_HEAD)
+        self.lbl_px_per_mm.pack(side=tk.RIGHT)
+        self.lbl_roi_px = text(row, "", colour=ui.MUTED)
+        self.lbl_roi_px.pack(side=tk.RIGHT, padx=14)
+        self.lbl_calibration = note(cal, "")
+        self.roi_length_var.trace_add("write", lambda *_: self._refresh_calibration())
+
+        # ── Image sensor ──
+        sensor = card("IMAGE SENSOR", "camera exposure and gain, software colour gain")
         cs = self.shared_state.camera_settings
         self.cam_vars = {
             "source": tk.StringVar(value=cs.source),
@@ -4389,40 +4432,62 @@ except Exception as e:
             "test_path": tk.StringVar(value=cs.test_path), "test_loop": tk.BooleanVar(value=cs.test_loop),
             "test_fps": tk.StringVar(value=f"{cs.test_fps:g}"),
         }
-        src_frm = tk.Frame(p_vis, bg=surf)
-        src_frm.pack(fill=tk.X, pady=2)
-        for label, value in (("Camera (Aravis)", "aravis"), ("Test source (video / images)", "file")):
-            tk.Radiobutton(src_frm, text=label, variable=self.cam_vars["source"], value=value, bg=surf, fg=text, selectcolor=self.colors["bg"],
-                           activebackground=surf, activeforeground=text, font=("Roboto", 10, "bold")).pack(side=tk.LEFT, padx=(0, 15))
-        self.lbl_cam_model = tk.Label(p_vis, text="", bg=surf, fg=self.colors["info"], font=("Roboto", 10, "bold"), justify="left", anchor="w", wraplength=430)
-        self.lbl_cam_model.pack(fill=tk.X, pady=(2, 4))
+        grid = tk.Frame(sensor, bg=ui.PANEL)
+        grid.pack(fill=tk.X)
+        text(grid, "Gain", size=ui.F_BODY).grid(row=0, column=0, sticky="w", pady=4)
+        entry(grid, self.cam_vars["gain"], 9).grid(row=0, column=1, padx=12, pady=4, ipady=5)
+        self.lbl_gain_range = text(grid, "", colour=ui.MUTED)
+        self.lbl_gain_range.grid(row=0, column=2, sticky="w")
+        text(grid, "Exposure", size=ui.F_BODY).grid(row=1, column=0, sticky="w", pady=4)
+        entry(grid, self.cam_vars["exposure_us"], 9).grid(row=1, column=1, padx=12, pady=4, ipady=5)
+        self.lbl_exposure_range = text(grid, "", colour=ui.MUTED)
+        self.lbl_exposure_range.grid(row=1, column=2, sticky="w")
+        text(grid, "µs", colour=ui.MUTED).grid(row=1, column=3, sticky="w", padx=6)
+        fps_row = line(sensor)
+        fps_entry = entry(fps_row, self.cam_vars["fps_limit"], 6)
 
-        cam_set = tk.Frame(p_vis, bg=surf)
-        cam_set.pack(fill=tk.X, pady=2)
-        ttk.Label(cam_set, text="Exposure (µs)", style="Surface.TLabel").grid(row=0, column=0, sticky="w", pady=3)
-        entry(cam_set, self.cam_vars["exposure_us"], 9).grid(row=0, column=1, padx=10, pady=3, sticky="w")
-        self.lbl_exposure_range = ttk.Label(cam_set, text="", style="Surface.TLabel", foreground=muted)
-        self.lbl_exposure_range.grid(row=0, column=2, sticky="w")
-        ttk.Label(cam_set, text="Camera gain", style="Surface.TLabel").grid(row=1, column=0, sticky="w", pady=3)
-        entry(cam_set, self.cam_vars["gain"], 9).grid(row=1, column=1, padx=10, pady=3, sticky="w")
-        self.lbl_gain_range = ttk.Label(cam_set, text="", style="Surface.TLabel", foreground=muted)
-        self.lbl_gain_range.grid(row=1, column=2, sticky="w")
-        fps_entry = entry(cam_set, self.cam_vars["fps_limit"], 9)
-
-        def on_fps_limit():
+        def on_fps_limit(on=None):
+            if on is not None:
+                self.cam_vars["fps_limit_enabled"].set(on)
             fps_entry.config(state=tk.NORMAL if self.cam_vars["fps_limit_enabled"].get() else tk.DISABLED)
 
-        check(cam_set, "Limit FPS to", self.cam_vars["fps_limit_enabled"], on_fps_limit).grid(row=2, column=0, sticky="w", pady=3)
-        fps_entry.grid(row=2, column=1, padx=10, pady=3, sticky="w")
-        ttk.Label(cam_set, text="off = free running", style="Surface.TLabel", foreground=muted).grid(row=2, column=2, sticky="w")
+        ui.ToggleSwitch(fps_row, ui.PANEL, cs.fps_limit_enabled, on_fps_limit).pack(side=tk.LEFT)
+        text(fps_row, "Limit FPS to").pack(side=tk.LEFT, padx=10)
+        fps_entry.pack(side=tk.LEFT, ipady=4)
+        text(fps_row, "off = free running", colour=ui.MUTED, size=-11).pack(side=tk.LEFT, padx=10)
         on_fps_limit()
-        tk.Label(p_vis, text="An empty exposure or gain field leaves the camera's own value unchanged.",
-                 bg=surf, fg=muted, font=("Roboto", 9), justify="left", anchor="w", wraplength=430).pack(fill=tk.X)
+        self.vars_cam = {
+            "gain": tk.StringVar(value=str(self.shared_state.cam_gain)),
+            "r": tk.StringVar(value=str(self.shared_state.cam_r)),
+            "g": tk.StringVar(value=str(self.shared_state.cam_g)),
+            "b": tk.StringVar(value=str(self.shared_state.cam_b)),
+            "a_gain": tk.StringVar(value=str(self.shared_state.analog_gain)),
+            "d_gain": tk.StringVar(value=str(self.shared_state.digital_gain)),
+        }
+        gain_row = line(sensor, pady=(8, 0))
+        text(gain_row, "Colour gain", size=ui.F_BODY).pack(side=tk.LEFT)
+        for label, key in (("ALL", "gain"), ("R", "r"), ("G", "g"), ("B", "b")):
+            text(gain_row, label, bold=True, colour=ui.MUTED).pack(side=tk.LEFT, padx=(14, 5))
+            entry(gain_row, self.vars_cam[key], 5).pack(side=tk.LEFT, ipady=5)
+            self.vars_cam[key].trace_add("write", self._on_cam_setting_change)
+        note(sensor, "An empty gain or exposure field leaves the camera's own value unchanged. Colour gain is applied in software to every frame "
+                     "before the AI and before any image is saved.")
 
-        test_frm = tk.Frame(p_vis, bg=surf)
-        test_frm.pack(fill=tk.X, pady=(8, 2))
-        ttk.Label(test_frm, text="Test source:", style="Surface.TLabel").pack(side=tk.LEFT)
-        entry(test_frm, self.cam_vars["test_path"], 24).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        # ── Camera / test source ──
+        source = card("CAMERA SOURCE")
+        row = line(source)
+        names = {"aravis": "CAMERA (ARAVIS)", "file": "TEST SOURCE"}
+        self.source_selector = ui.Segmented(row, list(names.values()), names.get(cs.source, "CAMERA (ARAVIS)"),
+                                            lambda value: (self.cam_vars["source"].set(next(k for k, v in names.items() if v == value)),
+                                                           self.source_selector.set(value)))
+        self.source_selector.pack(side=tk.LEFT)
+        self.lbl_cam_model = text(source, "", bold=True, colour=ui.ACCENT, justify="left", anchor="w", wraplength=570)
+        self.lbl_cam_model.pack(fill=tk.X, pady=(6, 2))
+        test_frm = line(source)
+        text(test_frm, "Test source").pack(side=tk.LEFT)
+        path_entry = entry(test_frm, self.cam_vars["test_path"], 24)
+        path_entry.config(justify="left")
+        path_entry.pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True, ipady=5)
 
         def browse_test_file():
             path = filedialog.askopenfilename(title="Test video or image", initialdir=str(app_paths.BASE_DIR),
@@ -4434,27 +4499,27 @@ except Exception as e:
             path = filedialog.askdirectory(title="Folder of test images (for example a recording)", initialdir=str(start))
             if path: self.cam_vars["test_path"].set(path)
 
-        ttk.Button(test_frm, text="File", width=5, command=browse_test_file).pack(side=tk.LEFT, padx=2)
-        ttk.Button(test_frm, text="Folder", width=7, command=browse_test_folder).pack(side=tk.LEFT, padx=2)
-        test_opt = tk.Frame(p_vis, bg=surf)
-        test_opt.pack(fill=tk.X)
-        check(test_opt, "Repeat", self.cam_vars["test_loop"]).pack(side=tk.LEFT)
-        ttk.Label(test_opt, text="   FPS when the files have no timestamps:", style="Surface.TLabel").pack(side=tk.LEFT)
-        entry(test_opt, self.cam_vars["test_fps"], 5).pack(side=tk.LEFT, padx=5)
-
-        ttk.Button(p_vis, text="APPLY CAMERA SETTINGS", style="Primary.TButton", command=self._apply_camera_settings).pack(fill=tk.X, pady=(8, 2))
-        self.lbl_cam_status = tk.Label(p_vis, text="", bg=surf, fg=muted, font=("Roboto", 10), justify="left", anchor="w", wraplength=430)
+        ui.FlatButton(test_frm, "FOLDER", browse_test_folder, kind="muted", height=30, width=80).pack(side=tk.RIGHT)
+        ui.FlatButton(test_frm, "FILE", browse_test_file, kind="muted", height=30, width=64).pack(side=tk.RIGHT, padx=6)
+        test_opt = line(source)
+        ui.ToggleSwitch(test_opt, ui.PANEL, cs.test_loop, lambda on: self.cam_vars["test_loop"].set(on)).pack(side=tk.LEFT)
+        text(test_opt, "Repeat").pack(side=tk.LEFT, padx=10)
+        text(test_opt, "FPS when the files have no timestamps", colour=ui.MUTED).pack(side=tk.LEFT, padx=(14, 6))
+        entry(test_opt, self.cam_vars["test_fps"], 5).pack(side=tk.LEFT, ipady=4)
+        self.lbl_cam_status = text(source, "", colour=ui.MUTED, justify="left", anchor="w", wraplength=570)
         self.lbl_cam_status.pack(fill=tk.X, pady=(6, 0))
 
         # ── White calibration (flat-field correction) ──
-        ttk.Label(p_vis, text="WHITE CALIBRATION (FFC)", style="Header.TLabel").pack(anchor="w", pady=(20,5))
+        white = card("WHITE CALIBRATION (FFC)")
         self.ffc_enabled_var = tk.BooleanVar(value=self.flat_field.enabled)
 
-        def on_ffc_toggle():
-            if self.ffc_enabled_var.get() and not self.flat_field.available:
+        def on_ffc_toggle(on):
+            if on and not self.flat_field.available:
                 messagebox.showinfo("White calibration", "No calibration yet. Put a plain white sheet under the camera and press TEACH WHITE.")
-                self.ffc_enabled_var.set(False)
-            self.flat_field.enabled = self.ffc_enabled_var.get()
+                on = False
+            self.ffc_enabled_var.set(on)
+            self.flat_field.enabled = on
+            self.ffc_switch.set(on)
 
         def teach_white():
             if self.shared_state.phase == "RUNNING":
@@ -4469,52 +4534,96 @@ except Exception as e:
             self.flat_field.enabled = True      # so that the request is picked up with the next frame
             self.flat_field.request_calibration()
             self.ffc_enabled_var.set(True)
+            self.ffc_switch.set(True)
 
-        check(p_vis, "Use white calibration", self.ffc_enabled_var, on_ffc_toggle).pack(anchor="w")
-        ttk.Button(p_vis, text="TEACH WHITE (white sheet under the camera)", command=teach_white).pack(fill=tk.X, pady=(4, 2))
-        self.lbl_ffc_status = tk.Label(p_vis, text="", bg=surf, fg=muted, font=("Roboto", 9), justify="left", anchor="w", wraplength=430)
-        self.lbl_ffc_status.pack(fill=tk.X)
+        row = line(white)
+        self.ffc_switch = ui.ToggleSwitch(row, ui.PANEL, self.flat_field.enabled, on_ffc_toggle)
+        self.ffc_switch.pack(side=tk.LEFT)
+        text(row, "Use white calibration").pack(side=tk.LEFT, padx=10)
+        ui.FlatButton(row, "TEACH WHITE", teach_white, height=30, width=130).pack(side=tk.RIGHT)
+        self.lbl_ffc_status = note(white, "")
 
         # ── Recorder: real camera frames for replay tests ──
-        ttk.Label(p_vis, text="RECORD TEST FRAMES", style="Header.TLabel").pack(anchor="w", pady=(20,5))
-        rec_frm = tk.Frame(p_vis, bg=surf)
-        rec_frm.pack(fill=tk.X)
+        rec = card("RECORD TEST FRAMES")
+        rec_frm = line(rec)
         self.rec_seconds_var, self.rec_fps_var = tk.StringVar(value="10"), tk.StringVar(value="25")
-        ttk.Label(rec_frm, text="Seconds", style="Surface.TLabel").pack(side=tk.LEFT)
-        entry(rec_frm, self.rec_seconds_var, 4).pack(side=tk.LEFT, padx=(5, 12))
-        ttk.Label(rec_frm, text="FPS", style="Surface.TLabel").pack(side=tk.LEFT)
-        entry(rec_frm, self.rec_fps_var, 4).pack(side=tk.LEFT, padx=(5, 12))
-        ttk.Button(rec_frm, text="RECORD", command=self._start_recording).pack(side=tk.LEFT, padx=2)
-        ttk.Button(rec_frm, text="STOP", command=lambda: self.camera_thread.recorder.stop()).pack(side=tk.LEFT, padx=2)
-        self.lbl_rec_status = tk.Label(p_vis, text="Saves camera frames (before colour gain) into recordings/. Replay them as a test source.",
-                                       bg=surf, fg=muted, font=("Roboto", 9), justify="left", anchor="w", wraplength=430)
-        self.lbl_rec_status.pack(fill=tk.X, pady=(4, 0))
-        tk.Label(p_vis, text="ROIs and the decision line are in pixels of the full camera image.",
-                 bg=surf, fg=muted, font=("Roboto", 9), justify="left", anchor="w", wraplength=430).pack(fill=tk.X, pady=(8, 0))
+        text(rec_frm, "Seconds").pack(side=tk.LEFT)
+        entry(rec_frm, self.rec_seconds_var, 5).pack(side=tk.LEFT, padx=(6, 14), ipady=4)
+        text(rec_frm, "FPS").pack(side=tk.LEFT)
+        entry(rec_frm, self.rec_fps_var, 5).pack(side=tk.LEFT, padx=(6, 14), ipady=4)
+        ui.FlatButton(rec_frm, "STOP", lambda: self.camera_thread.recorder.stop(), kind="muted", height=30, width=80).pack(side=tk.RIGHT)
+        ui.FlatButton(rec_frm, "RECORD", self._start_recording, height=30, width=100).pack(side=tk.RIGHT, padx=6)
+        self.lbl_rec_status = note(rec, "Saves camera frames (before colour gain) into recordings/. Replay them as a test source.")
 
-        # ── Colour gain (software, applied to every frame before the AI and before any image is saved) ──
-        ttk.Label(p_vis, text="COLOUR GAIN (SOFTWARE)", style="Header.TLabel").pack(anchor="w", pady=(20,5))
-        self.vars_cam = {
-            "gain": tk.StringVar(value=str(self.shared_state.cam_gain)),
-            "r": tk.StringVar(value=str(self.shared_state.cam_r)),
-            "g": tk.StringVar(value=str(self.shared_state.cam_g)),
-            "b": tk.StringVar(value=str(self.shared_state.cam_b)),
-            "a_gain": tk.StringVar(value=str(self.shared_state.analog_gain)),
-            "d_gain": tk.StringVar(value=str(self.shared_state.digital_gain)),
-        }
-        cam_grid = tk.Frame(p_vis, bg=surf)
-        cam_grid.pack(fill=tk.X)
-        for idx, (txt, key) in enumerate([("Global Gain", "gain"), ("R Gain", "r"), ("G Gain", "g"), ("B Gain", "b")]):
-            ttk.Label(cam_grid, text=txt, style="Surface.TLabel").grid(row=idx, column=0, sticky="w", pady=3)
-            entry(cam_grid, self.vars_cam[key], 10).grid(row=idx, column=1, padx=20, pady=3)
-            self.vars_cam[key].trace_add("write", self._on_cam_setting_change)
-            
-        def save_cam_settings():
-            self._on_cam_setting_change()
-            messagebox.showinfo("Saved", "Colour gain saved.")
-            
-        ttk.Button(p_vis, text="SAVE COLOUR GAIN", style="Primary.TButton", command=save_cam_settings).pack(pady=(10, 0), fill=tk.X)
-        ttk.Button(p_vis, text="Test Image Capture", command=self.shared_state.trigger_capture).pack(pady=15, fill=tk.X)
+        # ── bottom: one SAVE for the page ──
+        self.lbl_vision_saved = tk.Label(save_bar, text="ROIs and the line are in pixels of the full camera image.", font=(F, -11), fg=ui.MUTED, bg=ui.BG, anchor="w")
+        self.lbl_vision_saved.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+        ui.FlatButton(save_bar, "TEST IMAGE CAPTURE", self.shared_state.trigger_capture, kind="muted", height=44, width=190).pack(side=tk.LEFT)
+        ui.FlatButton(save_bar, "SAVE VISION SETTINGS", self._save_vision_settings, kind="primary", height=44,
+                      font=(F, ui.F_BODY, "bold")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 6))
+        self._refresh_calibration()
+
+    def _roi_length_px(self):
+        """Length of ROI 1 along the direction the cashews move, in pixels of the full image (0 when not drawn)."""
+        roi = self.shared_state.roi1
+        if not roi:
+            return 0
+        return abs(roi[2] - roi[0]) if self.shared_state.line_is_vertical else abs(roi[3] - roi[1])
+
+    def _calibration_from_ui(self):
+        """(ROI length mm, px per mm) from the field, or (None, None) when it is empty or not a number above 0."""
+        try:
+            mm = float(self.roi_length_var.get().strip().replace(",", "."))
+        except ValueError:
+            return None, None
+        px = self._roi_length_px()
+        return (mm, px / mm) if mm > 0 and px > 0 else (None, None)
+
+    def _refresh_calibration(self):
+        if not hasattr(self, "lbl_px_per_mm"):
+            return
+        ss = self.shared_state
+        for number, roi in ((1, ss.roi1), (2, ss.roi2)):
+            shown = f"x {roi[0]} - {roi[2]}    y {roi[1]} - {roi[3]}" if roi else "not drawn"
+            if self.lbl_roi_coords[number].cget("text") != shown:
+                self.lbl_roi_coords[number].config(text=shown)
+        px = self._roi_length_px()
+        mm, px_mm = self._calibration_from_ui()
+        saved = float(ss.size_config.get("px_per_mm", 0) or 0)
+        calibrated = bool(ss.size_config.get("roi_length_mm"))
+        self.lbl_roi_px.config(text=f"{px} px in the image" if px else "ROI 1 is not drawn")
+        self.lbl_px_per_mm.config(text=f"{px_mm:.2f} px per mm" if px_mm else "- px per mm", fg=ui.ACCENT if px_mm else ui.WARN)
+        if not calibrated:
+            state, colour = (f"NOT CALIBRATED: the program is using {saved:g} px per mm, which is only a placeholder. Sizes in mm, the double rule "
+                             "and speeds are wrong until this is set."), ui.WARN
+        elif px_mm and abs(px_mm - saved) > 0.005:
+            state, colour = f"In use now: {saved:.2f} px per mm. The new value is used after SAVE VISION SETTINGS.", ui.WARN
+        else:
+            state, colour = f"In use: {saved:.2f} px per mm.", ui.MUTED
+        self.lbl_calibration.config(text="Measure the real length of ROI 1 on the roller, along the direction the cashews move, with a ruler and enter it. "
+                                         + state, fg=colour)
+
+    def _save_vision_settings(self):
+        """SAVE VISION SETTINGS: calibration, colour gain and the camera settings; ROIs and line are saved with them."""
+        if self.shared_state.phase == "RUNNING":
+            messagebox.showwarning("Stop first", "Stop the machine before saving the vision settings.")
+            return
+        mm, px_mm = self._calibration_from_ui()
+        typed = self.roi_length_var.get().strip()
+        if typed and px_mm is None:
+            messagebox.showerror("Calibration", "ROI length must be a number above 0 in mm, and ROI 1 must be drawn.")
+            return
+        with self.shared_state.lock:
+            if px_mm:
+                self.shared_state.size_config["roi_length_mm"] = mm
+                self.shared_state.size_config["px_per_mm"] = round(px_mm, 4)
+        if px_mm and hasattr(self, "sz_vars") and "px_per_mm" in self.sz_vars:
+            self.sz_vars["px_per_mm"].set(f"{px_mm:.4f}")
+        self._on_cam_setting_change()               # colour gain, and writes the config file
+        self.shared_state.save_to_config(CFG_PATH)
+        self._apply_camera_settings()
+        self._refresh_calibration()
+        self.lbl_vision_saved.config(text=f"Saved {datetime.now():%H:%M:%S}" + (f"   {px_mm:.2f} px per mm" if px_mm else "   (calibration not set)"), fg=ui.GOOD)
 
     def _camera_settings_from_ui(self) -> CameraSettings:
         v = self.cam_vars
@@ -4577,6 +4686,7 @@ except Exception as e:
                                   fg=self.colors["success"] if cam.is_connected else (self.colors["warning"] if cam.state in ("CONNECTING", "RECONNECTING") else self.colors["danger"]))
         if not hasattr(self, 'lbl_cam_status'):
             return
+        self._refresh_calibration()
         info = cam.info or {}
         if cam.is_connected and cam.state == "ONLINE":
             model = f"{info.get('vendor', '')} {info.get('model', '')}  |  {info.get('pixel_format', '?')}  |  {info.get('width', '?')} x {info.get('height', '?')}"
@@ -5294,6 +5404,8 @@ except Exception as e:
             self._refresh_status()
         if self._grading_tick % 15 == 2:
             self._refresh_pneumatic()
+        if self._grading_tick % 15 == 7:
+            self._refresh_colour_size()
         if self._grading_tick % 50 == 1:
             self._refresh_teaching()
             self._fit_pills()
@@ -5655,88 +5767,328 @@ except Exception as e:
         box.pack(fill=tk.BOTH, expand=True)
 
     def _build_colour_size_page(self):
-        """Build the dedicated Colour & Size settings page (OpenCV Filter + Size Logic)."""
-        p_cs = tk.Frame(self.page_container, bg=self.colors["bg"])
-        self.pages["Colour Size"] = p_cs
-        
-        canvas = tk.Canvas(p_cs, bg=self.colors["bg"], highlightthickness=0)
-        scroll = ttk.Scrollbar(p_cs, orient="vertical", command=canvas.yview)
-        inner = tk.Frame(canvas, bg=self.colors["bg"], padx=15, pady=15)
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
-        
-        def _on_canvas_resize(e):
-            canvas.itemconfig(window_id, width=e.width)
-        canvas.bind("<Configure>", _on_canvas_resize)
-        
-        canvas.configure(yscrollcommand=scroll.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-        
-        # --- OPENCV FILTER ---
-        ttk.Label(inner, text="OPENCV FILTER (COLOR & DEFECT TOLERANCE)", style="Title.TLabel").pack(anchor="w", pady=(0, 10))
-        cv_frm = tk.Frame(inner, bg=self.colors["surface"], padx=10, pady=10)
-        cv_frm.pack(fill=tk.X, pady=(0, 20))
-        
-        def make_slider(parent, label, var_name, from_, to, default):
-            row = tk.Frame(parent, bg=self.colors["surface"], pady=5)
-            row.pack(fill=tk.X)
-            ttk.Label(row, text=label, width=25).pack(side=tk.LEFT)
-            var = tk.IntVar(value=self.shared_state.opencv_filter.get(var_name, default))
-            setattr(self, f"var_{var_name}", var)
-            ttk.Scale(row, from_=from_, to=to, variable=var, orient=tk.HORIZONTAL, length=150).pack(side=tk.LEFT, padx=10)
-            tk.Entry(row, textvariable=var, width=5).pack(side=tk.LEFT)
-            def _on_change(*args, v=var, n=var_name):
-                self.shared_state.opencv_filter[n] = v.get()
-                self.shared_state.save_to_config(CFG_PATH)
-            var.trace_add("write", _on_change)
-            
-        make_slider(cv_frm, "SW Color Threshold:", "sw_color_thresh", 0, 255, 45)
-        make_slider(cv_frm, "SW Defect Tolerance (px):", "sw_defect_size_px", 0, 100, 20)
-        make_slider(cv_frm, "WW Color Threshold:", "ww_color_thresh", 0, 255, 85)
-        make_slider(cv_frm, "WW Defect Tolerance (px):", "ww_defect_size_px", 0, 100, 16)
-        make_slider(cv_frm, "Max Defect Area (px):", "max_defect_px", 0, 5000, 1200)
-        
-        # --- SIZE LOGIC ---
-        ttk.Label(inner, text="SIZE LOGIC (AUTO TEACH)", style="Title.TLabel").pack(anchor="w", pady=(10, 10))
-        sz_frm = tk.Frame(inner, bg=self.colors["surface"], padx=10, pady=10)
-        sz_frm.pack(fill=tk.X)
-        
-        self.at_size_var = tk.StringVar(value="W180")
-        def _do_teach(sz):
-            self.at_size_var.set(sz)
-            self._start_auto_teach()
-            
-        sz_btn_grid = tk.Frame(sz_frm, bg=self.colors["surface"])
-        sz_btn_grid.pack(fill=tk.X)
-        
-        for i, sz in enumerate(["W180", "W210", "W240", "W320", "W450", "BUDDS"]):
-            row_frm = tk.Frame(sz_btn_grid, bg=self.colors["surface"])
-            row_frm.pack(fill=tk.X, pady=2)
-            
-            ttk.Label(row_frm, text=f"[{sz}]", font=("Roboto", 12, "bold"), width=8).pack(side=tk.LEFT)
-            
-            # Re-use the existing StringVars from Pneumatics tab so both UIs update together!
-            l_var = self.sz_vars.get(f"{sz}_L", tk.StringVar(value=str(self.shared_state.size_config.get(f"{sz}_L", 15))))
-            w_var = self.sz_vars.get(f"{sz}_W", tk.StringVar(value=str(self.shared_state.size_config.get(f"{sz}_W", 10))))
-            
-            ttk.Label(row_frm, text="L(mm):").pack(side=tk.LEFT)
-            tk.Entry(row_frm, textvariable=l_var, width=5, bg=self.colors["bg"], fg="white", justify="center").pack(side=tk.LEFT, padx=(0,10))
-            ttk.Label(row_frm, text="W(mm):").pack(side=tk.LEFT)
-            tk.Entry(row_frm, textvariable=w_var, width=5, bg=self.colors["bg"], fg="white", justify="center").pack(side=tk.LEFT, padx=(0,10))
-            
-            def update_sz_cfg(*args, s=sz, lv=l_var, wv=w_var):
-                try:
-                    self.shared_state.size_config[f"{s}_L"] = float(lv.get())
-                    self.shared_state.size_config[f"{s}_W"] = float(wv.get())
-                    self.shared_state.save_to_config(CFG_PATH)
-                except (ValueError, tk.TclError): pass
-            
-            l_var.trace_add("write", update_sz_cfg)
-            w_var.trace_add("write", update_sz_cfg)
-            
-            btn = ttk.Button(row_frm, text="TEACH FROM CAMERA", command=lambda s=sz: _do_teach(s))
-            btn.pack(side=tk.LEFT, padx=10)
+        """Colour Size page in the 5-track layout: colour engines and the old OpenCV filter (left), size grades with
+        TEACH FROM CAMERA, shape limits and the last measured cashews (right). One SAVE button."""
+        import size_teach
+        F = ui.FONT
+        ss = self.shared_state
+        page = tk.Frame(self.page_container, bg=ui.BG)
+        self.pages["Colour Size"] = page
+        self.cs_vars, self.cs_engine = {}, {}
+        self._size_teach = None
+
+        bar = tk.Frame(page, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
+        bar.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
+        self.lbl_cs_saved = tk.Label(bar, text=f"Saved with the program:  {self.active_program_name}", font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.PANEL)
+        self.lbl_cs_saved.pack(side=tk.LEFT, padx=16, pady=14)
+        ui.FlatButton(bar, "SAVE COLOUR & SIZE", self._save_colour_size, kind="primary", height=40, width=260, font=(F, ui.F_BODY, "bold")).pack(side=tk.RIGHT, padx=14)
+        self.lbl_cs_unsaved = tk.Label(bar, text="", font=(F, ui.F_SMALL, "bold"), fg=ui.WARN, bg=ui.PANEL)
+        self.lbl_cs_unsaved.pack(side=tk.RIGHT, padx=10)
+
+        def card(parent, title, note_text, engines_shown, **pack):
+            box = tk.Frame(parent, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
+            box.pack(**pack)
+            head = tk.Frame(box, bg=ui.PANEL)
+            head.pack(fill=tk.X, padx=16, pady=(12, 2))
+            tk.Label(head, text=title, font=(F, ui.F_SMALL, "bold"), fg=ui.TEXT, bg=ui.PANEL).pack(side=tk.LEFT)
+            tk.Label(head, text=note_text, font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT, padx=16)
+            for name in engines_shown:
+                row = tk.Frame(box, bg=ui.PANEL)
+                row.pack(fill=tk.X, padx=16, pady=2)
+                selector = ui.Segmented(row, engines.MODES, ss.grading["engines"].get(name, engines.SHADOW), lambda mode, n=name: self._set_engine(n, mode),
+                                        colours={engines.SHADOW: ui.WARN, engines.ACTIVE: ui.GOOD, engines.OFF: ui.IDLE})
+                selector.pack(side=tk.RIGHT)
+                tk.Label(row, text=engines.ENGINES[name][0], font=(F, ui.F_SMALL, "bold"), fg=ui.TEXT, bg=ui.PANEL).pack(side=tk.LEFT)
+                count = tk.Label(row, text="", font=(F, ui.F_SMALL), fg=ui.WARN, bg=ui.PANEL)
+                count.pack(side=tk.LEFT, padx=12)
+                self.cs_engine[name] = (selector, count)
+            tk.Frame(box, bg=ui.BORDER, height=1).pack(fill=tk.X, padx=16, pady=(8, 6))
+            return box
+
+        def text(parent, value, bold=False, colour=ui.TEXT, size=ui.F_SMALL, **kw):
+            return tk.Label(parent, text=value, font=(F, size, "bold") if bold else (F, size), fg=colour, bg=parent.cget("bg"), **kw)
+
+        def entry(parent, var, width=6):
+            return tk.Entry(parent, textvariable=var, width=width, bg=ui.FIELD, fg=ui.TEXT, insertbackground=ui.TEXT, bd=0, justify="center",
+                            font=(F, -14), highlightthickness=1, highlightbackground=ui.BORDER, highlightcolor=ui.ACCENT)
+
+        def changed(*_):
+            if hasattr(self, "lbl_cs_unsaved"):
+                self.lbl_cs_unsaved.config(text="●  UNSAVED CHANGES")
+
+        def slider_row(parent, key, label, help_text, lo, hi, step, value, unit=""):
+            var = tk.StringVar(value=f"{value:g}")
+            self.cs_vars[key] = var
+            row = tk.Frame(parent, bg=ui.PANEL)
+            row.pack(fill=tk.X, padx=16, pady=(4, 0))
+            text(row, label, size=ui.F_BODY, width=22, anchor="w").pack(side=tk.LEFT)
+            text(row, unit, colour=ui.MUTED, width=6, anchor="w").pack(side=tk.RIGHT)
+            entry(row, var, 7).pack(side=tk.RIGHT, padx=8, ipady=5)
+            ui.Slider(row, var, lo, hi, step, ui.PANEL).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+            text(parent, help_text, colour=ui.MUTED, size=-11, anchor="w").pack(fill=tk.X, padx=16)
+            var.trace_add("write", changed)
+
+        body = tk.Frame(page, bg=ui.BG)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        # ── left: colour ──
+        left = card(body, "COLOUR", "dark, brown and scorched colour inside the cashew mask", ("colour", "sw_ww"),
+                    side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12))
+        text(left, "These two engines do not measure yet in this version (planned: step c2). They can be OFF or SHADOW; nothing is fired by them. "
+                   "The limits below belong to the old OpenCV filter of this machine and are kept and saved.",
+             colour=ui.WARN, size=-12, justify="left", anchor="w", wraplength=760).pack(fill=tk.X, padx=16, pady=(0, 6))
+        cv = ss.opencv_filter
+        slider_row(left, ("cv", "sw_color_thresh"), "SW colour threshold", "old filter: brightness below this counts as scorched (SW)", 0, 255, 1, cv.get("sw_color_thresh", 45))
+        slider_row(left, ("cv", "sw_defect_size_px"), "SW defect tolerance", "old filter: smaller marks are ignored", 0, 100, 1, cv.get("sw_defect_size_px", 20), "px")
+        slider_row(left, ("cv", "ww_color_thresh"), "WW colour threshold", "old filter: brightness below this is a mark on a white (WW) cashew", 0, 255, 1, cv.get("ww_color_thresh", 85))
+        slider_row(left, ("cv", "ww_defect_size_px"), "WW defect tolerance", "old filter: smaller marks are ignored", 0, 100, 1, cv.get("ww_defect_size_px", 16), "px")
+        slider_row(left, ("cv", "max_defect_px"), "Max defect area", "old filter: a larger dark area fails the view", 0, 5000, 10, cv.get("max_defect_px", 1200), "px")
+        tk.Frame(left, bg=ui.BORDER, height=1).pack(fill=tk.X, padx=16, pady=(12, 6))
+        head = tk.Frame(left, bg=ui.PANEL)
+        head.pack(fill=tk.X, padx=16)
+        text(head, "LAST CASHEWS", bold=True, colour=ui.MUTED).pack(side=tk.LEFT)
+        text(head, "measured size of the cashews decided while RUNNING", colour=ui.MUTED, size=-11).pack(side=tk.LEFT, padx=12)
+        self.cs_last_tree = ttk.Treeview(left, columns=("id", "l", "w", "a", "sol", "result"), show="headings", style="Home.Treeview", height=9)
+        for col, title, width in (("id", "ID", 110), ("l", "L mm", 70), ("w", "W mm", 70), ("a", "AREA mm2", 90), ("sol", "SOLIDITY", 80), ("result", "DECISION", 300)):
+            self.cs_last_tree.heading(col, text=title, anchor="w")
+            self.cs_last_tree.column(col, width=width, anchor="w")
+        self.cs_last_tree.pack(fill=tk.BOTH, expand=True, padx=16, pady=(6, 14))
+
+        # ── right: size & shape ──
+        right = card(body, "SIZE & SHAPE", "size grade of a GOOD cashew, broken and split pieces", ("size", "shape"), side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ready = tk.Frame(right, bg=ui.PANEL)
+        ready.pack(fill=tk.X, padx=16)
+        self.cs_ready_switch = ui.ToggleSwitch(ready, ui.PANEL, bool(ss.size_config.get("size_ready", False)), self._set_size_ready)
+        self.cs_ready_switch.pack(side=tk.LEFT)
+        self.lbl_cs_ready = text(ready, "", bold=True)
+        self.lbl_cs_ready.pack(side=tk.LEFT, padx=12)
+        self.lbl_cs_calibration = text(ready, "", colour=ui.MUTED)
+        self.lbl_cs_calibration.pack(side=tk.RIGHT)
+
+        table = tk.Frame(right, bg=ui.PANEL)
+        table.pack(fill=tk.X, padx=16, pady=(8, 0))
+        heads = ("GRADE", "L below", "W below", "L min", "L max", "W min", "W max", "AREA min", "AREA max", "TAUGHT", "")
+        for col, title in enumerate(heads):
+            text(table, title, bold=True, colour=ui.MUTED, size=-11, anchor="w").grid(row=0, column=col, sticky="w", padx=(0, 6))
+        text(table, "mm, used now", colour=ui.MUTED, size=-10).grid(row=1, column=1, columnspan=2, sticky="w")
+        text(table, "taught limits (stored; used from step c2)", colour=ui.MUTED, size=-10).grid(row=1, column=3, columnspan=6, sticky="w")
+        table.columnconfigure(9, weight=1)
+        self.cs_grade_taught, self.cs_teach_buttons = {}, {}
+        grades = ss.size_config.get("grades", {})
+        for r, grade in enumerate(size_teach.GRADES, start=2):
+            text(table, grade, bold=True, size=ui.F_BODY).grid(row=r, column=0, sticky="w", pady=3, padx=(0, 10))
+            for col, key in ((1, f"{grade}_L"), (2, f"{grade}_W")):
+                var = self.sz_vars.get(key) or tk.StringVar(value=str(ss.size_config.get(key, "")))
+                self.sz_vars[key] = var
+                self.cs_vars[("old", key)] = var
+                entry(table, var, 6).grid(row=r, column=col, padx=(0, 6), ipady=4)
+                var.trace_add("write", changed)
+            for col, key in enumerate(("l_min", "l_max", "w_min", "w_max", "a_min", "a_max"), start=3):
+                value = grades.get(grade, {}).get(key)
+                var = tk.StringVar(value="" if value is None else f"{value:g}")
+                self.cs_vars[("grade", grade, key)] = var
+                entry(table, var, 6).grid(row=r, column=col, padx=(0, 6), ipady=4)
+                var.trace_add("write", changed)
+            self.cs_grade_taught[grade] = text(table, "", colour=ui.MUTED, anchor="w")
+            self.cs_grade_taught[grade].grid(row=r, column=9, sticky="w", padx=6)
+            button = ui.FlatButton(table, "TEACH", lambda g=grade: self._size_teach_toggle(g), height=28, width=76)
+            button.grid(row=r, column=10, sticky="e")
+            self.cs_teach_buttons[grade] = button
+
+        teach = tk.Frame(right, bg=ui.PANEL)
+        teach.pack(fill=tk.X, padx=16, pady=(10, 0))
+        self.lbl_cs_teach = text(teach, "TEACH FROM CAMERA", bold=True, colour=ui.MUTED)
+        self.lbl_cs_teach.pack(side=tk.LEFT)
+        self.cs_k_var = tk.StringVar(value=f"{float(ss.size_config.get('teach_k', size_teach.K_DEFAULT)):g}")
+        entry(teach, self.cs_k_var, 5).pack(side=tk.RIGHT, ipady=4)
+        text(teach, "mean -/+ k x std,  k", colour=ui.MUTED).pack(side=tk.RIGHT, padx=8)
+        histograms = tk.Frame(right, bg=ui.PANEL)
+        histograms.pack(fill=tk.X, padx=16, pady=(6, 0))
+        self.cs_histograms = {}
+        for index, (key, title, unit) in enumerate(size_teach.KEYS):
+            histogram = ui.Histogram(histograms, title, unit, height=120)
+            histograms.columnconfigure(index, weight=1, uniform="hist")
+            histogram.config(width=120)
+            histogram.grid(row=0, column=index, sticky="ew", padx=(0, 8) if index < 2 else 0)
+            self.cs_histograms[key] = histogram
+        apply_row = tk.Frame(right, bg=ui.PANEL)
+        apply_row.pack(fill=tk.X, padx=16, pady=(8, 0))
+        self.btn_cs_apply = ui.FlatButton(apply_row, "APPLY", self._size_teach_apply, kind="primary", height=32, width=170)
+        self.btn_cs_apply.pack(side=tk.LEFT)
+        self.btn_cs_apply.set_enabled(False)
+        text(apply_row, f"Run only cashews of that grade. Needs at least {size_teach.MIN_SAMPLES} cashews. Yellow lines = the min / max that will be set.",
+             colour=ui.MUTED, size=-11).pack(side=tk.LEFT, padx=12)
+
+        tk.Frame(right, bg=ui.BORDER, height=1).pack(fill=tk.X, padx=16, pady=(12, 4))
+        text(right, "SHAPE LIMITS      DOUBLE RULE", bold=True, colour=ui.MUTED, anchor="w").pack(fill=tk.X, padx=16)
+        shape, double = ss.grading["shape"], ss.grading["double"]
+        slider_row(right, ("shape", "min_solidity"), "Min solidity", "below: SHAPE_BROKEN", 0.5, 1.0, 0.01, shape["min_solidity"])
+        slider_row(right, ("shape", "min_length_width"), "Min length / width", "below: SHAPE_SPLIT", 1.0, 2.0, 0.01, shape["min_length_width"])
+        slider_row(right, ("shape", "min_length_mm"), "Min length", "below: SHAPE_SPLIT", 5, 30, 0.5, shape["min_length_mm"], "mm")
+        slider_row(right, ("shape", "min_area_mm2"), "Min area", "below: SHAPE_TOO_SMALL", 20, 300, 5, shape["min_area_mm2"], "mm2")
+        slider_row(right, ("double", "max_single_length_mm"), "Longest single cashew", "longer in enough frames: DOUBLE (reject ejector)", 30, 70, 0.5,
+                   double["max_single_length_mm"], "mm")
+        self.lbl_cs_unsaved.config(text="")
+        self._refresh_colour_size(force=True)
+
+    def _set_size_ready(self, on):
+        """SIZE GRADES READY: off = every GOOD cashew goes to the reject ejector (SIZE_NOT_READY)."""
+        ss = self.shared_state
+        if on:
+            if not ss.size_config.get("roi_length_mm"):
+                messagebox.showwarning("Size grades", "Calibrate px per mm first: Vision ROI page, ROI length in mm, SAVE VISION SETTINGS.")
+                self.cs_ready_switch.set(False)
+                return
+            if not messagebox.askyesno("Size grades", "Switch SIZE GRADES READY on?\n\nGOOD cashews will then go to the ejector of their size grade "
+                                       "(W180 ... SW450) from the 'L below / W below' table, instead of the reject ejector.\n\n"
+                                       "Do this only after the table was checked with real cashews.", icon="warning"):
+                self.cs_ready_switch.set(False)
+                return
+        with ss.lock:
+            ss.size_config["size_ready"] = bool(on)
+        ss.save_to_config(CFG_PATH)
+        log.info("SIZE GRADES READY -> %s", bool(on))
+        self._refresh_colour_size(force=True)
+
+    def _size_teach_toggle(self, grade):
+        """TEACH on a grade row: start collecting the cashews measured from now on; a second press stops it."""
+        if self._size_teach and self._size_teach["grade"] == grade:
+            self._size_teach = None
+        else:
+            if not self.shared_state.size_config.get("roi_length_mm"):
+                messagebox.showwarning("Teach size", "Calibrate px per mm first: Vision ROI page, ROI length in mm, SAVE VISION SETTINGS.\n"
+                                                     "Without it the mm values taught here would be wrong.")
+                return
+            self._size_teach = {"grade": grade, "since": time.time()}
+        self._refresh_colour_size(force=True)
+
+    def _size_teach_samples(self):
+        import size_teach
+        if not self._size_teach:
+            return []
+        with self.shared_state.lock:
+            samples = [s for s in self.shared_state.size_samples if s["t"] >= self._size_teach["since"]]
+        return size_teach.usable(samples)
+
+    def _size_teach_k(self):
+        import size_teach
+        try:
+            return min(6.0, max(0.5, float(self.cs_k_var.get().replace(",", "."))))
+        except ValueError:
+            return size_teach.K_DEFAULT
+
+    def _size_teach_apply(self):
+        """APPLY: write mean -/+ k x std of the taught cashews into the grade's limit fields (saved with SAVE)."""
+        import size_teach
+        if not self._size_teach:
+            return
+        grade = self._size_teach["grade"]
+        result = size_teach.limits(self._size_teach_samples(), self._size_teach_k())
+        if not result:
+            return
+        for key in ("l_min", "l_max", "w_min", "w_max", "a_min", "a_max"):
+            self.cs_vars[("grade", grade, key)].set(f"{result[key]:g}")
+        self._size_taught_pending = getattr(self, "_size_taught_pending", {})
+        self._size_taught_pending[grade] = {"n": result["n"], "k": result["k"], "taught": f"{datetime.now():%d.%m %H:%M}"}
+        self._size_teach = None
+        self._refresh_colour_size(force=True)
+
+    def _save_colour_size(self):
+        """SAVE COLOUR & SIZE: old filter limits, size tables, shape limits and the double length."""
+        ss = self.shared_state
+        if ss.phase == "RUNNING":
+            messagebox.showwarning("Stop first", "Stop the machine before saving colour and size settings.")
+            return False
+        import size_teach
+        try:
+            number = lambda var: float(var.get().strip().replace(",", "."))
+            cv = {key[1]: int(number(var)) for key, var in self.cs_vars.items() if key[0] == "cv"}
+            old = {key[1]: number(var) for key, var in self.cs_vars.items() if key[0] == "old"}
+            shape = {key[1]: number(var) for key, var in self.cs_vars.items() if key[0] == "shape"}
+            double_length = number(self.cs_vars[("double", "max_single_length_mm")])
+            grades = {}
+            for grade in size_teach.GRADES:
+                row = {key: self.cs_vars[("grade", grade, key)].get().strip() for key in ("l_min", "l_max", "w_min", "w_max", "a_min", "a_max")}
+                if any(row.values()):
+                    grades[grade] = {key: float(value.replace(",", ".")) for key, value in row.items() if value}
+        except ValueError:
+            messagebox.showerror("Colour & Size", "Please check the numbers: one field is empty or not a number.")
+            return False
+        if any(v <= 0 for v in old.values()) or double_length <= 0:
+            messagebox.showerror("Colour & Size", "Sizes must be above 0.")
+            return False
+        pending = getattr(self, "_size_taught_pending", {})
+        with ss.lock:
+            ss.opencv_filter.update(cv)
+            ss.size_config.update(old)
+            stored = ss.size_config.setdefault("grades", {})
+            for grade in size_teach.GRADES:
+                if grade in grades:
+                    stored[grade] = {**{k: v for k, v in stored.get(grade, {}).items() if k in ("n", "k", "taught")}, **grades[grade], **pending.get(grade, {})}
+                else:
+                    stored.pop(grade, None)
+            ss.size_config["teach_k"] = self._size_teach_k()
+        self._size_taught_pending = {}
+        g = copy.deepcopy(ss.grading)
+        g["shape"].update(shape)
+        g["double"]["max_single_length_mm"] = double_length
+        ss.set_grading(g)                           # also writes the settings file
+        self.lbl_cs_unsaved.config(text="")
+        self.lbl_cs_saved.config(text=f"Saved {datetime.now():%H:%M:%S} with the program:  {self.active_program_name}", fg=ui.GOOD)
+        self._refresh_colour_size(force=True)
+        return True
+
+    def _refresh_colour_size(self, force=False):
+        import size_teach
+        if not hasattr(self, "cs_last_tree") or not (force or self.pages["Colour Size"].winfo_ismapped()):
+            return
+        ss = self.shared_state
+        with ss.lock:
+            modes, counts = dict(ss.grading["engines"]), dict(ss.engine_counts)
+            samples = list(ss.size_samples)[-9:]
+            size_config = copy.deepcopy(ss.size_config)
+        for name, (selector, count) in self.cs_engine.items():
+            selector.set(modes.get(name, engines.SHADOW))
+            measuring = engines.ENGINES[name][2]
+            count.config(text=("not measuring yet" if not measuring else "off" if modes.get(name) == engines.OFF
+                               else f"{'rejected' if modes.get(name) == engines.ACTIVE else 'would reject'} today: {counts.get(name, 0)}"),
+                         fg=ui.MUTED if not measuring else ui.WARN)
+        ready, calibrated = bool(size_config.get("size_ready")), bool(size_config.get("roi_length_mm"))
+        self.cs_ready_switch.set(ready)
+        self.lbl_cs_ready.config(text="SIZE GRADES READY: GOOD goes to its grade ejector" if ready else "SIZE GRADES NOT READY: every GOOD cashew goes to the reject ejector",
+                                 fg=ui.GOOD if ready else ui.WARN)
+        self.lbl_cs_calibration.config(text=f"{float(size_config.get('px_per_mm', 0)):.2f} px per mm" if calibrated else "px per mm NOT CALIBRATED (Vision ROI)",
+                                       fg=ui.MUTED if calibrated else ui.BAD)
+        rows = [(s["id"], f"{s['l']:.1f}", f"{s['w']:.1f}", f"{s['a']:.0f}", f"{s['solidity']:.2f}", s["label"]) for s in reversed(samples)]
+        if rows != getattr(self, "_cs_last_rows", None):
+            self._cs_last_rows = rows
+            self.cs_last_tree.delete(*self.cs_last_tree.get_children())
+            for row in rows:
+                self.cs_last_tree.insert("", "end", values=row)
+        pending = getattr(self, "_size_taught_pending", {})
+        teaching = self._size_teach["grade"] if self._size_teach else None
+        taught = self._size_teach_samples()
+        for grade in size_teach.GRADES:
+            info = pending.get(grade) or size_config.get("grades", {}).get(grade, {})
+            if grade == teaching:
+                label, colour = f"{len(taught)} / {size_teach.TARGET_SAMPLES} teaching now", ui.ACCENT
+            elif grade in pending:
+                label, colour = f"{info['n']} cashews, not saved yet", ui.WARN
+            elif info.get("taught"):
+                label, colour = f"{info.get('n', '?')} cashews, {info['taught']}", ui.MUTED
+            else:
+                label, colour = ("typed" if info else "not taught"), ui.MUTED
+            self.cs_grade_taught[grade].config(text=label, fg=colour)
+            self.cs_teach_buttons[grade].set_text("STOP" if grade == teaching else "TEACH")
+        k = self._size_teach_k()
+        for key, histogram in self.cs_histograms.items():
+            histogram.show([s[key] for s in taught], k)
+        enough = teaching is not None and len(taught) >= size_teach.MIN_SAMPLES
+        self.btn_cs_apply.set_enabled(enough)
+        self.btn_cs_apply.set_text(f"APPLY TO {teaching}" if teaching else "APPLY")
+        self.lbl_cs_teach.config(text=(f"TEACH {teaching}:  run only {teaching} cashews now (machine RUNNING)   "
+                                       f"{len(taught)} of {size_teach.TARGET_SAMPLES} measured") if teaching else "TEACH FROM CAMERA",
+                                 fg=ui.ACCENT if teaching else ui.MUTED)
 
     def _refresh_class_grid(self):
         try:
