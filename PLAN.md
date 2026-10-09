@@ -350,19 +350,50 @@ view). Tell me if you want strictly the backup version only. Both stay read only
 
 ### 7.4 How step (e) is done (several commits, stop after each)
 
-A full rebuild is too big for one safe commit. Each sub-step: syntax check, tests, a real screenshot of the
-pages made by the program itself, stop for your OK.
+Feature reference for (e2)-(e4): the 5-track user manual v4.2, `docs/CASHEW_X_AI_Manual_English.pdf` (copied
+from `CNN/CNN/app/manual/` on the drive; not committed, 15 MB), adapted to this machine: Inovance PLC instead
+of the TCM32 board, 2 ROIs, 40 relays. Each sub-step: syntax check, tests, real screenshots taken by the
+program itself, stop for the owner's OK.
 
 | Sub-step | Content |
 |---|---|
-| (e1) **done** | `ui_theme.py` (port of `home_ui.py`), window frame: top bar, pills, clock, EXIT / SHUTDOWN, left menu; **Home** page. Programs (recipes) are shown as NOT AVAILABLE and move to (e2). |
-| (e2) | **Relay Mapping** (Pneumatic) page, PLC test window, **Sorting Logic**, programs (recipes) |
-| (e3) | **Vision ROI**, **Colour Size** shell, **Speed** shell |
-| (e4) | Teaching CNN, Dataset Capture, Teaching YOLO, AI Model Select, Network, Info, Test Console |
+| (e1) **done** | `ui_theme.py`, top bar, pills, clock, EXIT / SHUTDOWN, left menu, **Home** |
+| (e2a) | **Logic behind the Pneumatic and Home pages** (no new page yet): delay formula `delay = distance / speed - pulse / 2` and the delay-table bug; always-reject reasons of manual B14 (LOST > 300 ms, APPEARED_AFTER_LINE, STUCK, DOUBLE longer than 45 mm); inspection engines OFF / SHADOW / ACTIVE with "would reject" logging (view rule and shape start in SHADOW); Home **ALARMS** box, **SAFETY** pill, ACKNOWLEDGE; AVG CASHEW WEIGHT (1.8 g) and kg/hr; fires today per relay |
+| (e2b) | **Pneumatic page** in the manual's layout: relay table 2 x 20 (relay -> M coil, class / grade, distance, delay, pulse, TEST, status, fires today); class chips PASS / FIRE; engine rows OFF / SHADOW / ACTIVE with "would reject today"; RECENT EJECTOR EVENTS; AVG CASHEW WEIGHT; MASTER EJECTOR; DRY-RUN; FIRE 1-40 / SEQUENCE 1-40; SAVE PNEUMATICS. **PLC diagnostics window** like the Ejector Hardware Test: connection, counters (reconnects, write timeouts, lost, blocked, dry-run, refused), relay mapping with SAVE MAPPING (password), `logs/mapping_changes.log`, COPY DIAGNOSTICS, ALL EJECTORS OFF NOW (relays 1-40 only) |
+| (e3) | **Vision ROI**: ROIs, line per ROI, **ROI length in mm -> px per mm**, gain / exposure / colour gain R G B, FFC, recorder. **Colour Size**: colour engine limits (dark spot level 0.43, min spot 0.2 mm2, biggest spot 0.7 mm2, max count 8, max dark area 4 %, views needed 2), live preview, **histogram TEACH** (mean +- k x std, k = 3), shape limits (solidity 0.75, area 100 mm2, length 16 mm, length / width 1.15), SW/WW and grade tables as shells until (c2). **Sorting Logic** in the new style. **Speed** shell. **Programs** (NEW / COPY / DELETE) |
+| (e4) | **Teaching CNN**: CAPTURE / LABEL / TRAIN, **INBOX** production capture (60 % uncertain / 30 % reject / 10 % good, 5,000 per day, never deletes), dataset warnings, validation accuracy, test set (every 10th image). **AI Model Select**: SET ACTIVE with test-set comparison and PASS / FIRE popup. **Info**, Network, Dataset Capture, Teaching YOLO, Test Console. Daily summary CSV |
 
-Rules kept: MASTER EJECTOR OFF and DRY-RUN ON at every start; nothing in the UI may reach relays 41 / 42
-except the existing CONVEYOR / FEEDER operator buttons; `innovance_plc.py` unchanged; AI FPS must not drop
-(drawn widgets are made once and cached).
+How the manual's one-valve ideas are adapted to 40 relays:
+
+- **PASS / FIRE chips.** PASS = the class counts as "no defect" (today: GOOD_CASHEW, GOOD, SW). FIRE = the class
+  is a defect; the chip shows where it goes: its relay (`R03`), or `REJECT` when it has no relay. REJECTION and
+  DOUBLE KERNEL are fixed chips to the reject relay.
+- **Inspection engines.** OFF = not measured; SHADOW = measured, "would reject" written to the log and shown,
+  **never fires**; ACTIVE = can turn a GOOD into a reject (never the other way). Engines: View (NECK seen),
+  Shape, Colour (dark spots / area), SW/WW colour, Size. All new rules start in SHADOW.
+  **Consequence for the NECK rule:** with View in SHADOW a clean cashew is GOOD again and "not rolled" is only
+  logged; it rejects only after you switch View to ACTIVE.
+- **Relay mapping in the diagnostics window** = relay number -> PLC coil (M address), the table of
+  `inovance_config.json`. M140 / M141 (conveyor, feeder) can never be given to an ejector relay. Saving goes
+  through the PLC controller's own `update_config()`; `innovance_plc.py` is not changed.
+- **Startup ejector check** stays a button (RUN RELAY CHECK, obeys DRY-RUN), not automatic (E3).
+- **Password.** The 5-track code has its supervisor password written in the source. I do not copy a password
+  into this code. The first time a protected action is used, the program asks you to set the supervisor
+  password; only a salted hash is stored in `machine_config.json` (not committed).
+
+### 7.4a Current relay mapping against the grading rules (checked 2026-10-09)
+
+Kept as it is (A02 REJECTION ... A17 BUDDS, A22-A37 the same; relays 1 and 21 reject only). Conflicts:
+
+| Mapping | Conflict | What happens today |
+|---|---|---|
+| A02 / A22 = REJECTION | The rules send REJECTION to the reject relay 1 / 21. | A02 / A22 never fire. Tell me if REJECTION should go to A02 / A22 instead. |
+| UPW has no relay | UPW is the highest defect in the priority list. | UPW goes to the reject relay as "UNDEF no relay (UPW)". |
+| A11 / A31 = SW | CNN `SW` is a "no defect" vote; SW or WW is decided by colour in (c2). | A11 / A31 fire only for a GOOD cashew with mostly SW votes whose size name has no relay. In practice: never. |
+| A12-A16 = "SW180, W180" ... | One relay for the SW and the WW grade of a size. | SW and WW of one size go to the same relay; separate SW / WW tables come in (c2). |
+| A10 / A30 = DW1 + DW2 | none (two classes may share a relay) | works; DW1 can only come from YOLO until retraining. |
+| `size_config` T1/T2 relay numbers are all 1 / 21 | Old size table pointed every grade at relay 1 / 21. | Ignored: the class -> relay mapping (A12-A17) is used. |
+| EDGECUT, DOUBLE KERNEL have no relay | intended | reject relay. |
 
 ### 7.5 Questions for step (e)
 
@@ -446,6 +477,5 @@ SW/WW by colour with teach helper, double kernel OFF with live values.
 
 ## 11. Approval
 
-Steps (c1) and (e1) are done. Next is step (e2): on "approved, start (e2)" I do (e2) only, commit, show the
-screenshots, and stop. Questions E1-E7 have proposals; without answers I follow the proposals.
+Steps (c1) and (e1) are done. (e2a) is started on the owner's word of 2026-10-09; after it I stop, then (e2b). Questions E1-E7 have proposals; without answers I follow the proposals.
 The recording (question 15) is still needed for tracker tuning and view limits.
