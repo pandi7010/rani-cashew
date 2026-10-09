@@ -4,6 +4,18 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-09 (3): 5-track UI studied; PLAN step (e) rewritten and moved before (c2)
+
+- Read (read only): `TCM_CASHEWXAI_2026-10-06/` `CLAUDE.md`, `PROJECT_HISTORY.md`, `VERSIONS.txt`, `TODO.md`,
+  the theme `home_ui.py`, the page list, and the real screenshots / mockups in `design/`.
+- `TCM_CASHEWXAI_2026-10-06/source` and `CNN/CNN/app` are the same project. `CNN/CNN/app` is 11 commits newer
+  (2026-10-07 11:27 against 00:54). Same theme, same pages.
+- `PLAN.md` section 7 now holds: which copy is which, the look to copy, the page-by-page table against this
+  grader, the split of step (e) into (e1)-(e4), and questions E1-E7 with proposals.
+- New order: (c1) done -> (e) -> (c2) -> (c3) -> (d) -> (f). No code changed in this entry.
+
+---
+
 ## 2026-10-09 (2): Step (c1) done - tracking, views, voting, grading rules, log
 
 ### What changed

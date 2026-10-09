@@ -1,7 +1,7 @@
 # PLAN v3: GSN_V21 cashew grader
 
 Date: 2026-10-09
-Status: **waiting for the owner's approval.** No code was changed for this plan.
+Status: steps (a), (b), (c1) done. **Waiting for approval of step (e) (section 7), which now comes before (c2).**
 Source: `FINAL_PROMPT.txt` (copied into this folder). It replaces every earlier prompt.
 `PLAN_TAMIL.md` (plan v2) is kept unchanged for history; where the two differ, this file wins.
 
@@ -263,15 +263,118 @@ Files: `fire_timing.py`, `speed_sources.py`; `relay_output.py` stays the only pa
   file name `time_ID_ROI_class_conf_view`, saved after colour gain, 500 per category per day (UI), stops with
   "LIMIT REACHED", nothing is deleted automatically.
 
-## 7. Step (e): UI rebuild
+## 7. Step (e): UI rebuild from the 5-track project (CASHEW X AI)
 
-Style of `CNN/CNN/app/` on the external drive (read only; it is mounted): dark blue, cyan accent, top status
-pills (CAMERA, PLC, MASTER EJECTOR, MODE, STATE), left menu, camera in the centre, START/STOP and KPI tiles on
-the right, history. Pages: Home; Relay Mapping (mapping, distance, offset, pulse, valve delay, MASTER EJECTOR,
-DRY-RUN, single-relay test); Sorting Logic (#16: priority, voting, view tuning, SW/WW + teach, grade tables,
-px_per_mm, double limits, capture limit); Speed (encoder / vision / manual, mismatch); Vision ROI (ROI1, ROI2,
-one Decision line per ROI, camera settings, recording); the existing teaching pages. Counters per relay and
-per grade; Undefined / Double / not_rolled / LATE. Branding later.
+**Order changed by the owner (2026-10-09): step (e) comes right after (c1), before (c2) and (c3).**
+New order: (c1) done -> **(e)** -> (c2) -> (c3) -> (d) -> (f). Pages whose logic comes later are built in the
+new look with what exists now; controls that do not work yet are shown greyed as `NOT AVAILABLE` (5-track rule:
+never fake a feature).
+
+### 7.1 Which copy is the real 5-track UI
+
+Both folders on the external drive are the **same project** (same git history):
+
+| Folder | Last commit | What it is |
+|---|---|---|
+| `TCM_CASHEWXAI_2026-10-06/source/` | `e1522f0`, 2026-10-07 00:54 | The backup, git tag `TCM_CASHEWXAI_v1.0`, with its documents, venv, wheels, drivers. |
+| `CNN/CNN/app/` | `f78c172`, 2026-10-07 11:27 | The same project **11 commits later** (the working folder after the backup). |
+
+The 11 later commits: Home clock + date box and pills that always fit, CLEAR HISTORY without password, bigger
+customer logo (131 x 74), FIRE ALL / SEQUENCE ALL without popup, **relay mapping in the ejector test window**
+(firmware 2.1.0, `machine_config.py`), user manual (EN / TA / HI), restore notes. Nothing was removed.
+The theme module `home_ui.py` has the same colours, fonts and sizes in both; pages are the same.
+
+So: `CNN/CNN/app/` is the **newest**; `TCM_CASHEWXAI_2026-10-06` is the documented backup one half-day older.
+Both are the real 5-track UI. **I use `TCM_CASHEWXAI_2026-10-06` as the reference, as you said, and take the
+later improvements from `CNN/CNN/app/` where they apply here** (clock/date box, pills that fit, relay mapping
+view). Tell me if you want strictly the backup version only. Both stay read only.
+
+### 7.2 Look to copy (from `home_ui.py`)
+
+- Colours: background `#0E1420`, panel `#161E2E`, border `#263044`, text `#E6EAF2`, muted `#8A94A8`, accent cyan
+  `#22B8CF`, good `#2FBF71`, warning `#F2A93B`, bad `#E5484D`, idle `#3A4558`, input field `#0B111B`.
+- Four text sizes (13 / 16 / 22 / 34 px), 8 px grid. Font: Segoe UI there; not installed here, **Roboto** is.
+- Layout: top bar 64 px (customer logo, PROGRAM box, status pills, clock + date, EXIT, SHUTDOWN), left menu
+  176 px with drawn icons and the product logo at the bottom, camera in the centre, right column 696 px.
+- Drawn widgets (Pillow, no image files): round chrome MACHINE START / STOP button with red / green glow,
+  EXIT / SHUTDOWN buttons, LEDs, status pills, KPI tiles, flat outlined buttons, toggle switch, PASS / FIRE
+  chips, OFF / SHADOW / ACTIVE segmented switch, sliders, histograms, progress bar, line chart.
+- I port `home_ui.py` into this project as `ui_theme.py` (a copy adapted for Linux fonts; the source stays
+  untouched) and rebuild every page with it. Design work does not change grading, tracking or relay logic.
+
+### 7.3 5-track pages and features against this grader (today, after step c1)
+
+| 5-track page / feature | GSN_V21 now | Plan for step (e) |
+|---|---|---|
+| **Look**: dark blue theme, drawn widgets, 176 px menu with icons, 64 px top bar | different (older slate theme, plain ttk buttons, PNG icons, 220 px menu) | rebuild all pages with the 5-track theme |
+| **Top bar**: customer logo | missing | text only until you give the logo / name (question 16) |
+| Top bar: PROGRAM box, NEW / COPY / DELETE (recipes: config + dataset per program) | missing | include (programs = full settings sets); question E1 |
+| Top bar pills: TCM VISION, TCM32, SAFETY, CONVEYOR (mm/s), STATE, MODE, EJECTOR CHECK | different (camera + PLC health text, state badge) | pills: CAMERA, PLC, MASTER EJECTOR, MODE (LIVE / DRY-RUN), CONVEYOR (speed), STATE; question E2 |
+| Top bar: clock + date, EXIT, SHUTDOWN buttons | clock only | include (SHUTDOWN asks for confirmation) |
+| Welcome screen with startup ejector check (fires every lane) | missing | **not copied as it is**: firing 40 valves at start breaks "never fire at start". Offer a manual, DRY-RUN-aware check instead; question E3 |
+| **Home**: camera with lane ROIs, rulers, decision line, flow arrows, CAM / AI fps | have (2 ROIs, line per ROI, IDs, view values) | same, new style |
+| Home: lane LED strip under the camera | missing | LED per ROI (last result); per-relay strip on the Relay page |
+| Home: round MACHINE START / STOP, state text | different (plain button) | include |
+| Home: KPI tiles TOTAL, GOOD, BAD, REJECT %, THROUGHPUT kg/hr + pcs/min, RESET COUNTERS (password) | different (detected count only; counters on Sorting Logic) | tiles: TOTAL, GOOD, UNDEFINED, REJECTION, DOUBLE, NOT ROLLED, LATE, throughput; counts per grade and per relay; question E4 |
+| Home: RECENT RESULTS (time, ID, lane, result / class, ejector result), alarms | have (ID, result, frames, relay; double click = frame detail) | same, new style, add SW/WW, size, grade columns when c2 is done |
+| **Pneumatic**: lane table (relay, delay, pulse, TEST, status, fires today) | different (40-relay table with class mapping, distance, delay; single-relay test picker) | **Relay Mapping** page: 2 x 20 relay table in the same style (class / grade, distance, offset, pulse, TEST, status, count), relay 1 / 21 "REJECT - FIXED" |
+| Pneumatic: REJECT CLASSES chips PASS / FIRE (one valve per lane) | different by design (class -> relay, many relays) | class -> relay chips per ROI replace PASS / FIRE |
+| Pneumatic: MASTER EJECTOR switch, FIRE ALL, SEQUENCE ALL, SAVE | have (plus DRY-RUN; 1-40 only) | same, new style; DRY-RUN switch beside MASTER EJECTOR |
+| Pneumatic: INSPECTION ENGINES (colour, shape, size, hybrid) OFF / SHADOW / ACTIVE, decision mode AI / COLOR ONLY, TEST ENGINES ON DATASET | missing (only the old dark-spot filter, default OFF) | engine rows shown: dark %, skin %, spots as SHADOW (logged only, as now); AI / COLOR ONLY mode `NOT AVAILABLE`; question E5 |
+| Pneumatic: RECENT EJECTOR EVENTS (time, lane, source, delay, pulse, result) | partly (result line of the last test) | include, from `relay_output` events (DRY-RUN shown as such) |
+| Pneumatic: AVG CASHEW WEIGHT for kg/hr | missing | include |
+| **Ejector hardware test window**: connection, diagnostic counters, relay mapping, ALL RELAYS OFF NOW | partly (relay test on the Pneumatic page) | PLC test window: connection, counters (sent / dry-run / offline / refused), relay 1-40 test, sequence; ALL OFF for relays 1-40 only (never conveyor / feeder) |
+| **Colour Size**: colour engine sliders, live preview with outline and spots, HOLD | missing (old threshold sliders) | page built; colour part filled by c2 (SW/WW b* slider, teach, live value) |
+| Colour Size: size grades table (L / W / AREA min-max), TEACH from camera with histograms, shape limits, LAST CASHEWS | different (old L / W numbers, auto teach) | grade tables for SW and WW with relay columns; teach with histograms; filled by c2 |
+| **Vision ROI**: lane ROIs DRAW / RESET, decision line SET / shift / orientation, RESET ALL | have (2 ROIs, line per ROI or linked, flow direction) | same, new style |
+| Vision ROI: calibration (ROI length mm -> px per mm) | missing (px_per_mm typed) | include; two-point ruler calibration comes with c2 |
+| Vision ROI: camera rotation 0 / 90 / 180 / 270 | missing | question E6 (do you need it here?) |
+| Vision ROI: gain, exposure, colour gain R / G / B, TEST IMAGE CAPTURE, FFC `NOT AVAILABLE` | have, and more (FPS limit, FFC works, recorder, test source) | same, new style |
+| **Teaching CNN**: CAPTURE / LABEL / TRAIN steps, image grid, classes with target counts, dataset warnings, inbox review, loss / accuracy charts, ACTIVATE A MODEL | partly (older page, external labeler, training without validation charts) | new layout now; working training with validation = step (f); `NOT AVAILABLE` until then where it does not work |
+| Production capture into an inbox (quotas, never deletes) | missing | this is step (d) auto capture; inbox view added then |
+| **Dataset Capture**: 20 class slots with counts, CAPTURE / VIEW, auto capture (crop / full / both) | have (older look) | same, new style |
+| **Teaching YOLO**: annotate folder, class list, dataset numbers, training, one-class option | have (older look; TCM Studio copy) | same, new style |
+| **AI Model Select**: YOLO and CNN cards with classes and accuracy, SET ACTIVE, class-change popup | partly (model list + upload) | include cards; accuracy shown only when recorded |
+| **Network**: AnyDesk, camera network, this PC and ports, connection check table | different (PLC network settings) | PLC (Modbus IP / port, state), camera (USB3, model, serial), connection check; AnyDesk block; question E7 |
+| **Info**: product, versions, hardware, software, today's numbers | missing | include, only facts the software knows |
+| Hardware lock to one PC | missing | not copied unless you ask |
+| Self-screenshot hook for checking pages without clicking | missing | include (`ui_debug.py` idea); I use it to show you each page |
+| Daily summary CSV | missing (per-cashew CSV exists) | include with the Home counters |
+| User manual, .exe build | missing | not in step (e) |
+| -- **Only this machine** -- | | |
+| Sorting Logic: voting limits, priority, view limits, live values, belt colour, tracker | have (plain look) | new style |
+| Speed panel: encoder / vision / manual side by side, mismatch warning | missing (lane speed number only) | page built in (e) with vision + manual; encoder `NOT AVAILABLE`; logic in c3 |
+| DRY-RUN, single-relay test fire | have | new style |
+| Recording and replay (test source) | have | new style |
+| Test Console page | have | kept, new style |
+
+### 7.4 How step (e) is done (several commits, stop after each)
+
+A full rebuild is too big for one safe commit. Each sub-step: syntax check, tests, a real screenshot of the
+pages made by the program itself, stop for your OK.
+
+| Sub-step | Content |
+|---|---|
+| (e1) | `ui_theme.py` (port of `home_ui.py`), window frame: top bar, pills, clock, EXIT / SHUTDOWN, left menu; **Home** page |
+| (e2) | **Relay Mapping** (Pneumatic) page, PLC test window, **Sorting Logic** |
+| (e3) | **Vision ROI**, **Colour Size** shell, **Speed** shell |
+| (e4) | Teaching CNN, Dataset Capture, Teaching YOLO, AI Model Select, Network, Info, Test Console |
+
+Rules kept: MASTER EJECTOR OFF and DRY-RUN ON at every start; nothing in the UI may reach relays 41 / 42
+except the existing CONVEYOR / FEEDER operator buttons; `innovance_plc.py` unchanged; AI FPS must not drop
+(drawn widgets are made once and cached).
+
+### 7.5 Questions for step (e)
+
+| # | Question | My proposal |
+|---|---|---|
+| E1 | Programs (recipes) in the top bar: wanted here? | Yes, as full settings sets (`programs/<name>/`), start with one program "Default" made from today's config. |
+| E2 | Pill names: the 5-track screen says TCM VISION / TCM32. Here? | CAMERA and PLC until you give the branding. |
+| E3 | Startup ejector check: it fires every valve at start. | No automatic firing. A "RUN RELAY CHECK" button that obeys DRY-RUN. |
+| E4 | Home KPI tiles: which numbers do you want biggest? | TOTAL, GOOD, UNDEFINED, REJECTION, throughput; the rest smaller. Average cashew weight for kg/hr: you give it. |
+| E5 | Inspection engines and COLOR ONLY mode from the 5-track machine: wanted here? | Not now: show measured values as SHADOW only. |
+| E6 | Camera rotation control: needed? | No (the camera is fixed and the flow direction is already settable). |
+| E7 | AnyDesk block on the Network page: wanted? Screen resolution of this machine's monitor? | Yes if AnyDesk is installed. I read the resolution from the running program. |
 
 ## 8. Step (f): training
 
@@ -334,6 +437,6 @@ SW/WW by colour with teach helper, double kernel OFF with live values.
 
 ## 11. Approval
 
-On "approved, start (c1)" I do step (c1) only, commit, report, and stop.
-Step (c1) needs answers 6-11 and the recording (15). Without the recording I can build and unit-test (c1),
-but tracker choice and view thresholds stay open.
+Step (c1) is done (`3059824`). Next is step (e1): on "approved, start (e1)" I do (e1) only, commit, show the
+screenshots, and stop. Questions E1-E7 have proposals; without answers I follow the proposals.
+The recording (question 15) is still needed for tracker tuning and view limits.
