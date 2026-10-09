@@ -49,6 +49,8 @@ SKIN_CLASSES_DEFAULT = ["TESTA", "TESTA SMALL"]
 CLASS_ALIASES = {"back cut oil": "OIL", "oil backcut": "OIL", "backcut oil": "OIL", "oil back cut": "OIL",
                  "double kernels": "DOUBLE", "double kernel": "DOUBLE", "double cashews": "DOUBLE"}
 DOUBLE_CLASS = "DOUBLE"         # CNN class "two cashews stuck together": always the reject ejector (besides the size rule)
+REJECT_CLASSES_DEFAULT = ["EDGECUT"]    # classes that always go to the reject ejector under their own name (owner, 2026-10-09)
+SIZE_NOT_READY = "SIZE_NOT_READY"       # GOOD while px per mm and the size grades are not taught yet: reject ejector
 
 
 def canonical(name):
@@ -94,7 +96,7 @@ def _blank(name) -> bool:
 def decide(votes: List[FrameVote], voting: Optional[dict] = None, priority: Optional[List[str]] = None,
            good_classes=None, skin_classes=None, combination_rules=None, double: bool = False,
            appeared_after_line: bool = False, stuck: bool = False, lost_ms: float = 0.0, max_lost_ms: float = 300.0,
-           view_engine: str = ACTIVE) -> Decision:
+           view_engine: str = ACTIVE, reject_classes=None) -> Decision:
     """view_engine: ACTIVE = GOOD needs the NECK view; SHADOW = it is only noted in `shadow`; OFF = not checked."""
     v = {**VOTING_DEFAULTS, **(voting or {})}
     priority = [normalize_name(c) for c in (priority if priority is not None else PRIORITY_DEFAULT)]
@@ -150,6 +152,9 @@ def decide(votes: List[FrameVote], voting: Optional[dict] = None, priority: Opti
     seen = {k for k, n in weighted.items() if n >= v["defect_min_frames"]}
     if normalize_name(DOUBLE_CLASS) in seen:
         return done(DOUBLE, "double_class_seen", True)
+    for name in (reject_classes if reject_classes is not None else REJECT_CLASSES_DEFAULT):
+        if normalize_name(name) in seen:
+            return done(display.get(normalize_name(name), str(name)), "reject_class_seen", True)
 
     for rule in combination_rules or []:        # owner's "these classes together -> that class" table
         wanted = [normalize_name(c) for c in rule.get("conditions", []) if not _blank(c)]

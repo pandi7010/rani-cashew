@@ -97,6 +97,35 @@ class RelayMappingTest(unittest.TestCase):
         self.assertEqual((tables[1]["alpha"], tables[2]["beta"], tables[2]["gamma"]), (19, 39, 22))
         self.assertEqual(rm.target_of(tables[1], 1, ["DELTA"]), (1, False))
 
+    def test_owner_mapping_of_2026_10_09(self):
+        m = rm.owner_mapping()
+        self.assertEqual((m[1], m[21]), ([], []))                                       # reject ejectors carry nothing
+        self.assertEqual((m[2], m[22], m[7], m[27], m[11], m[31], m[20], m[40]),
+                         (["UPW"], ["UPW"], ["DW1", "DW2"], ["DW1", "DW2"], ["W180"], ["W180"], ["SW450"], ["SW450"]))
+        self.assertEqual(rm.duplicates(m), {})
+        self.assertEqual((rm.free_relays(m, 1), rm.free_relays(m, 2)), ([], []))
+        for roi in (1, 2):
+            table = rm.lookup(m)[roi]
+            self.assertNotIn("rejection", table)                                        # REJECTION is not on A02 / A22 any more
+            for name in ("REJECTION", "EDGECUT", "DOUBLE"):
+                self.assertEqual(rm.target_of(table, roi, [name]), (rm.REJECT_RELAY[roi], False))
+        classes = ["UPW", "PKW2", "PKW1", "OIL", "BROWN", "DW2", "DW1", "TESTA", "TESTA SMALL", "WHITE_DW"]
+        self.assertEqual(rm.unassigned(m, classes, rm.GRADES_WW + rm.GRADES_SW, 1, rm.NO_FIRE_DEFAULT), [])
+        self.assertEqual(rm.unassigned(m, classes, rm.GRADES_WW + rm.GRADES_SW, 2), ["BUDDS", "SW_BUDDS"])     # without the no-fire list
+
+    def test_no_fire_grades_run_to_the_end_of_the_belt(self):
+        m, no_fire = rm.owner_mapping(), rm.NO_FIRE_DEFAULT
+        table = rm.lookup(m)[1]
+        self.assertEqual(rm.target_of(table, 1, rm.grade_candidates("WW", "BUDDS"), no_fire), (None, True))
+        self.assertEqual(rm.target_of(table, 1, rm.grade_candidates("SW", "BUDDS"), no_fire), (None, True))
+        self.assertEqual(rm.target_of(table, 1, rm.grade_candidates("SW", "W320"), no_fire), (19, True))
+        self.assertEqual(rm.target_of(table, 1, rm.grade_candidates("WW", "BUDDS")), (1, False))        # not in the list: reject
+        rows = dict((r[0], r[1:]) for r in rm.summary(m, ["UPW"], ["BUDDS", "SW_BUDDS", "W180"], no_fire))
+        self.assertEqual(rows["BUDDS"], (rm.NO_FIRE_TEXT, rm.NO_FIRE_TEXT))
+        self.assertEqual(rows["W180"], ("A11", "A31"))
+        given = rm.assign(m, 15, ["W450", "BUDDS"], move=True)                          # an ejector for it wins over "no fire"
+        self.assertEqual(rm.target_of(rm.lookup(given)[2], 2, ["BUDDS"], no_fire), (35, True))
+
     def test_the_stored_config_has_no_duplicate(self):
         with open(os.path.join(ROOT, "pneumatic_config.json"), encoding="utf-8") as f:
             mapping = json.load(f)["mapping"]

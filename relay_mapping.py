@@ -8,6 +8,7 @@ Rules (owner, 2026-10-09):
   * A class or grade without an ejector goes to the reject ejector of its ROI.
   * An ejector without a class is free and is never fired by grading.
   * ROI 2 mirrors ROI 1: ejector r in ROI 1 and r + 20 in ROI 2 (when the mirror option is used).
+  * A grade in the "no fire" list runs to the end of the belt: no ejector and not a reject (BUDDS, SW_BUDDS).
 """
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -21,6 +22,24 @@ ALL_RELAYS = range(1, 41)
 GRADES_WW = ["W180", "W210", "W240", "W320", "W450", "BUDDS"]
 GRADES_SW = ["SW180", "SW210", "SW240", "SW320", "SW450", "SW_BUDDS"]
 GROUPS = ["GOOD_CASHEW", "WW", "SW"]                    # whole-group names a grade falls back to
+NO_FIRE_DEFAULT = ["BUDDS", "SW_BUDDS"]                 # owner, 2026-10-09: end of the belt
+NO_FIRE_TEXT = "NO FIRE (end of belt)"
+# Owner's mapping of 2026-10-09 for ROI 1; ROI 2 is the same + 20. Ejector 1 / 21 = reject.
+OWNER_MAPPING_ROI1 = {2: ["UPW"], 3: ["PKW2"], 4: ["PKW1"], 5: ["OIL"], 6: ["BROWN"], 7: ["DW1", "DW2"], 8: ["WHITE_DW"],
+                      9: ["TESTA SMALL"], 10: ["TESTA"], 11: ["W180"], 12: ["W210"], 13: ["W240"], 14: ["W320"], 15: ["W450"],
+                      16: ["SW180"], 17: ["SW210"], 18: ["SW240"], 19: ["SW320"], 20: ["SW450"]}
+
+
+def owner_mapping() -> Dict[int, List[str]]:
+    """The owner's full mapping for both ROIs (ROI 2 = ROI 1 + 20)."""
+    out = {r: [] for r in ALL_RELAYS}
+    for relay, names in OWNER_MAPPING_ROI1.items():
+        out[relay], out[mirror(relay)] = list(names), list(names)
+    return out
+
+
+def _in(name, names) -> bool:
+    return normalize_name(name) in {normalize_name(n) for n in names or ()}
 
 
 def roi_of(relay: int) -> int:
@@ -149,18 +168,24 @@ def grade_candidates(colour: str, size_label: str) -> List[str]:
     return [grade_name(colour, size_label), "SW" if str(colour).upper() == "SW" else "WW", "GOOD_CASHEW", "GOOD"]
 
 
-def target_of(table: Dict[str, int], roi: int, candidates: Iterable[str]) -> Tuple[int, bool]:
-    """(ejector, assigned?) for a decided class: its ejector, or the reject ejector of the ROI when it has none."""
+def target_of(table: Dict[str, int], roi: int, candidates: Iterable[str], no_fire: Iterable[str] = ()) -> Tuple[Optional[int], bool]:
+    """(ejector, assigned?) for a decided class: its ejector, or the reject ejector of the ROI when it has none.
+    (None, True) when the class itself is in the no-fire list: it runs to the end of the belt."""
+    candidates = list(candidates)
+    if candidates and _in(candidates[0], no_fire) and normalize_name(candidates[0]) not in table:
+        return None, True
     relay = resolve(table, candidates)
     return (relay, True) if relay is not None else (REJECT_RELAY[roi], False)
 
 
-def unassigned(mapping, classes: Iterable[str], grades: Iterable[str] = (), roi: int = 1) -> List[str]:
-    """Classes and grades that have no ejector in this ROI (they go to the reject ejector)."""
+def unassigned(mapping, classes: Iterable[str], grades: Iterable[str] = (), roi: int = 1, no_fire: Iterable[str] = ()) -> List[str]:
+    """Classes and grades that have no ejector in this ROI (they go to the reject ejector). No-fire grades are not listed."""
     table = lookup(mapping)[roi]
-    out = [name for name in classes if resolve(table, [name]) is None]
+    out = [name for name in classes if resolve(table, [name]) is None and not _in(name, no_fire)]
     for grade in grades:
         colour = "SW" if grade in GRADES_SW else "WW"
+        if _in(grade, no_fire):
+            continue
         if resolve(table, [grade, colour, "GOOD_CASHEW", "GOOD"]) is None:
             out.append(grade)
     return out
@@ -179,13 +204,15 @@ def label(mapping, relay: int) -> str:
     return ", ".join(names) if names else "(free)"
 
 
-def summary(mapping, classes: Iterable[str], grades: Iterable[str] = ()) -> List[Tuple[str, str, str]]:
+def summary(mapping, classes: Iterable[str], grades: Iterable[str] = (), no_fire: Iterable[str] = ()) -> List[Tuple[str, str, str]]:
     """Rows (class / grade, ROI 1 target, ROI 2 target) for the table shown before saving."""
     tables = lookup(mapping)
     rows = []
 
     def cell(roi, candidates):
-        relay, assigned = target_of(tables[roi], roi, candidates)
+        relay, assigned = target_of(tables[roi], roi, candidates, no_fire)
+        if relay is None:
+            return NO_FIRE_TEXT
         if assigned and normalize_name(candidates[0]) not in tables[roi]:
             via = next(c for c in candidates if normalize_name(c) in tables[roi])
             return f"A{relay:02d} (via {via})"

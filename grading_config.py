@@ -19,6 +19,7 @@ def defaults() -> dict:
         "priority": list(decision.PRIORITY_DEFAULT),
         "good_classes": list(decision.GOOD_CLASSES_DEFAULT),
         "skin_classes": list(decision.SKIN_CLASSES_DEFAULT),
+        "reject_classes": list(decision.REJECT_CLASSES_DEFAULT),     # always the reject ejector, under their own name
         # View limits are the owner's: {"NECK": {"hollow": [min, max]}, ...}. Empty = every frame is OTHER.
         "views": {"rules": {view: {} for view in view_features.VIEWS}, "show_values": True},
         "segmentation": dict(segmentation.DEFAULTS),

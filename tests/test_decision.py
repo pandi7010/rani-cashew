@@ -130,7 +130,7 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual((d.result, d.frames_total, d.frames_used), (dc.GOOD, 5, 3))
 
     def test_class_outside_the_priority_list_is_undefined(self):
-        d = decide(frames(("EDGECUT", 0.9), ("EDGECUT", 0.9)))
+        d = decide(frames(("MYSTERY", 0.9), ("MYSTERY", 0.9)))
         self.assertEqual((d.result, d.reason, d.reject), (dc.UNDEFINED, dc.NOT_IN_PRIORITY, True))
 
     def test_back_cut_oil_is_graded_as_oil_and_edgecut_is_rejected(self):
@@ -140,7 +140,7 @@ class DecisionTest(unittest.TestCase):
         d = decide(frames(("TESTA", 0.9), ("TESTA", 0.9), ("BACK_CUT_OIL", 0.9), ("OIL", 0.9)))
         self.assertEqual(d.result, "UPW")                       # skin + OIL
         d = decide(frames(("EDGECUT", 0.9), ("EDGECUT", 0.9), ("GOOD_CASHEW", 0.9)))
-        self.assertEqual((d.result, d.reject), (dc.UNDEFINED, True))
+        self.assertEqual((d.result, d.reject), ("EDGECUT", True))
 
     def test_cnn_class_double_goes_to_the_reject_ejector(self):
         for name in ("DOUBLE", "DOUBLE_KERNELS", "double cashews"):
@@ -150,6 +150,12 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual(d.result, dc.GOOD)
         d = decide(frames(("DOUBLE", 0.8), ("DOUBLE", 0.8), ("UPW", 0.9), ("UPW", 0.9)))
         self.assertEqual(d.result, dc.DOUBLE)                   # before the priority list
+
+    def test_edgecut_always_goes_to_the_reject_ejector_under_its_own_name(self):
+        d = decide(frames(*GOOD3_NECK, ("EDGECUT", 0.8), ("EDGECUT", 0.7)))
+        self.assertEqual((d.result, d.reason, d.reject), ("EDGECUT", "reject_class_seen", True))
+        d = decide(frames(("EDGECUT", 0.8), ("EDGECUT", 0.8)), reject_classes=[])
+        self.assertEqual((d.result, d.reason), (dc.UNDEFINED, dc.NOT_IN_PRIORITY))
 
     def test_owner_combination_rule(self):
         rules = [{"conditions": ["PKW1", "BROWN", "", ""], "final": "DW2"}]

@@ -467,6 +467,7 @@ class SharedState:
         self.teach_belt_message = ""
         self.decision_times = deque(maxlen=5000)            # for pcs/min on the Home page
         self.capture_cfg = production_capture.merged_config()    # automatic production capture into the inbox
+        self.no_fire = list(relay_mapping.NO_FIRE_DEFAULT)        # grades that run to the end of the belt (no ejector, not a reject)
         self.good_times = deque(maxlen=5000)                # ... and kg/hr of the good output
         self.engine_counts: Dict[str, int] = {}             # engine -> "would reject" (SHADOW) or rejected (ACTIVE)
         self.belt_stopped = {1: False, 2: False}            # from the trackers
@@ -748,6 +749,7 @@ class SharedState:
                 self.line2_x_full, self.line2_y_full = cfg.get("line2_x_full"), cfg.get("line2_y_full")
                 self.grading = grading_config.merged(cfg.get("grading"))
                 self.capture_cfg = production_capture.merged_config(cfg.get("production_capture"))
+                self.no_fire = [str(n) for n in cfg.get("no_fire", relay_mapping.NO_FIRE_DEFAULT)]
                 self.flow_direction = fg.valid_flow(cfg.get("flow_direction", fg.RIGHT_TO_LEFT))
                 if "camera_source" in cfg:
                     self.camera_settings = CameraSettings.from_dict(cfg["camera_source"])
@@ -798,6 +800,7 @@ class SharedState:
                     "line2_y_full": self.line2_y_full,
                     "grading": self.grading,
                     "production_capture": self.capture_cfg,
+                    "no_fire": self.no_fire,
                     "flow_direction": self.flow_direction,
                     "camera_source": self.camera_settings.to_dict(),
                     "capture_classes": self.capture_classes,
@@ -837,7 +840,7 @@ class SharedState:
                 "grading": copy.deepcopy(self.grading),
                 "flow": self.flow_direction,
                 "mouse_x": self.mouse_x, "mouse_y": self.mouse_y,
-                "mapping_t1": self.mapping_t1.copy(), "mapping_t2": self.mapping_t2.copy(),
+                "mapping_t1": self.mapping_t1.copy(), "mapping_t2": self.mapping_t2.copy(), "no_fire": list(self.no_fire),
                 "priority_rules": list(self.priority_rules),
                 "size_config": self.size_config.copy(),
                 "class_confs": self.class_confs.copy(),
@@ -1408,7 +1411,7 @@ class ProcessingThread(threading.Thread):
                             double=engines.is_double([x["length_px"] for x in feats], px_per_mm, grading.get("double")),
                             appeared_after_line=past_at_first >= 0, stuck=trk.stuck, lost_ms=trk.max_gap_ms,
                             max_lost_ms=float(grading.get("rules", {}).get("max_lost_ms", 300.0)),
-                            view_engine=engine_mode["view"])
+                            view_engine=engine_mode["view"], reject_classes=grading.get("reject_classes"))
         # Time already gone since the line (only for a cashew first seen after it): taken off the delay.
         late_ms = (past_at_first / self.trackers[rid].lane_speed) if (past_at_first >= 0 and self.trackers[rid].lane_speed > 0) else 0.0
 
@@ -1441,9 +1444,13 @@ class ProcessingThread(threading.Thread):
             _, s_lbl = self._get_size_data(mm_length, mm_width, state["size_config"], rid)
             prefix = "sw" if sw_votes * 2 > d.good_frames else "ww"
             grade = relay_mapping.grade_name(prefix, s_lbl)
-            relay, assigned = relay_mapping.target_of(map_dict, rid, relay_mapping.grade_candidates(prefix, s_lbl))
-            label = f"GOOD {grade}"
-            if not assigned:        # a grade without an ejector goes to the reject ejector
+            relay, assigned = relay_mapping.target_of(map_dict, rid, relay_mapping.grade_candidates(prefix, s_lbl), state.get("no_fire"))
+            label = f"GOOD {grade}" + (" (no fire)" if relay is None else "")
+            if not state["size_config"].get("size_ready", False):
+                # px per mm and the size grades are not taught yet: the grade is only what it WOULD have been.
+                d.reason, d.reject = f"{decision.SIZE_NOT_READY}:{grade}", True
+                relay, label, d.result = REJECT_RELAY[rid], f"UNDEF SIZE_NOT_READY (would be {grade})", decision.UNDEFINED
+            elif not assigned:      # a grade without an ejector goes to the reject ejector
                 d.reason, d.reject = f"{decision.NOT_MAPPED}:{grade}", True
                 label, d.result = f"UNDEF no ejector ({grade})", decision.UNDEFINED
         else:
@@ -1613,7 +1620,7 @@ def _software_version() -> str:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Newton Automation | Industrial HMI")
+        self.title("TCM CASHEW X AI")
         if os.environ.get("GSN_UI_OFFSCREEN"):
             # Self-screenshot tests (ui_debug.py): a fixed 1920 x 1080 window outside the visible screen, set before the
             # window is first shown so the window manager never maximises or moves it.
@@ -1824,8 +1831,8 @@ class App(tk.Tk):
         brand = tk.Frame(top, bg=ui.PANEL, width=ui.NAV_W)      # customer logo goes here when it is given
         brand.pack(side=tk.LEFT, fill=tk.Y)
         brand.pack_propagate(False)
-        tk.Label(brand, text="NEWTON", font=(F, ui.F_BODY, "bold"), fg=ui.TEXT, bg=ui.PANEL).pack(anchor="w", padx=16, pady=(12, 0))
-        tk.Label(brand, text="AUTOMATION", font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.PANEL).pack(anchor="w", padx=16)
+        tk.Label(brand, text="TCM", font=(F, ui.F_BODY, "bold"), fg=ui.ACCENT, bg=ui.PANEL).pack(anchor="w", padx=16, pady=(12, 0))
+        tk.Label(brand, text="CASHEW X AI", font=(F, ui.F_SMALL, "bold"), fg=ui.TEXT, bg=ui.PANEL).pack(anchor="w", padx=16)
 
         right = tk.Frame(top, bg=ui.PANEL)
         right.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10))
@@ -1878,10 +1885,20 @@ class App(tk.Tk):
             self.nav_buttons[item] = btn
         foot = tk.Frame(nav_frm, bg=ui.PANEL)
         foot.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 12))
-        tk.Frame(foot, bg=ui.BORDER, height=1).pack(fill=tk.X, padx=10, pady=(0, 10))
-        tk.Label(foot, text="GSN V21", font=(F, ui.F_HEAD, "bold"), fg=ui.TEXT, bg=ui.PANEL).pack(anchor="w", padx=14)
-        tk.Label(foot, text="CASHEW GRADER", font=(F, -11, "bold"), fg=ui.ACCENT, bg=ui.PANEL).pack(anchor="w", padx=14)
-        tk.Label(foot, text=f"Software {_software_version()}", font=(F, -10), fg=ui.MUTED, bg=ui.PANEL).pack(anchor="w", padx=14, pady=(6, 0))
+        tk.Frame(foot, bg=ui.BORDER, height=1).pack(fill=tk.X, padx=10, pady=(0, 8))
+        # Product logo scaled to the menu width (the file is used as it is), then the machine name and the running commit.
+        self._logo_image = None
+        try:
+            logo = Image.open(app_paths.ASSETS_DIR / "cashew_x_ai_logo_clean.png").convert("RGB")
+            width = ui.NAV_W - 12
+            logo = logo.resize((width, max(1, round(logo.height * width / logo.width))), Image.LANCZOS)
+            self._logo_image = ImageTk.PhotoImage(logo)
+            tk.Label(foot, image=self._logo_image, bg=ui.PANEL, bd=0).pack(pady=(0, 6))
+        except Exception:
+            log.warning("Logo assets/cashew_x_ai_logo_clean.png could not be loaded; text is shown instead")
+            tk.Label(foot, text="TCM CASHEW X AI", font=(F, ui.F_BODY, "bold"), fg=ui.TEXT, bg=ui.PANEL).pack(anchor="w", padx=14)
+        tk.Label(foot, text="GSN V21", font=(F, -12, "bold"), fg=ui.TEXT, bg=ui.PANEL).pack(anchor="w", padx=14)
+        tk.Label(foot, text=f"Software {_software_version()}", font=(F, -10), fg=ui.MUTED, bg=ui.PANEL).pack(anchor="w", padx=14, pady=(1, 0))
 
         self.center_frm = tk.Frame(body_frm, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
         self.center_frm.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=16, pady=16)
@@ -4661,11 +4678,14 @@ except Exception as e:
             classes, grades = self._mapping_names()
             lines = []
             for roi in (1, 2):
-                missing = relay_mapping.unassigned(mapping, classes, grades, roi)
+                missing = relay_mapping.unassigned(mapping, classes, grades, roi, self.shared_state.no_fire)
                 if missing:
                     lines.append(f"ROI {roi} -> reject ejector A{relay_mapping.REJECT_RELAY[roi]:02d}:  " + ", ".join(missing))
-            self.lbl_map_unassigned.config(text=("NOT ASSIGNED (these go to the reject ejector)\n" + "\n".join(lines)) if lines
-                                           else "Every class and grade has an ejector.",
+            end = f"   End of belt, no fire: {', '.join(self.shared_state.no_fire) or 'none'}."
+            if not self.shared_state.size_config.get("size_ready", False):
+                end += "\nSIZE NOT READY: until px per mm and the size grades are taught, every GOOD cashew goes to the reject ejector (its grade is only logged)."
+            self.lbl_map_unassigned.config(text=("NOT ASSIGNED (these go to the reject ejector)\n" + "\n".join(lines) + "\n" + end.strip()) if lines
+                                           else "Every class and grade has an ejector." + end,
                                            fg=self.colors["warning"] if lines else self.colors["success"])
             problems = self._mapping_problems(mapping)
             self.lbl_map_problem.config(text=("SAVE IS BLOCKED\n" + "\n".join(problems)) if problems else "")
@@ -4789,6 +4809,8 @@ except Exception as e:
                 note.config(text=str(e))
                 return
             self.shared_state.set_mapping(new)
+            with self.shared_state.lock:
+                self.shared_state.no_fire = [n for n in self.shared_state.no_fire if normalize_name(n) not in {normalize_name(c) for c in chosen}]
             self._mapping_dirty = True
             self._update_all_map_labels()
             win.destroy()
@@ -4808,7 +4830,7 @@ except Exception as e:
         with self.shared_state.lock:
             mapping = relay_mapping.clean(self.shared_state.mapping_by_act)
         classes, grades = self._mapping_names()
-        rows = relay_mapping.summary(mapping, classes, grades)
+        rows = relay_mapping.summary(mapping, classes, grades, self.shared_state.no_fire)
         win = self._dialog("Class -> ejector")
         F = ui.FONT
         tk.Label(win, text="CLASS  ->  EJECTOR", font=(F, ui.F_HEAD, "bold"), fg=ui.TEXT, bg=ui.BG).pack(anchor="w", padx=20, pady=(16, 2))
