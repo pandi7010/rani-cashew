@@ -38,6 +38,10 @@
 
 - Entry point: `cashew_cnn_grader.py`. Run from anywhere; all paths come from `app_paths.py`.
 - Tests: `python3 -m unittest discover -s tests` (no camera or PLC needed).
-- Read-only references: the old project on the external drive (`/media/phoenix/00A46655A4664D6A/CNN`,
-  UI reference `CNN/CNN/app/`), `/home/phoenix/Documents/RaniVision_Latest`, `v2_snapshot/`.
+- Read-only references on the external drive (`/media/phoenix/00A46655A4664D6A`): the 5-track project
+  `TCM_CASHEWXAI_2026-10-06/` (the owner's UI reference; theme in `source/home_ui.py`, screenshots in
+  `source/design/`) and `CNN/CNN/app/` (the same project, 11 commits newer). Also
+  `/home/phoenix/Documents/RaniVision_Latest`, `v2_snapshot/`. Never modify any of them.
+- Plan: `PLAN.md` (English, current). Owner's requirements: `FINAL_PROMPT.txt`. Step order: (c1) done, then
+  (e) UI, (c2), (c3), (d), (f).
 - `external_tools/` holds unmodified copies of the TCM tools; do not edit them.
