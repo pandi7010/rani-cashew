@@ -8,6 +8,9 @@ training.py; this module is the screen.
 """
 import json
 import os
+import queue
+import time
+from collections import OrderedDict
 import subprocess
 import sys
 import threading
@@ -27,6 +30,52 @@ TINY = (hu.FONT, -11)
 TARGET = 1000
 THUMB_W, THUMB_H, COLS, ROWS = 152, 112, 5, 5
 PAGE = COLS * ROWS
+SCAN_EVERY_S = 3.0          # GSN_V21: folders are listed in the background, at most this often while the page is shown
+THUMB_CACHE = 500           # thumbnails kept in memory
+
+
+class _Background:
+    """GSN_V21: one helper thread for the slow work of the page (listing folders, moving files), in order.
+    A job returns a result that the UI thread collects with results(); the UI itself never waits for the disk."""
+
+    def __init__(self):
+        self._jobs, self._done = queue.Queue(), queue.Queue()
+        self._busy = 0
+        self._lock = threading.Lock()
+        threading.Thread(target=self._run, daemon=True, name="TeachPageWork").start()
+
+    def submit(self, job):
+        with self._lock:
+            self._busy += 1
+        self._jobs.put(job)
+
+    def _run(self):
+        while True:
+            job = self._jobs.get()
+            try:
+                self._done.put(job())
+            except Exception as exc:
+                self._done.put(("error", f"{type(exc).__name__}: {exc}"))
+            finally:
+                with self._lock:
+                    self._busy -= 1
+
+    def busy(self):
+        with self._lock:
+            return self._busy > 0
+
+    def results(self):
+        out = []
+        while True:
+            try:
+                out.append(self._done.get_nowait())
+            except queue.Empty:
+                return out
+
+    def wait(self, timeout=30.0):
+        end = time.time() + timeout
+        while self.busy() and time.time() < end:
+            time.sleep(0.005)
 PALETTE = ["#E5484D", "#F2A93B", "#2FBF71", "#4C8DF6", "#9B6CF6", "#E667AF", "#22B8CF", "#C8D04A", "#FF8A5B"]
 CAPTURES, INBOX, CONFUSION = "CAPTURES", "INBOX", "CONFUSION"      # CONFUSION: GSN_V21
 
@@ -47,6 +96,13 @@ class TeachPage:
         self._signature = None
         self._class_signature = None
         self._suggesting = False
+        # GSN_V21: nothing on this page reads a folder in the UI thread. Lists and counts come from a helper thread.
+        self._work = _Background()
+        self._data = {"source": None, "items": [], "counts": {}, "confusion": 0, "captures": 0, "loaded": False}
+        self._generation = 0            # raised by every change made here; an older folder listing is thrown away
+        self._scan_wanted, self._scan_running, self._scan_time = True, False, 0.0
+        self._thumb_cache = OrderedDict()
+        self.last_click_ms = 0.0        # how long the last label / delete click kept the UI busy
         self._build(parent)
         app.bind_all("<Key>", self._on_key, add="+")
         self.refresh(force=True)
@@ -228,14 +284,137 @@ class TeachPage:
         self.source, self.page = source, 0
         self.selected.clear()
         self.source_selector.set(source)
+        self.items = []                 # the list of the other source comes from the helper thread in a moment
+        self._data["loaded"] = False
+        self._generation += 1
         self.refresh(force=True)
 
-    def _load_items(self):
-        if self.source == INBOX:
+    def _load_items(self, source=None):
+        """The image list of a source, read from the disk (helper thread, or the self-test)."""
+        source = source or self.source
+        if source == INBOX:
             return ops.list_inbox(self.inbox_dir())
-        if self.source == CONFUSION:
+        if source == CONFUSION:
             return ops.list_confusion(self.dataset_dir())
         return [{"path": path, "suggested": "", "confidence": 0.0} for path in ops.list_images(self.golden_dir)]
+
+    # ------------------------------------------------------------------ GSN_V21: background listing
+    def _request_scan(self):
+        """List the shown source and count the classes in the helper thread (never in the UI thread)."""
+        if self._scan_running:
+            self._scan_wanted = True
+            return
+        self._scan_running, self._scan_wanted, self._scan_time = True, False, time.time()
+        source, generation, dataset_dir, golden_dir = self.source, self._generation, self.dataset_dir(), self.golden_dir
+
+        def job():
+            items = self._load_items(source)
+            try:
+                captures = len(items) if source == CAPTURES else sum(1 for f in os.listdir(golden_dir) if f.lower().endswith(ops.IMAGE_TYPES))
+            except OSError:
+                captures = 0
+            os.makedirs(dataset_dir, exist_ok=True)
+            return ("scan", generation, {"source": source, "items": items, "counts": ops.class_counts(dataset_dir),
+                                          "confusion": len(items) if source == CONFUSION else ops.confusion_count(dataset_dir),
+                                          "captures": captures, "loaded": True})
+        self._work.submit(job)
+        self._poll_soon()
+
+    def _poll_soon(self):
+        if not getattr(self, "_polling", False):
+            self._polling = True
+            self.app.after(40, self._poll)
+
+    def _poll(self):
+        self._polling = False
+        try:
+            self.refresh()
+        except tk.TclError:
+            return
+        if self._work.busy() or self._scan_running:
+            self._poll_soon()
+
+    def _take_results(self):
+        """Apply what the helper thread finished (UI thread). True when the shown data changed."""
+        changed = False
+        for result in self._work.results():
+            kind = result[0]
+            if kind == "scan":
+                self._scan_running = False
+                _, generation, data = result
+                if generation == self._generation and data["source"] == self.source:
+                    self._data, self.items, changed = data, data["items"], True
+                else:
+                    self._scan_wanted = True        # the folders were changed meanwhile: list again
+            elif kind == "moved":
+                _, action, moves = result
+                self.changes.add(action, moves)
+                self._scan_wanted = True
+            elif kind == "error":
+                print(f"[TEACH] {result[1]}")
+                self._scan_running = False
+                self._scan_wanted = True
+        return changed
+
+    def wait_idle(self, timeout=30.0):
+        """Wait until every file move and folder listing is finished and shown (UNDO, tests)."""
+        end = time.time() + timeout
+        while time.time() < end:
+            self._work.wait(timeout)
+            self._take_results()
+            if self._scan_wanted and not self._scan_running:
+                self._request_scan()
+                continue
+            if not self._work.busy() and not self._scan_running:
+                break
+        self.refresh(force=True, scan=False)
+
+    def invalidate(self):
+        """Something outside this page moved images (review windows, import): list the folders again."""
+        self._generation += 1
+        self._scan_wanted = True
+        self._class_signature = None
+
+    def _thumbnail(self, path):
+        """Small picture of an image, from memory when it was shown before."""
+        photo = self._thumb_cache.get(path)
+        if photo is not None:
+            self._thumb_cache.move_to_end(path)
+            return photo
+        try:
+            image = Image.open(path)
+            image.draft("RGB", (THUMB_W * 2, THUMB_H * 2))           # JPEG: decoded small, much faster for full frames
+            image = image.convert("RGB")
+            image.thumbnail((THUMB_W, THUMB_H), Image.Resampling.LANCZOS)
+            canvas = Image.new("RGB", (THUMB_W, THUMB_H), hu.rgb("#0A1626"))
+            canvas.paste(image, ((THUMB_W - image.width) // 2, (THUMB_H - image.height) // 2))
+            photo = ImageTk.PhotoImage(canvas)
+        except Exception:
+            return ImageTk.PhotoImage(Image.new("RGB", (THUMB_W, THUMB_H), hu.rgb(hu.FIELD)))
+        self._thumb_cache[path] = photo
+        while len(self._thumb_cache) > THUMB_CACHE:
+            self._thumb_cache.popitem(last=False)
+        return photo
+
+    def _change_view(self, removed_paths, class_name=None):
+        """Show a label / delete at once: the images leave the grid and the class count rises; the files follow."""
+        gone = set(removed_paths)
+        self._generation += 1
+        self.items = [item for item in self.items if item["path"] not in gone]
+        self._data["items"] = self.items
+        if self.source == CAPTURES:
+            self._data["captures"] = len(self.items)
+        if self.source == CONFUSION:
+            self._data["confusion"] = len(self.items)
+        if class_name:
+            counts = dict(self._data["counts"])
+            counts[class_name] = counts.get(class_name, 0) + len(gone)
+            self._data["counts"] = counts
+        for path in gone:
+            self._thumb_cache.pop(path, None)
+        self.selected.clear()
+        self._class_signature = None
+        self.refresh(force=True, scan=False)
 
     def _page_items(self):
         return self.items[self.page * PAGE:(self.page + 1) * PAGE]
@@ -246,15 +425,19 @@ class TeachPage:
         return (item["suggested"], item["confidence"]) if item.get("suggested") else None
 
     # ------------------------------------------------------------------ drawing
-    def refresh(self, force=False):
-        """Reload the image list and redraw when something changed (called from the UI loop while the page is shown)."""
-        items = self._load_items()
-        signature = (self.source, len(items), items[0]["path"] if items else "", self.page, len(self.suggestions))
-        if force or signature != self._signature:
-            self.items = items
+    def refresh(self, force=False, scan=True):
+        """Redraw from what is known (called from the UI loop while the page is shown). The folders themselves are
+        listed by the helper thread: at most every few seconds, and right after a change."""
+        changed = self._take_results()
+        stale = time.time() - self._scan_time > SCAN_EVERY_S
+        if scan and (self._scan_wanted or force or stale or self._class_signature is None):
+            self._request_scan()
+        items = self.items
+        signature = (self.source, len(items), items[0]["path"] if items else "", self.page, len(self.suggestions), self._data["loaded"])
+        if force or changed or signature != self._signature:
             pages = max(1, (len(items) + PAGE - 1) // PAGE)
             self.page = max(0, min(self.page, pages - 1))
-            self._signature = (self.source, len(items), items[0]["path"] if items else "", self.page, len(self.suggestions))
+            self._signature = (self.source, len(items), items[0]["path"] if items else "", self.page, len(self.suggestions), self._data["loaded"])
             self.selected &= {item["path"] for item in items}
             self._draw_gallery()
         self._draw_classes()
@@ -266,7 +449,8 @@ class TeachPage:
         self._thumbs, self._cells = [], {}
         page_items = self._page_items()
         if not page_items:
-            text = ("The CONFUSION folder is empty." if self.source == CONFUSION else
+            text = ("loading ..." if not self._data["loaded"] else
+                    "The CONFUSION folder is empty." if self.source == CONFUSION else
                     "The inbox is empty. Production capture fills it while the machine runs." if self.source == INBOX
                     else "No unlabelled captures. Use START AUTO CAPTURE or SNAPSHOT.")
             tk.Label(self.grid, text=text, font=SMALL, fg=hu.MUTED, bg=hu.PANEL).grid(row=0, column=0, columnspan=COLS, pady=60)
@@ -274,14 +458,7 @@ class TeachPage:
             path = item["path"]
             cell = tk.Frame(self.grid, bg=hu.PANEL, highlightthickness=2, highlightbackground=hu.BORDER, cursor="hand2")
             cell.grid(row=index // COLS, column=index % COLS, padx=5, pady=4)
-            try:
-                image = Image.open(path).convert("RGB")
-                image.thumbnail((THUMB_W, THUMB_H), Image.Resampling.LANCZOS)
-                canvas = Image.new("RGB", (THUMB_W, THUMB_H), hu.rgb("#0A1626"))
-                canvas.paste(image, ((THUMB_W - image.width) // 2, (THUMB_H - image.height) // 2))
-                photo = ImageTk.PhotoImage(canvas)
-            except Exception:
-                photo = ImageTk.PhotoImage(Image.new("RGB", (THUMB_W, THUMB_H), hu.rgb(hu.FIELD)))
+            photo = self._thumbnail(path)
             self._thumbs.append(photo)
             picture = tk.Label(cell, image=photo, bg="#0A1626", bd=0, cursor="hand2")
             picture.pack()
@@ -305,11 +482,10 @@ class TeachPage:
         self.lbl_selected.config(text=f"{len(self.selected)} selected" if self.selected else "")
 
     def _draw_classes(self):
-        dataset_dir = self.dataset_dir()
-        os.makedirs(dataset_dir, exist_ok=True)
-        counts = ops.class_counts(dataset_dir)
-        colours = self._colours()
-        confusion = ops.confusion_count(dataset_dir)
+        counts, confusion = self._data["counts"], self._data["confusion"]
+        if getattr(self, "_colour_cache", None) is None or self._class_signature is None:
+            self._colour_cache = self._colours()
+        colours = self._colour_cache
         signature = (tuple(counts.items()), self.active_class, tuple(sorted(colours.items())), confusion)
         if signature == self._class_signature:
             return
@@ -364,7 +540,7 @@ class TeachPage:
         total = len(self.items)
         pages = max(1, (total + PAGE - 1) // PAGE)
         self.lbl_page.config(text=f"page {self.page + 1 if total else 0} of {pages if total else 0}")
-        unlabelled = len(ops.list_images(self.golden_dir)) if self.source != CAPTURES else total
+        unlabelled = self._data["captures"] if self.source != CAPTURES else total
         self.lbl_unlabelled.config(text=f"{unlabelled} unlabelled" if unlabelled else "all labelled",
                                    fg=hu.WARN if unlabelled else hu.GOOD)
         self.mode_selector.set(self.mode_names.get(app.capture_mode_var.get(), "CROP"))
@@ -482,7 +658,7 @@ class TeachPage:
         new_page = max(0, min(pages - 1, self.page + step))
         if new_page != self.page:
             self.page = new_page
-            self.refresh(force=True)
+            self.refresh(force=True, scan=False)
 
     def _on_key(self, event):
         """1-9 labels the selected images, arrows / PgUp / PgDn turn the page. Only on this page, not while typing."""
@@ -507,16 +683,25 @@ class TeachPage:
             self._draw_classes()
 
     def label_selected(self, class_name):
-        """Move the selected images into the class folder. Inbox images count for the test set rule (every 10th)."""
+        """Move the selected images into the class folder. Inbox images count for the test set rule (every 10th).
+        GSN_V21: the page changes at once; the files are moved by the helper thread (UNDO waits for it)."""
+        started = time.perf_counter()
         paths = [item["path"] for item in self.items if item["path"] in self.selected]
-        moves = ops.confirm_images(paths, class_name, self.dataset_dir(), self.testset_dir(), use_testset=self.source == INBOX)
-        self.changes.add(f"{'RE-LABEL from CONFUSION' if self.source == CONFUSION else 'LABEL'} as {class_name}", moves)
-        self.selected.clear()
+        if not paths:
+            return
+        source, dataset_dir, testset_dir = self.source, self.dataset_dir(), self.testset_dir()
+        action = f"{'RE-LABEL from CONFUSION' if source == CONFUSION else 'LABEL'} as {class_name}"
         self.active_class = class_name
-        if self.source == INBOX:
-            self.app.processing_thread.capture.refresh_inbox()
-        self._class_signature = None
-        self.refresh(force=True)
+        self._change_view(paths, class_name)
+
+        def job():
+            moves = ops.confirm_images(paths, class_name, dataset_dir, testset_dir, use_testset=source == INBOX)
+            if source == INBOX:
+                self.app.processing_thread.capture.refresh_inbox()
+            return ("moved", action, moves)
+        self._work.submit(job)
+        self._poll_soon()
+        self.last_click_ms = 1000.0 * (time.perf_counter() - started)
 
     def confirm_page(self):
         """Inbox: accept the suggested class for every image on this page whose suggestion is an existing class."""
@@ -534,23 +719,28 @@ class TeachPage:
         if not messagebox.askyesno("Confirm page", f"Move {total} images into the dataset as suggested?\n\n{summary}\n\n"
                                                    "Look at the page first: the suggestion is the machine's opinion, not a checked label."):
             return
-        moves = []
+        dataset_dir, testset_dir = self.dataset_dir(), self.testset_dir()
         for name, paths in plan.items():
-            moves += ops.confirm_images(paths, name, self.dataset_dir(), self.testset_dir(), use_testset=True)
-        self.changes.add("CONFIRM PAGE AS SUGGESTED", moves)
-        self.selected.clear()
-        self.app.processing_thread.capture.refresh_inbox()
-        self._class_signature = None
-        self.refresh(force=True)
+            self._change_view(paths, name)
+
+        def job():
+            moves = []
+            for name, paths in plan.items():
+                moves += ops.confirm_images(paths, name, dataset_dir, testset_dir, use_testset=True)
+            self.app.processing_thread.capture.refresh_inbox()
+            return ("moved", "CONFIRM PAGE AS SUGGESTED", moves)
+        self._work.submit(job)
+        self._poll_soon()
 
     def undo(self):
         """Multi-step undo: every press takes back one more move or delete (also those made in the review windows)."""
+        self.wait_idle()                # moves still on their way are finished first
         result = self.changes.undo()
         if result is None:
             self.lbl_selected.config(text="nothing to undo")
             return
-        self._class_signature = None
-        self.refresh(force=True)
+        self.invalidate()
+        self.wait_idle()
         self.lbl_selected.config(text=f"UNDO {result[0]}: {result[1]} image(s) put back")
 
     def delete_selected(self):
@@ -559,12 +749,16 @@ class TeachPage:
         if not messagebox.askyesno("Delete images", f"Delete {len(self.selected)} selected image(s)?\n\nUNDO brings them back (they are kept in the trash folder of the program).",
                                    icon="warning"):
             return
-        self.changes.add("DELETE", ops.trash_images(sorted(self.selected), self.dataset_dir()))
-        self._class_signature = None
-        self.selected.clear()
-        if self.source == INBOX:
-            self.app.processing_thread.capture.refresh_inbox()
-        self.refresh(force=True)
+        paths, source, dataset_dir = sorted(self.selected), self.source, self.dataset_dir()
+        self._change_view(paths)
+
+        def job():
+            moves = ops.trash_images(paths, dataset_dir)
+            if source == INBOX:
+                self.app.processing_thread.capture.refresh_inbox()
+            return ("moved", "DELETE", moves)
+        self._work.submit(job)
+        self._poll_soon()
 
     def clear_inbox(self):
         total = len(ops.list_inbox(self.inbox_dir()))
@@ -578,6 +772,7 @@ class TeachPage:
         removed = ops.clear_inbox(self.inbox_dir())
         self.app.processing_thread.capture.refresh_inbox()
         self.selected.clear()
+        self.invalidate()
         self.refresh(force=True)
         messagebox.showinfo("Clear inbox", f"{removed} images deleted.")
 
@@ -640,6 +835,7 @@ class TeachPage:
             self._draw_classes()
 
     def _after_class_change(self):
+        self.invalidate()
         try:
             import recipe_manager
             recipe_manager.generate_data_yaml(self.app.active_program_name)
@@ -665,7 +861,7 @@ class TeachPage:
         def run():
             try:
                 result = training.predict_images(model_path, paths)
-                self.app.after(0, lambda: (self.suggestions.update(result), self.refresh(force=True)))
+                self.app.after(0, lambda: (self.suggestions.update(result), self.refresh(force=True, scan=False)))
             except Exception as exc:
                 message = f"{type(exc).__name__}: {exc}"
                 self.app.after(0, lambda: messagebox.showerror("AI suggest", f"The active CNN could not be run:\n{message}"))

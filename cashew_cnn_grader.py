@@ -7,6 +7,13 @@ Instant Fire Grader - Final Master Release
 from datetime import datetime
 import os
 
+# The desktop's input method (IBus) answers for every window Tk creates. On this machine that made the first opening
+# of a page take seconds (6 s for 420 widgets instead of 0.06 s) and could stall the program when a window was closed.
+# The grader only needs plain keyboard input, so the input method is switched off for this program (and the tools it
+# starts). Must be set before Tk starts. GSN_KEEP_INPUT_METHOD=1 keeps it.
+if not os.environ.get("GSN_KEEP_INPUT_METHOD"):
+    os.environ["XMODIFIERS"] = "@im=none"
+
 import sys
 import shutil
 import time
@@ -43,6 +50,8 @@ import ejector_check_ui
 import production_capture
 import undefined_capture
 import colour_size
+import perf
+from concurrent.futures import ThreadPoolExecutor
 import dataset_ops
 import relay_mapping
 import decision
@@ -463,6 +472,7 @@ class SharedState:
         self.grading = grading_config.defaults()
         self.result_counts: Dict[str, int] = {}
         self.recent_decisions = OrderedDict()               # cashew ID -> text with its frame-by-frame votes
+        self.recent_cashew_frames = OrderedDict()           # cashew ID -> structured frames with crops and concluding info
         self.size_samples = deque(maxlen=400)               # measured size of every decided cashew (Colour Size page, teach)
         self.view_live = {1: "", 2: ""}                     # latest measured values per ROI (view tuning)
         self.view_thumb = {}                                # ROI -> small picture of that cashew (BGR)
@@ -564,7 +574,7 @@ class SharedState:
             self.line_pixel_callback(txt, pos)
 
     # ── grading: counters, decision details, belt colour teach ──
-    def add_decision(self, track_id: str, label: str, frames_txt: str, relay: int, count_keys, detail: str, row=None):
+    def add_decision(self, track_id: str, label: str, frames_txt: str, relay: int, count_keys, detail: str, row=None, cashew_frames=None):
         """row = (class, SW / WW, colour value, length mm, grade) for the RECENT RESULTS table."""
         with self.lock:
             shown = row or (label, "-", "-", "-", "-")
@@ -572,6 +582,10 @@ class SharedState:
             for key in count_keys:
                 self.result_counts[key] = self.result_counts.get(key, 0) + 1
             self.recent_decisions[track_id] = detail
+            if cashew_frames is not None:
+                self.recent_cashew_frames[track_id] = cashew_frames
+                while len(self.recent_cashew_frames) > 200:
+                    self.recent_cashew_frames.popitem(last=False)
             now = time.time()
             self.decision_times.append(now)
             accepted = label.startswith("GOOD") or "(PASS) ->" in label
@@ -607,6 +621,7 @@ class SharedState:
         with self.lock:
             self.result_counts = {}
             self.engine_counts = {}
+            self.recent_cashew_frames.clear()
 
     def set_grading(self, grading: dict):
         with self.lock: self.grading = grading_config.merged(grading)
@@ -844,6 +859,16 @@ class SharedState:
             self.mapping_by_act = relay_mapping.clean(mapping)
             self._rebuild_processing_map()
 
+    def _grading_snapshot(self):
+        """A private copy of the grading settings for the grading thread. Copying the whole tree for every frame cost
+        time, so the copy is reused until the settings change (set_grading) or 0.3 s have passed. Call with the lock held."""
+        now = time.time()
+        cached = getattr(self, "_grading_cache", None)
+        if cached is None or cached[0] is not self.grading or now - cached[1] > 0.3:
+            cached = (self.grading, now, copy.deepcopy(self.grading))
+            self._grading_cache = cached
+        return cached[2]
+
     def get_processing_state(self) -> Dict[str, Any]:
         with self.lock:
             return {
@@ -853,7 +878,7 @@ class SharedState:
                 "line_pos": self.line_x_full if self.line_is_vertical else self.line_y_full,
                 "line_pos2": self.line_pos_for(2),
                 "link_lines": self.link_lines,
-                "grading": copy.deepcopy(self.grading),
+                "grading": self._grading_snapshot(),
                 "flow": self.flow_direction,
                 "mouse_x": self.mouse_x, "mouse_y": self.mouse_y,
                 "mapping_t1": self.mapping_t1.copy(), "mapping_t2": self.mapping_t2.copy(), "no_fire": list(self.no_fire),
@@ -936,6 +961,11 @@ class ProcessingThread(threading.Thread):
         # Every Undefined / lost / double cashew: all views + the full frame into captures/<undefined|double>/<date>/
         self.undefined_capture = undefined_capture.UndefinedCapture(app_paths.CAPTURES_DIR)
         self._box_areas = {1: deque(maxlen=40), 2: deque(maxlen=40)}      # box size of real cashews per ROI (noise filter)
+        self.perf = perf.Stages()           # ms per frame of every stage of the loop (Info page, tools/profile_grader.py)
+        self._last_shown = 0.0
+        self._perf_logged, self.last_perf = time.time(), None
+        # Masks, features and CNN crops of the cashews of one frame are made side by side (OpenCV releases the GIL).
+        self._pool = ThreadPoolExecutor(max_workers=self.WORKERS, thread_name_prefix="Measure")
         self._clean_frame = None
         self.frame_time = time.time()
         self.ai_fps, self._ai_count, self._ai_since = 0.0, 0, time.time()   # frames graded per second
@@ -1068,11 +1098,13 @@ class ProcessingThread(threading.Thread):
                 frame_full, w, h = data[0], data[1], data[2]
                 self.frame_time = data[3] if len(data) > 3 else time.time()    # when the camera took the frame
                 if frame_full is None: continue
+                pt = self.perf.start()
                 
                 with self.shared_state.lock:
-                    self.shared_state.frame = frame_full.copy()
+                    self.shared_state.frame = frame_full     # never drawn on (the screen picture is a copy): no copy needed
                 
                 state = self.shared_state.get_processing_state()
+                pt = self.perf.lap("frame copy + settings", pt)
                 
                 g = max(0.1, state["gain"] * state["a_gain"] * state["d_gain"])
                 r, gr, b = max(0.1, state["r"]), max(0.1, state["g"]), max(0.1, state["b"])
@@ -1127,33 +1159,43 @@ class ProcessingThread(threading.Thread):
                 
                 if state["phase"] == "RUNNING" and self.model and (state["roi1"] or state["roi2"]):
                     # Don't draw rulers here, just process it directly to save massive amounts of CPU on the 5MP frame
-                    frame_drawn = self._process_frame(frame_full, state)
+                    # The screen picture is made at most DISPLAY_FPS times per second; every frame is graded.
+                    show = time.time() - self._last_shown >= 1.0 / self.DISPLAY_FPS
+                    frame_drawn = self._process_frame(frame_full, state, draw=show)
+                    pt = self.perf.start()
+                    self.perf.frame()
                     self._ai_count += 1
+                    if time.time() - self._perf_logged >= 30.0:      # every 30 s while RUNNING: where the frame time goes
+                        self._perf_logged = time.time()
+                        self.last_perf = self.perf.report(reset=True)
+                        if self.last_perf["frames"]:
+                            log.info("LOOP %s", perf.Stages.text(self.last_perf))
                     if time.time() - self._ai_since >= 1.0:
                         self.ai_fps = self._ai_count / (time.time() - self._ai_since)
                         self._ai_count, self._ai_since = 0, time.time()
                     
-                    # Crop and stack only the ROIs for the GUI display!
-                    crops_to_show = []
-                    if state["roi1"]:
-                        rx1, ry1, rx2, ry2 = state["roi1"]
-                        crops_to_show.append(frame_drawn[ry1:ry2, rx1:rx2])
-                    if state["roi2"]:
-                        rx1, ry1, rx2, ry2 = state["roi2"]
-                        crops_to_show.append(frame_drawn[ry1:ry2, rx1:rx2])
-                        
-                    if len(crops_to_show) > 0:
-                        display_img, _ = fg.stack_crops(crops_to_show)
-                    else:
-                        display_img = frame_drawn
-                        
-                    display_frame, scale, x_off, y_off = resize_letterbox(display_img, VIDEO_PANE_W, VIDEO_PANE_H, bg_color=BG_COLOR)
-                    geometry = {"scale": scale, "x_off": x_off, "y_off": y_off, "orig_w": w, "orig_h": h}
+                    if show:
+                        self._last_shown = time.time()
+                        # Crop and stack only the ROIs for the GUI display!
+                        crops_to_show = []
+                        if state["roi1"]:
+                            rx1, ry1, rx2, ry2 = state["roi1"]
+                            crops_to_show.append(frame_drawn[ry1:ry2, rx1:rx2])
+                        if state["roi2"]:
+                            rx1, ry1, rx2, ry2 = state["roi2"]
+                            crops_to_show.append(frame_drawn[ry1:ry2, rx1:rx2])
+                        display_img = fg.stack_crops(crops_to_show)[0] if crops_to_show else frame_drawn
+                        display_frame, scale, x_off, y_off = resize_letterbox(display_img, VIDEO_PANE_W, VIDEO_PANE_H, bg_color=BG_COLOR)
+                        geometry = {"scale": scale, "x_off": x_off, "y_off": y_off, "orig_w": w, "orig_h": h}
+                    self.perf.lap("picture for the screen", pt)
                 else:
                     for tracker in self.trackers.values():
                         tracker.clear()
                     self.ai_fps = 0.0
                     self._tracking_reset.clear()
+                    if time.time() - self._last_shown < 1.0 / self.DISPLAY_FPS:
+                        continue                # STOPPED: nothing to grade; the picture is redrawn 15 times per second
+                    self._last_shown = time.time()
                     frame_drawn = draw_rulers(frame_full.copy())
                     self._draw_setup_overlays(frame_drawn, state)
                     
@@ -1165,6 +1207,8 @@ class ProcessingThread(threading.Thread):
                     display_frame, scale, x_off, y_off = resize_letterbox(frame_drawn, VIDEO_PANE_W, VIDEO_PANE_H, bg_color=BG_COLOR)
                     geometry = {"scale": scale, "x_off": x_off, "y_off": y_off, "orig_w": w, "orig_h": h}
 
+                if display_frame is None:       # graded, not shown (the screen keeps its last picture)
+                    continue
                 try: self.display_queue.get_nowait() 
                 except queue.Empty: pass
                 
@@ -1258,25 +1302,40 @@ class ProcessingThread(threading.Thread):
             else:
                 cv2.line(frame, (roi[0], int(pos)), (roi[2], int(pos)), LINE_COLOR, thickness)
 
-    def _process_frame(self, frame, state):
+    DISPLAY_FPS = 15.0          # screen pictures per second while RUNNING (grading uses every frame)
+    WORKERS = 4                 # threads for masks / features / CNN crops of the cashews of one frame
+
+    def _map(self, function, items):
+        """function over the items, side by side when there are several (same results, same order)."""
+        items = list(items)
+        if len(items) < 2:
+            return [function(item) for item in items]
+        return list(self._pool.map(function, items))
+
+    def _process_frame(self, frame, state, draw=True):
         """One frame: YOLO finds the cashews, the CNN classifies every crop, each ROI's tracker gives the
-        cashew its ID, every frame adds a vote, and ONE decision is made when the centroid crosses the line."""
+        cashew its ID, every frame adds a vote, and ONE decision is made when the centroid crosses the line.
+        draw=False: graded exactly the same, but no picture for the screen is made (returns None)."""
         t_ms = float(self.frame_time) * 1000.0          # when the camera took the frame
         if self._tracking_reset.is_set():               # a new YOLO model was applied
             self._tracking_reset.clear()
             for tracker in self.trackers.values():
                 tracker.clear()
 
-        clean_frame = frame.copy()                      # for inference and saved images (no overlay)
+        pt = self.perf.start()
+        clean_frame = frame                             # for inference and saved images: never drawn on
+        frame = clean_frame.copy() if draw else None    # the copy that gets the overlay for the screen
         self._clean_frame = clean_frame
         self._live_size_cfg = state["size_config"]
         flow, grading = state["flow"], state["grading"]
         lines = {1: state["line_pos"], 2: state.get("line_pos2")}
-        self._draw_lines(frame, state, 2)
+        if draw:
+            self._draw_lines(frame, state, 2)
 
         rois = [(rid, roi) for rid, roi in ((1, state.get("roi1")), (2, state.get("roi2"))) if roi]
         found = {rid: ([], [], []) for rid, _ in rois}  # ROI -> boxes, YOLO class IDs, YOLO confidences
 
+        pt = self.perf.lap("frame copy + settings", pt)
         with self.model_lock:
             if self.model is not None:
                 crops, owners = [], []
@@ -1302,15 +1361,30 @@ class ProcessingThread(threading.Thread):
                         found[rid][1].append(int(box.cls[0].cpu().numpy()))
                         found[rid][2].append(float(box.conf[0].cpu().numpy()))
 
+        pt = self.perf.lap("YOLO", pt)
+        # Pass 1: where every box is (mask centroid, tight box) and which cashew it belongs to (tracker).
+        located, target_conf = {}, float(state.get("target_conf", 0.30))
         for rid, roi in rois:
             boxes, classes, confs = merge_boxes_area_rule(*found[rid])
-            detections = [self._measure_detection(clean_frame, box, cid, conf, roi, state, t_ms)
-                          for box, cid, conf in zip(boxes, classes, confs)]
+            detections = self._map(lambda job, roi=roi: self._locate_detection(clean_frame, job[0], job[1], job[2], roi, state, t_ms),
+                                   zip(boxes, classes, confs))
+            pt = self.perf.lap("mask + tight box", pt)
             for det in detections:
-                det.weak = det.data["yolo_conf"] < float(state.get("target_conf", 0.30))
+                det.weak = det.data["yolo_conf"] < target_conf
             tracker = self.trackers[rid]
             tracker.params = {**tracker.params, **grading.get("tracker", {})}
             tracks = tracker.update(detections, t_ms, flow, roi)
+            pt = self.perf.lap("tracker", pt)
+            located[rid] = (detections, tracks, tracker)
+        # Pass 2: view / colour / size features and the CNN class, in one go for both ROIs, and only for the boxes of
+        # cashews that still have to be decided (not for faint boxes without a cashew, not after the decision).
+        every = [det for rid, _ in rois for det in located[rid][0]]
+        self._finish_detections(clean_frame, [d for d in every if d.track is not None and not d.track.decided], state)
+        for det in every:
+            det.data.pop("_seg", None)
+        pt = self.perf.start()
+        for rid, roi in rois:
+            detections, tracks, tracker = located[rid]
             for det in detections:
                 crop = det.data.pop("crop", None)
                 if det.track is None:           # a faint box alone, or a second box on a cashew that has its ID
@@ -1318,9 +1392,12 @@ class ProcessingThread(threading.Thread):
                 if crop is not None and not det.track.decided:
                     self.capture.note_view(det.track.id, crop, decision.canonical(det.data["cnn"]), det.data["cnn_conf"])
                 if not det.track.decided:
-                    det.track.frames.append(det.data)
                     bx1, by1, bx2, by2 = det.data["box"]
-                    self.undefined_capture.note_view(det.track.id, clean_frame[max(0, by1):by2, max(0, bx1):bx2])
+                    crop_box = clean_frame[max(0, by1):by2, max(0, bx1):bx2]
+                    if crop_box.size > 0:
+                        det.data["crop_img"] = crop_box.copy()
+                    det.track.frames.append(det.data)
+                    self.undefined_capture.note_view(det.track.id, crop_box)
                 det.track.info["last"] = det.data
             live = next((d.data for d in detections if d.track is not None and d.data.get("feat")), None)
             for lost in tracker.dropped:        # disappeared before its line: LOST, nothing is fired
@@ -1337,6 +1414,7 @@ class ProcessingThread(threading.Thread):
                         scale = 110.0 / max(crop.shape[:2])
                         self.shared_state.view_thumb[rid] = cv2.resize(crop, (max(1, int(crop.shape[1] * scale)), max(1, int(crop.shape[0] * scale))))
 
+            pt = self.perf.lap("views + capture hand-over", pt)
             line = lines[rid]
             for trk in tracks:
                 if not trk.counted and trk.hits >= 2:   # seen in two frames: a cashew, not noise
@@ -1347,9 +1425,18 @@ class ProcessingThread(threading.Thread):
                     self._golden_capture(clean_frame, trk, state)
                 if progress is not None and progress >= 0 and not trk.decided:
                     # One cashew = one decision = at most one fire: a fragment is closed without a decision.
+                    pd = self.perf.start()
                     if not self._close_fragment(trk, rid, flow, "AT_LINE"):
                         self._decide_track(trk, rid, line, state, t_ms)
-                self._draw_track(frame, trk, grading)
+                    self.perf.lap("decision + log", pd)
+                if draw:
+                    pd = self.perf.start()
+                    self._draw_track(frame, trk, grading)
+                    self.perf.lap("drawing labels", pd)
+            pt = self.perf.start()
+
+        if not draw:
+            return None
 
         # ROI boxes while RUNNING. The Home view shows only the ROI crops, so the frame is drawn just inside the ROI
         # (a box on the ROI edge itself would be cut away) and the name sits inside it.
@@ -1361,10 +1448,10 @@ class ProcessingThread(threading.Thread):
         self._draw_arrows(frame, state)
         return frame
 
-    def _measure_detection(self, clean_frame, box, yolo_cid, yolo_conf, roi, state, t_ms):
-        """Everything known about one detection in one frame: YOLO class, CNN class, mask, view, features."""
-        grading = state["grading"]
-        seg_params = grading.get("segmentation", {})
+    def _locate_detection(self, clean_frame, box, yolo_cid, yolo_conf, roi, state, t_ms):
+        """Step 1 for one YOLO box: the cashew mask (its centroid is the position that is tracked) and the tight box
+        the CNN crop is cut from. Features and the CNN class follow in _finish_detections, after tracking."""
+        seg_params = state["grading"].get("segmentation", {})
         H, W = clean_frame.shape[:2]
         bx1, by1, bx2, by2 = max(0, int(box[0])), max(0, int(box[1])), min(W, int(box[2])), min(H, int(box[3]))
         edge_cut = segmentation.touches_edge(box, roi, float(seg_params.get("edge_margin_px", 2)))
@@ -1385,40 +1472,99 @@ class ProcessingThread(threading.Thread):
             _throttle.exception("segment", "[CV] Cashew mask failed (box centre is used)")
         if seg is not None:
             cx, cy = sx1 + seg.cx, sy1 + seg.cy     # the mask centroid does not jump when the cashew rolls
-            if not edge_cut:
-                try:
-                    data["feat"] = view_features.measure(seg_crop, seg)
-                    data["view"] = view_features.classify(data["feat"], grading.get("views", {}).get("rules"))
-                except Exception:
-                    _throttle.exception("view_features", "[CV] View measurement failed for a cashew")
+        data["_seg"] = (seg, seg_crop)              # for step 2; taken out again before the data is stored
 
         # CNN crop: made exactly as before (preprocess.py), so the model sees what it was trained on.
-        crop = clean_frame[by1:by2, bx1:bx2]
         if self.cnn_model is not None:
-            cashew_area, cashew_rect = self._get_cashew_contour_rect(crop)
+            cashew_area, cashew_rect = self._get_cashew_contour_rect(clean_frame[by1:by2, bx1:bx2])
             if cashew_rect is not None and cashew_area >= 150:
                 rx, ry, rw, rh = cashew_rect
                 margin = 4
-                tx1, ty1 = max(0, bx1 + rx - margin), max(0, by1 + ry - margin)
-                tx2, ty2 = min(W, bx1 + rx + rw + margin), min(H, by1 + ry + rh + margin)
-                data["box"] = [tx1, ty1, tx2, ty2]
-                crop = clean_frame[ty1:ty2, tx1:tx2]
-            cnn_name, cnn_conf = self._cnn_predict(crop)
-            if cnn_name is not None:
-                cv_cfg = state.get("opencv_filter", {})
-                low = cnn_name.lower().replace("_", " ")
-                if cv_cfg.get("enabled", False) and low in ("sw", "white dw"):     # old dark-spot filter, default OFF
-                    if low == "sw":
-                        def_px, max_px = self._calculate_defect_area(crop, color_thresh=cv_cfg.get("sw_color_thresh", 45)), cv_cfg.get("sw_defect_size_px", 20)
-                    else:
-                        def_px, max_px = self._calculate_defect_area(crop, color_thresh=cv_cfg.get("ww_color_thresh", 85)), cv_cfg.get("ww_defect_size_px", 16)
-                    if def_px < max_px:
-                        cnn_name = "GOOD_CASHEW"
-                self.registry.id_for(cnn_name, register=True)
-                data["cnn"], data["cnn_conf"] = cnn_name, float(cnn_conf)
-                if not edge_cut and self.capture.wanted():
-                    data["crop"] = crop.copy()      # only while production capture is on; handed over right after tracking
+                data["box"] = [max(0, bx1 + rx - margin), max(0, by1 + ry - margin), min(W, bx1 + rx + rw + margin), min(H, by1 + ry + rh + margin)]
         return Detection(cx, cy, data["box"], data)
+
+    def _measure_features(self, det, rules):
+        """View, colour and size features of one located cashew (not for a box cut by the ROI edge)."""
+        seg, seg_crop = det.data.get("_seg") or (None, None)
+        if seg is None or det.data["edge_cut"]:
+            return
+        try:
+            det.data["feat"] = view_features.measure(seg_crop, seg)
+            det.data["view"] = view_features.classify(det.data["feat"], rules)
+        except Exception:
+            _throttle.exception("view_features", "[CV] View measurement failed for a cashew")
+
+    def _cnn_predict_batch(self, crops):
+        """CNN on several BGR crops in ONE forward pass. Returns [(class name, confidence) or (None, 0.0)] in order.
+        Every crop is prepared exactly as for a single prediction (preprocess.py)."""
+        results = [(None, 0.0)] * len(crops)
+        if self.cnn_model is None or not crops:
+            return results
+
+        def tensor_of(crop):
+            if crop is None or crop.size == 0:
+                return None
+            try:
+                return preprocess.crop_to_tensor(crop, self.cnn_transform, tight=False)
+            except Exception:
+                _throttle.exception("cnn_predict", "[CNN] Preparing a crop failed")
+                return None
+        tensors = self._map(tensor_of, crops)
+        usable = [i for i, t in enumerate(tensors) if t is not None]
+        if not usable:
+            return results
+        try:
+            batch = _torch.stack([tensors[i] for i in usable]).to(self.cnn_device)
+            with _torch.no_grad():
+                probs = _F.softmax(self.cnn_model(batch), dim=1).cpu().numpy()
+            for row, i in zip(probs, usable):
+                idx = int(np.argmax(row))
+                results[i] = (self.cnn_classes[idx], float(row[idx]))
+        except Exception:
+            _throttle.exception("cnn_predict", "[CNN] Prediction failed")
+        return results
+
+    def _finish_detections(self, clean_frame, detections, state):
+        """Step 2 for the boxes that belong to a cashew still to be decided: features (side by side) and the CNN class
+        (one batch). The results are the same as measuring the boxes one by one."""
+        if not detections:
+            return
+        grading = state["grading"]
+        rules = grading.get("views", {}).get("rules")
+        pt = self.perf.start()
+        self._map(lambda det: self._measure_features(det, rules), detections)
+        pt = self.perf.lap("view + colour + size features", pt)
+        if self.cnn_model is None:
+            return
+        crops = []
+        for det in detections:
+            x1, y1, x2, y2 = det.data["box"]
+            crops.append(clean_frame[y1:y2, x1:x2] if (x2 > x1 and y2 > y1) else None)
+        predictions = self._cnn_predict_batch(crops)
+        pt = self.perf.lap("CNN", pt)
+        cv_cfg = state.get("opencv_filter", {})
+        wanted = self.capture.wanted()
+        for det, crop, (cnn_name, cnn_conf) in zip(detections, crops, predictions):
+            if cnn_name is None:
+                continue
+            data = det.data
+            low = cnn_name.lower().replace("_", " ")
+            if cv_cfg.get("enabled", False) and low in ("sw", "white dw"):     # old dark-spot filter, default OFF
+                if low == "sw":
+                    def_px, max_px = self._calculate_defect_area(crop, color_thresh=cv_cfg.get("sw_color_thresh", 45)), cv_cfg.get("sw_defect_size_px", 20)
+                else:
+                    def_px, max_px = self._calculate_defect_area(crop, color_thresh=cv_cfg.get("ww_color_thresh", 85)), cv_cfg.get("ww_defect_size_px", 16)
+                if def_px < max_px:
+                    cnn_name = "GOOD_CASHEW"
+            # Enforce per-class confidence thresholds: if CNN confidence is below the
+            # required threshold for this class, downgrade the prediction to GOOD_CASHEW.
+            req_conf = state.get("class_confs", {}).get(cnn_name.lower(), 50)
+            if (cnn_conf * 100) < req_conf:
+                cnn_name = "GOOD_CASHEW"
+            self.registry.id_for(cnn_name, register=True)
+            data["cnn"], data["cnn_conf"] = cnn_name, float(cnn_conf)
+            if not data["edge_cut"] and wanted:
+                data["crop"] = crop.copy()          # only while production capture is on; handed over right after tracking
 
     def _golden_capture(self, clean_frame, trk, state):
         """Dataset auto capture (Teaching pages): crop and / or full frame of a cashew before the line."""
@@ -1572,8 +1718,88 @@ class ProcessingThread(threading.Thread):
         shown_class = label
         if d.reason.startswith(decision.SIZE_NOT_READY):        # SHADOW: "GOOD (would be W240)" / "TESTA SMALL (PASS) (would be W240)"
             shown_class = label.replace("UNDEF SIZE_NOT_READY (", "").rstrip(")").replace(", would be ", " (would be ") + ")"
+
+        # Build frame cards with image crops and determine concluding / deciding frames
+        norm_res = normalize_name(d.result)
+        v_cfg = grading.get("voting", {})
+        def_conf = float(v_cfg.get("defect_conf", 0.5))
+        gd_conf = float(v_cfg.get("good_conf", 0.8))
+        rej_conf = float(v_cfg.get("rejection_conf", 0.5))
+
+        cashew_frame_cards = []
+        concluding_indices = []
+
+        for idx, f in enumerate(trk.frames):
+            c_name = decision.canonical(f.get("cnn"))
+            c_conf = float(f.get("cnn_conf", 0.0) or 0.0)
+            y_name = f.get("yolo")
+            y_conf = float(f.get("yolo_conf", 0.0) or 0.0)
+            
+            is_concluding = False
+            badge = ""
+
+            if norm_res == normalize_name(decision.REJECTION):
+                if c_name and normalize_name(c_name) == norm_res and c_conf >= rej_conf:     # the CNN only (decision.py)
+                    is_concluding = True
+                    badge = "REJECTION"
+            elif norm_res == normalize_name(decision.GOOD):
+                if c_name and c_name in ("GOOD_CASHEW", "GOOD", "SW") and c_conf >= gd_conf:
+                    is_concluding = True
+                    badge = "CLEAN / GOOD"
+            elif norm_res not in (normalize_name(decision.UNDEFINED), normalize_name(decision.DOUBLE)):
+                if c_name and normalize_name(c_name) == norm_res and c_conf >= def_conf:     # the CNN only (decision.py)
+                    is_concluding = True
+                    badge = f"DECIDING {d.result}"
+
+            if is_concluding:
+                concluding_indices.append(idx + 1)
+
+            cashew_frame_cards.append({
+                "idx": idx + 1,
+                "t_ms": round(f["t"] - trk.born_ms, 1),
+                "crop": f.get("crop_img"),
+                "cnn": c_name,
+                "cnn_conf": c_conf,
+                "yolo": y_name,
+                "yolo_conf": y_conf,
+                "view": f.get("view", "OTHER"),
+                "edge_cut": f.get("edge_cut", False),
+                "feat": f.get("feat"),
+                "is_concluding": is_concluding,
+                "badge": badge
+            })
+
+        if concluding_indices:
+            idx_str = ", ".join(f"#{i}" for i in concluding_indices)
+            if norm_res == normalize_name(decision.GOOD):
+                concluding_summary = f"Concluded as GOOD ({grade}): confirmed by clean frame(s) {idx_str}."
+            elif norm_res == normalize_name(decision.REJECTION):
+                concluding_summary = f"Concluded as REJECTION: triggered by rejection frame(s) {idx_str}."
+            else:
+                concluding_summary = f"Concluded as {d.result}: decided by defect frame(s) {idx_str} (min {v_cfg.get('defect_min_frames', 2)} met)."
+        elif d.result == decision.UNDEFINED:
+            concluding_summary = f"Resulted as UNDEFINED ({d.reason}): {d.frames_used} used of {d.frames_total} total frames."
+        else:
+            concluding_summary = f"Resulted as {d.result} ({d.reason})."
+
+        cashew_frames_payload = {
+            "track_id": trk.id,
+            "label": label,
+            "result": d.result,
+            "reason": d.reason,
+            "relay": relay,
+            "length_mm": mm_length,
+            "width_mm": mm_width,
+            "grade": grade,
+            "colour": colour,
+            "summary": concluding_summary,
+            "detail": "\n".join(detail),
+            "frames": cashew_frame_cards
+        }
+
         self.shared_state.add_decision(trk.id, label, f"{d.frames_used}f", relay or 0, count_keys, "\n".join(detail), row=(
-            shown_class, colour or "-", "-" if colour_value is None else f"{colour_value:.1f}", f"{mm_length:.1f}" if mm_length else "-", grade or "-"))
+            shown_class, colour or "-", "-" if colour_value is None else f"{colour_value:.1f}", f"{mm_length:.1f}" if mm_length else "-", grade or "-"),
+            cashew_frames=cashew_frames_payload)
         if len(trk.frames) >= 5:
             self._box_areas[rid].append(abs(trk.box[2] - trk.box[0]) * abs(trk.box[3] - trk.box[1]))
         # Auto capture: Undefined (not the GOOD cashews held back only because the size grades are not ready) and double.
@@ -1691,7 +1917,8 @@ class ProcessingThread(threading.Thread):
         cid = self.registry.id_for(name)
         colour = self.get_color_for_class(cid if cid is not None else 0)
         cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 1 if trk.missed else 2)
-        text = f"{trk.id} {str(name).upper()[:12]} {conf:.2f} {last.get('view', '')}" + (" (PRED)" if trk.missed else "")
+        show_views = grading.get("views", {}).get("show_values", False)
+        text = f"{trk.id} {str(name).upper()[:12]} {conf:.2f}" + (f" {last.get('view', '')}" if show_views else "") + (" (PRED)" if trk.missed else "")
         cv2.putText(frame, text, (x1, max(12, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, colour, 2)
         line_y = y2 + 24
         measured = [f["feat"] for f in trk.frames if f.get("feat")]
@@ -1702,10 +1929,12 @@ class ProcessingThread(threading.Thread):
             values = colour_size.track_colour(measured)
             which, value = colour_size.colour_of(values, size_cfg.get("colour"))
             size_grade, why = colour_size.grade_of(which or colour_size.WW, length, 0.0, 0.0, size_cfg.get("grades"))
-            cv2.putText(frame, f"{length:.1f} mm  b* {values['b']:.1f}  {colour_size.would_be(which, size_grade, why)}",
-                        (x1, line_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            line_y += 24
-        if last.get("feat") and not trk.missed and grading.get("views", {}).get("show_values", True):
+            current_class = str(last.get("cnn") or last.get("yolo") or "").upper()
+            if "GOOD" in current_class or "SW" in current_class:
+                cv2.putText(frame, f"{length:.1f} mm  b* {values['b']:.1f}  {colour_size.would_be(which, size_grade, why)}",
+                            (x1, line_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                line_y += 24
+        if last.get("feat") and not trk.missed and show_views:
             cv2.putText(frame, view_features.short_text(last["feat"]), (x1, line_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
 
     def _get_size_data(self, length: float, width: float, cfg: dict, track_id: int) -> Tuple[Optional[int], str]:
@@ -2831,6 +3060,8 @@ class App(tk.Tk):
 
         self.fire_tree.pack(side="left", fill=tk.BOTH, expand=True)
         tree_scroll.pack(side="right", fill="y")
+
+        ui.FlatButton(p_prod, "🔍  INSPECT CASHEW & CONCLUDING FRAMES", command=self._show_decision_detail, kind="primary", height=32).pack(fill=tk.X, pady=(6, 0))
         
 
         # PAGE: Dataset Capture (5-track layout: cards, flat buttons; same functions as before)
@@ -3169,142 +3400,179 @@ class App(tk.Tk):
         sort_window = sort_canvas.create_window((0, 0), window=sort_outer, anchor="nw")
         sort_canvas.bind("<Configure>", lambda e: sort_canvas.itemconfig(sort_window, width=e.width))
         self._build_grading_section(sort_outer, bar_parent=p_sort)
-        # Older blocks (combination rules, per-class confidence sliders of the old logic) stay below, unchanged.
-        sort_inner = tk.Frame(sort_outer, bg=self.colors["surface"], padx=15, pady=15, width=520)
-        sort_inner.pack(anchor="w")
+        # Additional sorting settings (combination rules, per-class confidence, size, defect allowance)
+        sort_inner = tk.Frame(sort_outer, bg=ui.BG, padx=10, pady=10)
+        sort_inner.pack(fill=tk.X, expand=True)
         sort_canvas.configure(yscrollcommand=sort_scroll.set)
         sort_canvas.pack(side="left", fill="both", expand=True)
         sort_scroll.pack(side="right", fill="y")
-        
-        ttk.Label(sort_inner, text="COMBINATION RULES (classes seen together -> final)", style="Title.TLabel").pack(anchor="w", pady=(0,10))
+
+        def _on_sort_mousewheel(event):
+            if not p_sort.winfo_ismapped():
+                return
+            if event.num == 4:
+                sort_canvas.yview_scroll(-2, "units")
+            elif event.num == 5:
+                sort_canvas.yview_scroll(2, "units")
+            elif getattr(event, "delta", 0):
+                sort_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _bind_sort_wheel(event=None):
+            p_sort.bind_all("<Button-4>", _on_sort_mousewheel)
+            p_sort.bind_all("<Button-5>", _on_sort_mousewheel)
+            p_sort.bind_all("<MouseWheel>", _on_sort_mousewheel)
+
+        def _unbind_sort_wheel(event=None):
+            p_sort.unbind_all("<Button-4>")
+            p_sort.unbind_all("<Button-5>")
+            p_sort.unbind_all("<MouseWheel>")
+
+        p_sort.bind("<Enter>", _bind_sort_wheel)
+        p_sort.bind("<Leave>", _unbind_sort_wheel)
+        p_sort.bind("<Unmap>", _unbind_sort_wheel)
+
+        def sort_card(parent, title):
+            box = tk.Frame(parent, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
+            box.pack(fill=tk.X, pady=(0, 14))
+            head = tk.Frame(box, bg=ui.PANEL)
+            head.pack(fill=tk.X, padx=16, pady=(12, 6))
+            tk.Label(head, text=title, font=(ui.FONT, ui.F_SMALL, "bold"), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT)
+            body = tk.Frame(box, bg=ui.PANEL)
+            body.pack(fill=tk.X, padx=16, pady=(0, 14))
+            return body
+
+        grid_inner = tk.Frame(sort_inner, bg=ui.BG)
+        grid_inner.pack(fill=tk.X, expand=True)
+        grid_inner.columnconfigure(0, weight=1, uniform="sub_sort")
+        grid_inner.columnconfigure(1, weight=1, uniform="sub_sort")
+
+        col_left = tk.Frame(grid_inner, bg=ui.BG)
+        col_left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+
+        col_right = tk.Frame(grid_inner, bg=ui.BG)
+        col_right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+
+        # ── Left Column: COMBINATION RULES ──
+        body_prio = sort_card(col_left, "COMBINATION RULES (classes seen together -> final)")
         classes = ["Any", "Good", "UPW", "PKW", "White", "Defect_Skin"] + self.all_class_names
         classes = list(set(classes))
-        
-        prio_frm = tk.Frame(sort_inner, bg=self.colors["surface"])
+
+        prio_frm = tk.Frame(body_prio, bg=ui.PANEL)
         prio_frm.pack(fill=tk.X, pady=5)
         self.prio_vars = []
         for i in range(4):
-            f_col = tk.Frame(prio_frm, bg=self.colors["surface"])
+            f_col = tk.Frame(prio_frm, bg=ui.PANEL)
             f_col.pack(side=tk.LEFT, padx=2)
-            ttk.Label(f_col, text=f"F{i+1}", font=("Roboto", 8), style="Surface.TLabel").pack()
+            tk.Label(f_col, text=f"F{i+1}", font=(ui.FONT, 8), fg=ui.MUTED, bg=ui.PANEL).pack()
             var = tk.StringVar(value="Any")
-            ttk.Combobox(f_col, textvariable=var, values=classes, width=6).pack()
+            ttk.Combobox(f_col, textvariable=var, values=classes, width=7).pack()
             self.prio_vars.append(var)
-            if i < 3: ttk.Label(prio_frm, text="+", style="Surface.TLabel").pack(side=tk.LEFT, padx=2, pady=(15,0))
-            
-        ttk.Label(prio_frm, text="=", style="Surface.TLabel").pack(side=tk.LEFT, padx=5, pady=(15,0))
-        f_fin = tk.Frame(prio_frm, bg=self.colors["surface"])
+            if i < 3: tk.Label(prio_frm, text="+", font=(ui.FONT, 10, "bold"), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT, padx=2, pady=(15,0))
+
+        tk.Label(prio_frm, text="=", font=(ui.FONT, 10, "bold"), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT, padx=5, pady=(15,0))
+        f_fin = tk.Frame(prio_frm, bg=ui.PANEL)
         f_fin.pack(side=tk.LEFT)
-        ttk.Label(f_fin, text="FINAL", font=("Roboto", 8), style="Surface.TLabel").pack()
+        tk.Label(f_fin, text="FINAL", font=(ui.FONT, 8), fg=ui.MUTED, bg=ui.PANEL).pack()
         self.final_grade_var = tk.StringVar(value="Good")
-        ttk.Combobox(f_fin, textvariable=self.final_grade_var, values=classes, width=8).pack()
-        
-        ttk.Button(sort_inner, text="ADD RULE", style="Primary.TButton", command=self._add_priority_logic).pack(anchor="e", pady=10)
-        
+        ttk.Combobox(f_fin, textvariable=self.final_grade_var, values=classes, width=9).pack()
+
+        ui.FlatButton(body_prio, "ADD RULE", command=self._add_priority_logic, kind="primary", height=28, width=100, font=(ui.FONT, -11, "bold")).pack(anchor="e", pady=(8, 6))
+
         cols_prio = ("f1", "f2", "f3", "f4", "final")
-        self.logic_tree = ttk.Treeview(sort_inner, columns=cols_prio, show='headings', height=5)
+        self.logic_tree = ttk.Treeview(body_prio, columns=cols_prio, show='headings', height=4)
         self.logic_tree.heading("f1", text="F1"); self.logic_tree.column("f1", width=50, anchor='center')
         self.logic_tree.heading("f2", text="F2"); self.logic_tree.column("f2", width=50, anchor='center')
         self.logic_tree.heading("f3", text="F3"); self.logic_tree.column("f3", width=50, anchor='center')
         self.logic_tree.heading("f4", text="F4"); self.logic_tree.column("f4", width=50, anchor='center')
         self.logic_tree.heading("final", text="FINAL"); self.logic_tree.column("final", width=80, anchor='center')
         self.logic_tree.pack(fill=tk.X, pady=5)
-        
+
         for rule in self.shared_state.priority_rules:
             vals = rule["conditions"] + [rule["final"]]
             self.logic_tree.insert("", "end", values=vals)
-            
-        prio_acts = tk.Frame(sort_inner, bg=self.colors["surface"])
+
+        prio_acts = tk.Frame(body_prio, bg=ui.PANEL)
         prio_acts.pack(fill=tk.X, pady=5)
         ttk.Button(prio_acts, text="Undo", command=self._undo_last_priority_logic).pack(side=tk.LEFT, padx=2)
         ttk.Button(prio_acts, text="Delete", command=self._delete_selected_priority_logic).pack(side=tk.LEFT, padx=2)
         ttk.Button(prio_acts, text="Clear", command=self._clear_all_priority_rules).pack(side=tk.LEFT, padx=2)
-        
-        ttk.Label(sort_inner, text="CONFIDENCE THRESHOLDS (old logic: not used by the grading rules above)", style="Title.TLabel").pack(anchor="w", pady=(20,10))
-        self.conf_vars = {}
-        for cname in sorted(self.all_class_names):
-            cname_low = cname.lower()
-            val = self.shared_state.class_confs.get(cname_low, 50)
-            row = tk.Frame(sort_inner, bg=self.colors["surface"])
-            row.pack(fill=tk.X, pady=4)
-            ttk.Label(row, text=cname.upper(), width=12, style="Surface.TLabel").pack(side=tk.LEFT)
-            var = tk.IntVar(value=val)
-            self.conf_vars[cname_low] = var
-            ttk.Scale(row, from_=1, to=100, orient=tk.HORIZONTAL, variable=var, length=180).pack(side=tk.LEFT, padx=10)
-            tk.Entry(row, textvariable=var, width=4, bg=self.colors["surface_light"], fg=self.colors["text"], bd=0, justify="center").pack(side=tk.LEFT)
-            var.trace_add("write", lambda *a, c=cname_low, v=var: self._update_class_conf(c, v))
 
-        ttk.Label(sort_inner, text="AUTO-TEACH SIZE CALIBRATION", style="Title.TLabel").pack(anchor="w", pady=(20,10))
-        at_row = tk.Frame(sort_inner, bg=self.colors["surface"])
-        at_row.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(at_row, text="Target Size:").pack(side=tk.LEFT, padx=(0,5))
+        # ── Left Column: SIZE SORTING & CALIBRATION ──
+        body_size = sort_card(col_left, "SIZE SORTING (MM) & AUTO-TEACH")
+        at_row = tk.Frame(body_size, bg=ui.PANEL)
+        at_row.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(at_row, text="Target Size:", font=(ui.FONT, -12), fg=ui.TEXT, bg=ui.PANEL).pack(side=tk.LEFT, padx=(0,5))
         self.at_size_var = tk.StringVar(value="W180")
         ttk.Combobox(at_row, textvariable=self.at_size_var, values=["W180", "W210", "W240", "W320", "W450", "BUDDS"], width=8).pack(side=tk.LEFT, padx=(0,15))
-        
-        ttk.Button(at_row, text="TEACH FROM CAMERA", style="Primary.TButton", command=self._start_auto_teach).pack(side=tk.LEFT)
+        ui.FlatButton(at_row, "TEACH FROM CAMERA", command=self._start_auto_teach, kind="outline", height=26, width=160, font=(ui.FONT, -11, "bold")).pack(side=tk.LEFT)
 
-        ttk.Label(sort_inner, text="SIZE SORTING (MM)", style="Title.TLabel").pack(anchor="w", pady=(20,10))
         cfg = self.shared_state.size_config
-        px_frm = tk.Frame(sort_inner, bg=self.colors["surface"])
-        px_frm.pack(fill=tk.X, pady=5)
-        ttk.Label(px_frm, text="1 MM = Pixels:", style="Surface.TLabel").pack(side=tk.LEFT)
+        px_frm = tk.Frame(body_size, bg=ui.PANEL)
+        px_frm.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(px_frm, text="1 MM = Pixels:", font=(ui.FONT, -12), fg=ui.TEXT, bg=ui.PANEL).pack(side=tk.LEFT)
         px_mm_var = tk.StringVar(value=str(cfg.get("px_per_mm", 10.0)))
-        tk.Entry(px_frm, textvariable=px_mm_var, width=6, bg=self.colors["surface_light"], fg=self.colors["text"], bd=0).pack(side=tk.LEFT, padx=10)
+        tk.Entry(px_frm, textvariable=px_mm_var, width=6, bg=ui.FIELD, fg=ui.TEXT, bd=0, justify="center").pack(side=tk.LEFT, padx=10)
         self.sz_vars = {"px_per_mm": px_mm_var}
-        
-        sz_grid = tk.Frame(sort_inner, bg=self.colors["surface"])
+
+        sz_grid = tk.Frame(body_size, bg=ui.PANEL)
         sz_grid.pack(fill=tk.X)
         for i, h in enumerate(["Size", "Len <", "Wid <", "T1", "T2"]):
-            ttk.Label(sz_grid, text=h, font=("Roboto", 9, "bold"), style="Surface.TLabel").grid(row=0, column=i, padx=5, pady=5, sticky="w")
-            
+            tk.Label(sz_grid, text=h, font=(ui.FONT, -11, "bold"), fg=ui.MUTED, bg=ui.PANEL).grid(row=0, column=i, padx=5, pady=3, sticky="w")
+
         for i, sz in enumerate(["W180", "W210", "W240", "W320", "W450", "BUDDS"]):
-            ttk.Label(sz_grid, text=sz, style="Surface.TLabel").grid(row=i+1, column=0, padx=5, pady=2, sticky="w")
-            
+            tk.Label(sz_grid, text=sz, font=(ui.FONT, -11), fg=ui.TEXT, bg=ui.PANEL).grid(row=i+1, column=0, padx=5, pady=2, sticky="w")
             l_var = tk.StringVar(value=str(cfg.get(f"{sz}_L", 15)))
-            tk.Entry(sz_grid, textvariable=l_var, width=5, bg=self.colors["surface_light"], fg=self.colors["text"], bd=0).grid(row=i+1, column=1, padx=5, pady=2)
+            tk.Entry(sz_grid, textvariable=l_var, width=5, bg=ui.FIELD, fg=ui.TEXT, bd=0, justify="center").grid(row=i+1, column=1, padx=5, pady=2)
             self.sz_vars[f"{sz}_L"] = l_var
-            
             w_var = tk.StringVar(value=str(cfg.get(f"{sz}_W", 10)))
-            tk.Entry(sz_grid, textvariable=w_var, width=5, bg=self.colors["surface_light"], fg=self.colors["text"], bd=0).grid(row=i+1, column=2, padx=5, pady=2)
+            tk.Entry(sz_grid, textvariable=w_var, width=5, bg=ui.FIELD, fg=ui.TEXT, bd=0, justify="center").grid(row=i+1, column=2, padx=5, pady=2)
             self.sz_vars[f"{sz}_W"] = w_var
-            
             t1_var = tk.StringVar(value=str(cfg.get(f"T1_Act_{sz}", 0)))
             ttk.Combobox(sz_grid, textvariable=t1_var, values=[0] + list(range(1,21)), width=3).grid(row=i+1, column=3, padx=5, pady=2)
             self.sz_vars[f"T1_Act_{sz}"] = t1_var
-            
             t2_var = tk.StringVar(value=str(cfg.get(f"T2_Act_{sz}", 0)))
             ttk.Combobox(sz_grid, textvariable=t2_var, values=[0] + list(range(21,41)), width=3).grid(row=i+1, column=4, padx=5, pady=2)
             self.sz_vars[f"T2_Act_{sz}"] = t2_var
 
-        ttk.Label(sort_inner, text="DEFECT ALLOWANCE (MM)", style="Title.TLabel").pack(anchor="w", pady=(20,10))
+        # ── Right Column: CONFIDENCE THRESHOLDS (in 2-column grid) ──
+        body_conf = sort_card(col_right, "CONFIDENCE THRESHOLDS (old logic: not used by the grading rules above)")
+        conf_grid = tk.Frame(body_conf, bg=ui.PANEL)
+        conf_grid.pack(fill=tk.X)
+        conf_grid.columnconfigure(0, weight=1)
+        conf_grid.columnconfigure(1, weight=1)
+        self.conf_vars = {}
+        for idx, cname in enumerate(sorted(self.all_class_names)):
+            cname_low = cname.lower()
+            val = self.shared_state.class_confs.get(cname_low, 50)
+            row = tk.Frame(conf_grid, bg=ui.PANEL)
+            row.grid(row=idx // 2, column=idx % 2, sticky="ew", padx=6, pady=2)
+            tk.Label(row, text=cname.upper(), width=11, font=(ui.FONT, -11), fg=ui.TEXT, bg=ui.PANEL, anchor="w").pack(side=tk.LEFT)
+            var = tk.IntVar(value=val)
+            self.conf_vars[cname_low] = var
+            ttk.Scale(row, from_=1, to=100, orient=tk.HORIZONTAL, variable=var, length=110).pack(side=tk.LEFT, padx=4)
+            tk.Entry(row, textvariable=var, width=4, bg=ui.FIELD, fg=ui.TEXT, bd=0, justify="center").pack(side=tk.LEFT)
+            var.trace_add("write", lambda *a, c=cname_low, v=var: self._update_class_conf(c, v))
+
+        # ── Right Column: DEFECT ALLOWANCE (in 2-column grid) ──
+        body_allow = sort_card(col_right, "DEFECT ALLOWANCE (MM)")
+        allow_grid = tk.Frame(body_allow, bg=ui.PANEL)
+        allow_grid.pack(fill=tk.X)
+        allow_grid.columnconfigure(0, weight=1)
+        allow_grid.columnconfigure(1, weight=1)
         self.allow_vars = {}
-        for cname in sorted(self.all_class_names):
-            if "good" in cname.lower() or bool(re.search(r'\b(s|w)w\d*', cname.lower())): continue
+        allow_classes = [c for c in sorted(self.all_class_names) if not ("good" in c.lower() or bool(re.search(r'\b(s|w)w\d*', c.lower())))]
+        for idx, cname in enumerate(allow_classes):
             cname_low = cname.lower()
             val = self.shared_state.defect_allowances.get(cname_low, 0.0)
-            row = tk.Frame(sort_inner, bg=self.colors["surface"])
-            row.pack(fill=tk.X, pady=2)
-            ttk.Label(row, text=cname.upper(), width=15, style="Surface.TLabel").pack(side=tk.LEFT)
+            row = tk.Frame(allow_grid, bg=ui.PANEL)
+            row.grid(row=idx // 2, column=idx % 2, sticky="ew", padx=6, pady=2)
+            tk.Label(row, text=cname.upper(), width=13, font=(ui.FONT, -11), fg=ui.TEXT, bg=ui.PANEL, anchor="w").pack(side=tk.LEFT)
             var = tk.DoubleVar(value=val)
             self.allow_vars[cname_low] = var
-            tk.Entry(row, textvariable=var, width=5, bg=self.colors["surface_light"], fg=self.colors["text"], bd=0, justify="center").pack(side=tk.LEFT, padx=10)
-            ttk.Label(row, text="Max Allowable Length (mm)", style="Surface.TLabel", foreground=self.colors["text_muted"]).pack(side=tk.LEFT)
+            tk.Entry(row, textvariable=var, width=5, bg=ui.FIELD, fg=ui.TEXT, bd=0, justify="center").pack(side=tk.LEFT, padx=4)
+            tk.Label(row, text="mm max", font=(ui.FONT, -10), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT)
 
-        ttk.Label(sort_inner, text="DEFECT ACTUATOR MAPPING", style="Title.TLabel").pack(anchor="w", pady=(20,10))
-        self.map_lbls = {}
-        for trk, acts in [(1, range(1,21)), (2, range(21,41))]:
-            ttk.Label(sort_inner, text=f"Track {trk}", style="Header.TLabel").pack(anchor="w", pady=5)
-            for act in acts:
-                row = tk.Frame(sort_inner, bg=self.colors["surface"])
-                row.pack(fill=tk.X, pady=2)
-                ttk.Button(row, text=f"A{act}", width=4, command=lambda a=act: self._popup_mapper(a)).pack(side=tk.LEFT, padx=(0,10))
-                lbl = ttk.Label(row, text="(none)", style="Surface.TLabel", foreground=self.colors["text_muted"])
-                lbl.pack(side=tk.LEFT)
-                self.map_lbls[act] = lbl
-        self._update_all_map_labels()
-        
-        ttk.Button(sort_inner, text="SAVE SORTING CONFIG", style="Primary.TButton", command=self._save_program).pack(fill=tk.X, pady=20)
+        ui.FlatButton(sort_inner, "SAVE SORTING CONFIG", command=self._save_program, kind="primary", height=38, width=320, font=(ui.FONT, -13, "bold")).pack(pady=12)
 
 
         self._build_pneumatic_page()
@@ -3611,7 +3879,7 @@ class App(tk.Tk):
     def _teach_changed(self):
         page = getattr(self, "teach_page", None)
         if page is not None:
-            page._class_signature = None
+            page.invalidate()
             page._signature = None
 
     def _review_wrong_images(self):
@@ -5356,16 +5624,26 @@ except Exception as e:
             problems = self._mapping_problems(mapping)
             self.lbl_map_problem.config(text=("SAVE IS BLOCKED\n" + "\n".join(problems)) if problems else "")
 
-    def _dialog(self, title):
+    def _dialog(self, title, width=980, height=660):
         """A modal dialog window in the theme. In the self-screenshot mode it is placed outside the visible screen."""
         win = tk.Toplevel(self)
-        if os.environ.get("GSN_UI_OFFSCREEN"):
-            win.overrideredirect(True)
-            win.geometry(f"+{self.winfo_screenwidth() + 4200}+0")
         win.title(title)
         win.configure(bg=ui.BG)
-        win.transient(self)
-        win.grab_set()
+        if os.environ.get("GSN_UI_OFFSCREEN"):
+            win.overrideredirect(True)
+            win.geometry(f"{width}x{height}+{self.winfo_screenwidth() + 4200}+0")
+        else:
+            self.update_idletasks()
+            try:
+                x = self.winfo_rootx() + (self.winfo_width() - width) // 2
+                y = self.winfo_rooty() + (self.winfo_height() - height) // 2
+            except Exception:
+                x = (self.winfo_screenwidth() - width) // 2
+                y = (self.winfo_screenheight() - height) // 2
+            win.geometry(f"{width}x{height}+{max(0, x)}+{max(0, y)}")
+            win.minsize(width, height)
+            win.transient(self)
+            win.grab_set()
         return win
 
     def _mapping_problems(self, mapping=None):
@@ -5497,7 +5775,7 @@ except Exception as e:
             mapping = relay_mapping.clean(self.shared_state.mapping_by_act)
         classes, grades = self._mapping_names()
         rows = relay_mapping.summary(mapping, classes, grades, self.shared_state.no_fire)
-        win = self._dialog("Class -> ejector")
+        win = self._dialog("Class -> ejector", width=760, height=660)
         F = ui.FONT
         tk.Label(win, text="CLASS  ->  EJECTOR", font=(F, ui.F_HEAD, "bold"), fg=ui.TEXT, bg=ui.BG).pack(anchor="w", padx=20, pady=(16, 2))
         tk.Label(win, text="Check the table. REJECT = no ejector assigned: it goes to the reject ejector. REJECTION, DOUBLE and Undefined always go to A01 / A21.",
@@ -5839,8 +6117,8 @@ except Exception as e:
                     self.view_vars[(view, name, k)] = var
         legend = "   ".join(f"{letter} = {description}" for name, (letter, description) in view_features.FEATURES.items())
         tk.Label(body, text=legend, font=(F, -11), fg=ui.MUTED, bg=ui.PANEL, justify="left", anchor="w", wraplength=480).pack(fill=tk.X, pady=(8, 0))
-        self.show_values_var = tk.BooleanVar(value=bool(g["views"].get("show_values", True)))
-        switch(body, "Draw the values under each cashew in the camera picture", self.show_values_var)
+        self.show_values_var = tk.BooleanVar(value=bool(g["views"].get("show_values", False)))
+        switch(body, "Show view values: the view name and the view numbers under each cashew in the camera picture", self.show_values_var)
 
         body = panel(cols[1], "LIVE VALUES", "The latest measured cashew of each ROI while the machine is RUNNING (for tuning the view limits).")
         self.lbl_view_thumb, self.lbl_view_live_roi, self._thumb_images = {}, {}, {}
@@ -5976,22 +6254,220 @@ except Exception as e:
                     self.grading_vars[("segmentation", key)].set(f"{seg[key]:g}")
 
     def _show_decision_detail(self, _event=None):
-        """Double click on a history row: the frame-by-frame votes of that cashew."""
+        """Inspection window showing cashew image crops across all frames, highlighting concluding frames."""
         sel = self.fire_tree.selection()
         if not sel:
             return
         track_id = str(self.fire_tree.item(sel[0])["values"][1])
         with self.shared_state.lock:
+            payload = self.shared_state.recent_cashew_frames.get(track_id)
             detail = self.shared_state.recent_decisions.get(track_id)
-        if not detail:
+        if not payload and not detail:
             return
+
         win = tk.Toplevel(self)
-        win.title(f"Cashew {track_id}")
-        win.geometry("1150x420")
-        box = tk.Text(win, bg=self.colors["surface"], fg=self.colors["text"], font=("Roboto Mono", 9), wrap="none")
-        box.insert("1.0", detail)
-        box.config(state="disabled")
-        box.pack(fill=tk.BOTH, expand=True)
+        win.title(f"Cashew Inspection - {track_id}")
+        win.geometry("1180x720")
+        win.minsize(960, 600)
+        win.configure(bg=ui.BG)
+        win._photos = []  # retain ImageTk references
+
+        F = ui.FONT
+
+        # Top Header Bar
+        top_bar = tk.Frame(win, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
+        top_bar.pack(fill=tk.X, padx=12, pady=(12, 6))
+
+        title_box = tk.Frame(top_bar, bg=ui.PANEL)
+        title_box.pack(side=tk.LEFT, padx=16, pady=10)
+
+        tk.Label(title_box, text=f"CASHEW {track_id}", font=(F, ui.F_HEAD, "bold"), fg=ui.TEXT, bg=ui.PANEL).pack(side=tk.LEFT, padx=(0, 14))
+
+        res_str = payload["result"] if payload else (detail.split("\n")[2].split(",")[0].replace("result ", "").strip() if "result " in detail else "DECISION")
+        res_color = ui.GOOD if (res_str in ("GOOD", "GOOD_CASHEW") or res_str.startswith("W") or res_str.startswith("SW")) else (ui.BAD if res_str in ("REJECTION", "DOUBLE", "DOUBLE KERNEL") else (ui.MUTED if res_str == "UNDEFINED" else ui.WARN))
+
+        lbl_res = tk.Label(title_box, text=f"  {res_str}  ", font=(F, ui.F_BODY, "bold"), fg="#FFFFFF", bg=res_color)
+        lbl_res.pack(side=tk.LEFT, padx=6)
+
+        relay_val = payload.get("relay") if payload else None
+        relay_txt = f"EJECTOR A{relay_val:02d}" if relay_val else "NO EJECTOR"
+        tk.Label(title_box, text=relay_txt, font=(F, ui.F_BODY, "bold"), fg=ui.ACCENT, bg=ui.PANEL).pack(side=tk.LEFT, padx=10)
+
+        if payload and payload.get("length_mm"):
+            tk.Label(title_box, text=f"L: {payload['length_mm']:.1f} mm   W: {payload['width_mm']:.1f} mm   Grade: {payload.get('grade') or '-'}",
+                     font=(F, ui.F_BODY), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT, padx=12)
+
+        ui.FlatButton(top_bar, "✕  CLOSE", command=win.destroy, kind="muted", height=30, width=90).pack(side=tk.RIGHT, padx=14)
+
+        # Concluding Reason Banner
+        summary_text = payload.get("summary") if payload else "Frame-by-frame vote record (recorded before visual capture was enabled):"
+        banner = tk.Frame(win, bg=ui.FIELD, highlightthickness=1, highlightbackground=ui.BORDER)
+        banner.pack(fill=tk.X, padx=12, pady=(0, 8))
+        tk.Label(banner, text="🎯 CONCLUDING DIAGNOSIS:", font=(F, ui.F_SMALL, "bold"), fg=ui.ACCENT, bg=ui.FIELD).pack(side=tk.LEFT, padx=(14, 8), pady=8)
+        tk.Label(banner, text=summary_text, font=(F, ui.F_BODY, "bold"), fg=ui.TEXT, bg=ui.FIELD, wraplength=900, justify="left").pack(side=tk.LEFT, fill=tk.X, expand=True, pady=8)
+
+        # Main splitter (Top: Frame Filmstrip/Gallery, Bottom: Zoom & Detail text)
+        body = tk.Frame(win, bg=ui.BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+
+        # Filmstrip section
+        strip_frame = tk.Frame(body, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
+        strip_frame.pack(fill=tk.X, pady=(0, 8))
+
+        strip_hdr = tk.Frame(strip_frame, bg=ui.PANEL)
+        strip_hdr.pack(fill=tk.X, padx=12, pady=(8, 4))
+        frames_list = payload.get("frames", []) if payload else []
+        tk.Label(strip_hdr, text=f"CAMERA FRAMES ({len(frames_list)} FRAMES RECORDED)", font=(F, ui.F_SMALL, "bold"), fg=ui.TEXT, bg=ui.PANEL).pack(side=tk.LEFT)
+        tk.Label(strip_hdr, text="★ Deciding frames highlighted in orange/red • Click any frame to inspect details below", font=(F, -11), fg=ui.MUTED, bg=ui.PANEL).pack(side=tk.LEFT, padx=12)
+
+        # Horizontal Scroll Canvas for Frame Cards
+        h_canvas = tk.Canvas(strip_frame, bg=ui.PANEL, height=225, bd=0, highlightthickness=0)
+        h_scroll = ttk.Scrollbar(strip_frame, orient="horizontal", command=h_canvas.xview)
+        cards_container = tk.Frame(h_canvas, bg=ui.PANEL)
+
+        cards_container.bind("<Configure>", lambda e: h_canvas.configure(scrollregion=h_canvas.bbox("all")))
+        h_canvas.create_window((0, 0), window=cards_container, anchor="nw")
+        h_canvas.configure(xscrollcommand=h_scroll.set)
+
+        h_canvas.pack(fill=tk.X, padx=8, pady=(4, 0))
+        h_scroll.pack(fill=tk.X, padx=8, pady=(2, 6))
+
+        # Bottom Inspector Area (Left: Zoomed Crop, Center: Frame Measurements, Right: Raw Text Log)
+        bottom_frame = tk.Frame(body, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.BORDER)
+        bottom_frame.pack(fill=tk.BOTH, expand=True)
+
+        zoom_panel = tk.Frame(bottom_frame, bg=ui.FIELD, width=220, highlightthickness=1, highlightbackground=ui.BORDER)
+        zoom_panel.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
+        zoom_panel.pack_propagate(False)
+
+        lbl_zoom_title = tk.Label(zoom_panel, text="FRAME PREVIEW", font=(F, ui.F_SMALL, "bold"), fg=ui.MUTED, bg=ui.FIELD)
+        lbl_zoom_title.pack(pady=(8, 4))
+        lbl_zoom_img = tk.Label(zoom_panel, bg=ui.PANEL)
+        lbl_zoom_img.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        info_panel = tk.Frame(bottom_frame, bg=ui.PANEL, width=320)
+        info_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0, 10), pady=10)
+
+        lbl_info_header = tk.Label(info_panel, text="FRAME DETAILS", font=(F, ui.F_BODY, "bold"), fg=ui.ACCENT, bg=ui.PANEL, anchor="w")
+        lbl_info_header.pack(fill=tk.X, pady=(0, 6))
+
+        info_text = tk.Text(info_panel, bg=ui.FIELD, fg=ui.TEXT, font=(F, ui.F_SMALL), bd=0, highlightthickness=1, highlightbackground=ui.BORDER, width=38, height=12)
+        info_text.pack(fill=tk.BOTH, expand=True)
+
+        log_panel = tk.Frame(bottom_frame, bg=ui.PANEL)
+        log_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10), pady=10)
+
+        tk.Label(log_panel, text="FULL DECISION LOG TRACE", font=(F, ui.F_BODY, "bold"), fg=ui.MUTED, bg=ui.PANEL, anchor="w").pack(fill=tk.X, pady=(0, 6))
+        raw_box = tk.Text(log_panel, bg=ui.FIELD, fg=ui.TEXT, font=("Roboto Mono", 9), wrap="none", bd=0, highlightthickness=1, highlightbackground=ui.BORDER)
+        raw_box.insert("1.0", detail or "")
+        raw_box.config(state="disabled")
+        raw_scroll = ttk.Scrollbar(log_panel, orient="vertical", command=raw_box.yview)
+        raw_box.configure(yscrollcommand=raw_scroll.set)
+        raw_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        raw_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def select_frame(fr_data):
+            crop_cv = fr_data.get("crop")
+            if crop_cv is not None and crop_cv.size > 0:
+                try:
+                    rgb_img = cv2.cvtColor(crop_cv, cv2.COLOR_BGR2RGB)
+                    h, w = rgb_img.shape[:2]
+                    scale = min(170.0 / max(w, 1), 170.0 / max(h, 1))
+                    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+                    resized = cv2.resize(rgb_img, (nw, nh), interpolation=cv2.INTER_AREA)
+                    photo_zoom = ImageTk.PhotoImage(Image.fromarray(resized))
+                    win._photos.append(photo_zoom)
+                    lbl_zoom_img.config(image=photo_zoom, text="")
+                except Exception:
+                    lbl_zoom_img.config(image="", text="(Crop Error)", fg=ui.MUTED)
+            else:
+                lbl_zoom_img.config(image="", text="(No Image Crop)", fg=ui.MUTED)
+
+            lbl_zoom_title.config(text=f"FRAME #{fr_data['idx']} PREVIEW")
+
+            info_text.config(state="normal")
+            info_text.delete("1.0", tk.END)
+            role = fr_data.get("badge") or ("DECIDING VOTE" if fr_data.get("is_concluding") else "Ordinary Frame")
+            lines = [
+                f"Frame: #{fr_data['idx']}  (at +{fr_data.get('t_ms', 0)} ms)",
+                f"Role: {role}",
+                f"CNN Class: {fr_data.get('cnn') or '-'} ({fr_data.get('cnn_conf', 0)*100:.1f}%)",
+                f"YOLO Class: {fr_data.get('yolo') or '-'} ({fr_data.get('yolo_conf', 0)*100:.1f}%)",
+                f"View: {fr_data.get('view') or '-'}",
+                f"Edge Cut: {'YES' if fr_data.get('edge_cut') else 'No'}",
+                ""
+            ]
+            feat = fr_data.get("feat")
+            if feat:
+                lines.append("OpenCV Measurements:")
+                lines.append(f"  Length: {feat.get('length_px', 0):.1f} px")
+                lines.append(f"  Width:  {feat.get('width_px', 0):.1f} px")
+                lines.append(f"  Area:   {feat.get('area_px', 0):.0f} px")
+                lines.append(f"  LAB b*: {feat.get('b', 0):.1f} (yellow)")
+                lines.append(f"  LAB a*: {feat.get('a', 0):.1f} (red)")
+                lines.append(f"  Dark %: {feat.get('dark_pct', 0):.1f}%")
+                lines.append(f"  Red %:  {feat.get('red_pct', 0):.1f}%")
+            info_text.insert("1.0", "\n".join(lines))
+            info_text.config(state="disabled")
+
+        first_sel = None
+        for fr_data in frames_list:
+            is_conc = fr_data.get("is_concluding", False)
+            card_bg = "#221815" if (is_conc and res_str != "GOOD") else ("#12241C" if is_conc else ui.FIELD)
+            border_col = ui.WARN if (is_conc and res_str != "REJECTION") else (ui.BAD if is_conc else ui.BORDER)
+            if is_conc and res_str in ("GOOD", "GOOD_CASHEW"):
+                border_col = ui.GOOD
+
+            card = tk.Frame(cards_container, bg=card_bg, highlightthickness=2, highlightbackground=border_col, padx=6, pady=6)
+            card.pack(side=tk.LEFT, padx=5, pady=6)
+
+            # Header inside card
+            hdr_txt = f"Frame #{fr_data['idx']}"
+            hdr_col = border_col if is_conc else ui.MUTED
+            lbl_hdr = tk.Label(card, text=hdr_txt, font=(F, -11, "bold"), fg=hdr_col, bg=card_bg)
+            lbl_hdr.pack(fill=tk.X)
+
+            if is_conc:
+                lbl_tag = tk.Label(card, text=f"★ {fr_data.get('badge', 'DECIDING')}", font=(F, -10, "bold"), fg="#FFFFFF", bg=border_col)
+                lbl_tag.pack(fill=tk.X, pady=(2, 4))
+
+            # Thumbnail
+            crop_cv = fr_data.get("crop")
+            lbl_thumb = tk.Label(card, bg=ui.PANEL, width=14, height=6)
+            if crop_cv is not None and crop_cv.size > 0:
+                try:
+                    rgb_img = cv2.cvtColor(crop_cv, cv2.COLOR_BGR2RGB)
+                    h, w = rgb_img.shape[:2]
+                    scale = min(100.0 / max(w, 1), 90.0 / max(h, 1))
+                    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+                    resized = cv2.resize(rgb_img, (nw, nh), interpolation=cv2.INTER_AREA)
+                    photo = ImageTk.PhotoImage(Image.fromarray(resized))
+                    win._photos.append(photo)
+                    lbl_thumb.config(image=photo, width=nw, height=nh)
+                except Exception:
+                    lbl_thumb.config(text="(Crop Error)", fg=ui.MUTED)
+            else:
+                lbl_thumb.config(text="(No Crop)", fg=ui.MUTED)
+            lbl_thumb.pack(pady=3)
+
+            # Labels under thumbnail
+            cnn_txt = f"CNN {fr_data.get('cnn') or '-'} {fr_data.get('cnn_conf', 0):.2f}"
+            lbl_cnn = tk.Label(card, text=cnn_txt, font=(F, -11), fg=ui.TEXT, bg=card_bg)
+            lbl_cnn.pack()
+
+            yolo_txt = f"YOLO {fr_data.get('yolo') or '-'} {fr_data.get('yolo_conf', 0):.2f}"
+            lbl_yolo = tk.Label(card, text=yolo_txt, font=(F, -10), fg=ui.MUTED, bg=card_bg)
+            lbl_yolo.pack()
+
+            # Click binding to select
+            for widget in (card, lbl_hdr, lbl_thumb, lbl_cnn, lbl_yolo):
+                widget.bind("<Button-1>", lambda e, fd=fr_data: select_frame(fd))
+
+            if first_sel is None or (is_conc and not first_sel.get("is_concluding")):
+                first_sel = fr_data
+
+        if first_sel:
+            select_frame(first_sel)
 
     def _build_colour_size_page(self):
         """Colour Size page, step (c2). Left: SW / WW colour (metric, threshold, TEACH WW / TEACH SW with both
@@ -6044,11 +6520,44 @@ except Exception as e:
         def rule(parent):
             tk.Frame(parent, bg=ui.BORDER, height=1).pack(fill=tk.X, padx=16, pady=(8, 4))
 
-        body = tk.Frame(page, bg=ui.BG)
-        body.pack(fill=tk.BOTH, expand=True)
+        cs_canvas = tk.Canvas(page, bg=ui.BG, highlightthickness=0)
+        cs_scroll = ttk.Scrollbar(page, orient="vertical", command=cs_canvas.yview)
+        cs_canvas.configure(yscrollcommand=cs_scroll.set)
+
+        body = tk.Frame(cs_canvas, bg=ui.BG)
+        body.bind("<Configure>", lambda e: cs_canvas.configure(scrollregion=cs_canvas.bbox("all")))
+        cs_window = cs_canvas.create_window((0, 0), window=body, anchor="nw")
+        cs_canvas.bind("<Configure>", lambda e: cs_canvas.itemconfig(cs_window, width=e.width))
+
+        cs_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        cs_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _on_cs_mousewheel(event):
+            if not page.winfo_ismapped():
+                return
+            if event.num == 4:
+                cs_canvas.yview_scroll(-2, "units")
+            elif event.num == 5:
+                cs_canvas.yview_scroll(2, "units")
+            elif getattr(event, "delta", 0):
+                cs_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _bind_cs_wheel(event=None):
+            page.bind_all("<Button-4>", _on_cs_mousewheel)
+            page.bind_all("<Button-5>", _on_cs_mousewheel)
+            page.bind_all("<MouseWheel>", _on_cs_mousewheel)
+
+        def _unbind_cs_wheel(event=None):
+            page.unbind_all("<Button-4>")
+            page.unbind_all("<Button-5>")
+            page.unbind_all("<MouseWheel>")
+
+        page.bind("<Enter>", _bind_cs_wheel)
+        page.bind("<Leave>", _unbind_cs_wheel)
+        page.bind("<Unmap>", _unbind_cs_wheel)
 
         # ───────────────────────────── left: colour ─────────────────────────────
-        left = card(body, "COLOUR  SW / WW", "median inside the cashew mask over all frames of the cashew", side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12))
+        left = card(body, "COLOUR  SW / WW", "median inside the cashew mask over all frames of the cashew", side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12), pady=(0, 14))
         colour_cfg = {**colour_size.COLOUR_DEFAULTS, **ss.size_config.get("colour", {})}
         self._metric_names = {"b": "b*  YELLOW", "a": "a*  RED", "L": "L*  LIGHT"}
         row = row_of(left)
@@ -6094,7 +6603,7 @@ except Exception as e:
         self.btn_cs_colour_apply = ui.FlatButton(row, "APPLY SUGGESTION", self._colour_teach_apply, kind="primary", height=34, width=200)
         self.btn_cs_colour_apply.pack(side=tk.RIGHT)
         self.btn_cs_colour_apply.set_enabled(False)
-        self.cs_colour_hist = ui.DualHistogram(left, height=150)
+        self.cs_colour_hist = ui.DualHistogram(left, height=130)
         self.cs_colour_hist.pack(fill=tk.X, padx=16, pady=(6, 0))
         self.lbl_cs_suggest = text(left, "", colour=ui.MUTED, size=-12, justify="left", anchor="w", wraplength=780)
         self.lbl_cs_suggest.pack(fill=tk.X, padx=16, pady=(6, 0))
@@ -6103,7 +6612,7 @@ except Exception as e:
         head = row_of(left, pady=0)
         text(head, "LAST CASHEWS", bold=True, colour=ui.MUTED).pack(side=tk.LEFT)
         text(head, "measured while RUNNING", colour=ui.MUTED, size=-11).pack(side=tk.LEFT, padx=12)
-        self.cs_last_tree = ttk.Treeview(left, columns=("id", "result", "colour", "value", "l", "w", "a", "grade", "relay"), show="headings", style="Home.Treeview", height=7)
+        self.cs_last_tree = ttk.Treeview(left, columns=("id", "result", "colour", "value", "l", "w", "a", "grade", "relay"), show="headings", style="Home.Treeview", height=5)
         for col, title, width in (("id", "ID", 96), ("result", "CLASS / RESULT", 230), ("colour", "SW/WW", 60), ("value", "COLOUR", 70), ("l", "L mm", 60),
                                   ("w", "W mm", 60), ("a", "AREA", 60), ("grade", "GRADE", 110), ("relay", "EJECTOR", 70)):
             self.cs_last_tree.heading(col, text=title, anchor="w")
@@ -6111,7 +6620,7 @@ except Exception as e:
         self.cs_last_tree.pack(fill=tk.BOTH, expand=True, padx=16, pady=(6, 14))
 
         # ───────────────────────────── right: size ─────────────────────────────
-        right = card(body, "SIZE GRADES", "length, width, area in mm from the contour, median over the frames", side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right = card(body, "SIZE GRADES", "length, width, area in mm from the contour, median over the frames", side=tk.LEFT, fill=tk.BOTH, expand=True, pady=(0, 14))
         ready = tk.Frame(right, bg=ui.FIELD, highlightthickness=1, highlightbackground=ui.BORDER)
         ready.pack(fill=tk.X, padx=16, pady=(0, 4))
         self.cs_ready_switch = ui.ToggleSwitch(ready, ui.FIELD, bool(ss.size_config.get("size_ready", False)), self._set_size_ready)
@@ -6190,7 +6699,7 @@ except Exception as e:
         rule(right)
         text(right, "SHAPE LIMITS  (GOOD cashews only; SHADOW / ACTIVE on the Pneumatic page)      DOUBLE RULE", bold=True, colour=ui.MUTED, anchor="w").pack(fill=tk.X, padx=16)
         shape, double = ss.grading["shape"], ss.grading["double"]
-        limits = row_of(right, pady=(6, 12))
+        limits = row_of(right, pady=(6, 20))
         for key, label, value, unit in ((("shape", "min_solidity"), "Min solidity", shape["min_solidity"], ""),
                                         (("shape", "min_length_width"), "Min L / W", shape["min_length_width"], ""),
                                         (("shape", "min_length_mm"), "Min length", shape["min_length_mm"], "mm"),

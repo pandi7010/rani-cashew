@@ -33,12 +33,12 @@ VIEW_NOT_ROLLED = "VIEW_NOT_ROLLED"
 
 # Start values given by the owner (FINAL_PROMPT section 4 and the answers of 2026-10-09).
 VOTING_DEFAULTS = {
-    "defect_conf": 0.50, "defect_min_frames": 2,
-    "good_conf": 0.80, "good_min_frames": 3,
+    "defect_conf": 0.60, "defect_min_frames": 2,
+    "good_conf": 0.70, "good_min_frames": 3,
     "neck_min_frames": 0,               # M: GOOD needs the NECK view in at least this many frames. 0 = rule on hold
                                         # (owner, 2026-10-09); a cashew whose NECK was never seen is still noted.
     "neck_weight": 2,                   # a skin vote from a NECK frame counts as this many frames
-    "rejection_conf": 0.50, "rejection_min_frames": 2,
+    "rejection_conf": 0.75, "rejection_min_frames": 3,
     "single_defect_blocks_good": False, # True: one defect frame (below the frame limit) makes the cashew Undefined
 }
 PRIORITY_DEFAULT = ["UPW", "PKW2", "PKW1", "OIL", "BROWN", "DW2", "DW1", "TESTA", "TESTA SMALL", "WHITE_DW"]
@@ -196,8 +196,8 @@ def decide(votes: List[FrameVote], voting: Optional[dict] = None, priority: Opti
 
     if seen:
         others = seen - skin_set - {upw}
-        if upw in seen or (seen & skin_set and others):
-            return done(UPW, "upw_seen" if upw in seen else "skin_with_other_defect", False)
+        if upw in seen:
+            return done(UPW, "upw_seen", False)
         for cls in priority:
             if cls in seen:
                 return done(display.get(cls, cls.upper()), "defect_seen", False)

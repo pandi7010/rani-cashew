@@ -59,7 +59,10 @@ class GradingConfigTest(unittest.TestCase):
         self.assertEqual(cfg["priority"], ["OIL"])
         self.assertEqual(cfg["views"]["rules"]["NECK"], {"hollow": [0.1, None]})
         self.assertEqual(cfg["views"]["rules"]["TOP"], {})
-        self.assertTrue(cfg["views"]["show_values"])
+        self.assertFalse(cfg["views"]["show_values"])            # hidden until switched on (owner, 2026-10-10)
+        # an older settings file had it on by default: it is switched off once; a file of the new version keeps the owner's choice
+        self.assertFalse(grading_config.merged({"defaults_version": 2, "views": {"show_values": True}})["views"]["show_values"])
+        self.assertTrue(grading_config.merged({"defaults_version": 3, "views": {"show_values": True}})["views"]["show_values"])
         self.assertEqual(grading_config.merged(None), grading_config.defaults())
 
 

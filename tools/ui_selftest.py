@@ -31,6 +31,8 @@ def make_belt(folder, frames=70):
     samples = [cv2.imread(f) for f in sorted(glob.glob(str(ROOT / "samples" / "rolling_example" / "*.jpg")))]
     folder.mkdir(parents=True)
     cashews = [(1500, 300, 0), (1760, 310, 1), (2300, 290, 2), (1400, 1750, 3), (2000, 1760, 0)]
+    if os.environ.get("GSN_SELFTEST_LOAD"):     # a full belt for speed measurements: 7 cashews per ROI
+        cashews = [(1300 + 330 * k, y + 14 * (k % 3), k) for k in range(7) for y in (300, 1750)]
     for n in range(frames):
         img = np.zeros((2048, 2448, 3), np.uint8)
         img[:] = (120, 40, 15)
@@ -47,7 +49,8 @@ def make_belt(folder, frames=70):
 
 make_belt(T / "belt")
 cfg = json.load(open(ROOT / "pneumatic_config.json"))
-cfg["camera_source"] = {"source": "file", "test_path": str(T / "belt"), "test_loop": True, "test_fps": 25.0}
+cfg["camera_source"] = {"source": "file", "test_path": str(T / "belt"), "test_loop": True,
+                        "test_fps": float(os.environ.get("GSN_SELFTEST_FPS", 25.0))}
 cfg["production_capture"] = {"enabled": False}
 json.dump(cfg, open(T / "pneumatic_config.json", "w"), indent=2)
 

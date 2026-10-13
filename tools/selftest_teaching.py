@@ -33,8 +33,8 @@ page.changes = ops.Changes(str(T / "logs"))
 app._active_cnn_path = lambda: model_path
 app._switch_page("Teaching CNN")
 page._result_key = "-"
-page._class_signature = None
-page.refresh(force=True)
+page.invalidate()
+page.wait_idle()
 pump(1.0)
 print("  panel:", page.lbl_fire.cget("text")[:90], "|", page.btn_wrong.text if hasattr(page.btn_wrong, "text") else "")
 shot(app, "30_teaching_cnn_after_training")
@@ -92,8 +92,9 @@ if not ops.confusion_count(str(data)):
     page.changes.add("MOVE TO CONFUSION", ops.move_to_confusion([str(p) for p in sorted((data / "TESTA").glob("*.jpg"))[:3]], str(data)))
 
 # 3. CONFUSION tab: grid, large view, re-label, delete, undo
-page._class_signature = None
+page.invalidate()
 page.set_source(teach_ui.CONFUSION)
+page.wait_idle()
 pump(1.0)
 shot(app, "33_teaching_cnn_confusion_tab")
 items = list(page.items)
@@ -102,11 +103,12 @@ shot(viewer, "34_window_large_image")
 viewer.destroy()
 before = ops.confusion_count(str(data))
 page.selected = {items[0]["path"]}
-page.label_selected("TESTA"); pump(0.3)
+page.label_selected("TESTA"); click_ms = page.last_click_ms; page.wait_idle(); pump(0.3)
 after_label = ops.confusion_count(str(data))
 if len(items) > 1:
     page.selected = {items[1]["path"]}
-    page.delete_selected(); pump(0.3)
+    page.delete_selected(); page.wait_idle(); pump(0.3)
+print("  label click kept the UI busy for", round(click_ms, 1), "ms")
 print("  CONFUSION tab:", before, "images | re-label ->", after_label, "| delete ->", ops.confusion_count(str(data)), "| last:", page.changes.last_action())
 steps = 0
 while page.changes.can_undo():

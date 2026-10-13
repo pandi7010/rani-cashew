@@ -10,7 +10,8 @@ import view_features
 
 # Raised when the owner changes a start value that must also reach a settings file written before the change.
 # 2 (2026-10-09): NECK M = 0 and "one defect frame blocks GOOD" = OFF.
-DEFAULTS_VERSION = 2
+# 3 (2026-10-10): the view name and view numbers on the live picture are hidden until switched on (Sorting Logic).
+DEFAULTS_VERSION = 3
 
 
 def defaults() -> dict:
@@ -21,7 +22,7 @@ def defaults() -> dict:
         "skin_classes": list(decision.SKIN_CLASSES_DEFAULT),
         "reject_classes": list(decision.REJECT_CLASSES_DEFAULT),     # always the reject ejector, under their own name
         # View limits are the owner's: {"NECK": {"hollow": [min, max]}, ...}. Empty = every frame is OTHER.
-        "views": {"rules": {view: {} for view in view_features.VIEWS}, "show_values": True},
+        "views": {"rules": {view: {} for view in view_features.VIEWS}, "show_values": False},
         "segmentation": dict(segmentation.DEFAULTS),
         "tracker": dict(lane_tracker.DEFAULTS),
         "frame_log": {"enabled": True, "keep_days": 7},
@@ -46,6 +47,8 @@ def merged(stored) -> dict:
     if int((stored or {}).get("defaults_version", 1)) < 2 and stored:
         out["voting"]["neck_min_frames"] = 0
         out["voting"]["single_defect_blocks_good"] = False
+    if int((stored or {}).get("defaults_version", 1)) < 3 and stored:
+        out["views"]["show_values"] = False
     out["defaults_version"] = DEFAULTS_VERSION
     rules = out["views"].setdefault("rules", {})
     for view in view_features.VIEWS:
