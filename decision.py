@@ -44,6 +44,9 @@ VOTING_DEFAULTS = {
 PRIORITY_DEFAULT = ["UPW", "PKW2", "PKW1", "OIL", "BROWN", "DW2", "DW1", "TESTA", "TESTA SMALL", "WHITE_DW"]
 GOOD_CLASSES_DEFAULT = ["GOOD_CASHEW", "GOOD", "SW"]       # "no defect" votes; SW / WW is decided by colour
 SKIN_CLASSES_DEFAULT = ["TESTA", "TESTA SMALL"]
+# Owner, 2026-10-14: "if you found PKW + TESTA it should go to PKW only". A piece with skin on it shows the skin in
+# most frames and the broken side in one, so next to skin ONE piece frame (at the defect confidence) is enough.
+PIECE_CLASSES_DEFAULT = ["PKW2", "PKW1"]
 # Owner, 2026-10-09: BACK_CUT_OIL / OIL_BACKCUT are graded (and trained) as OIL. EDGECUT stays its own class;
 # it is not in the priority list, so it goes to the reject relay until a relay is given for it.
 CLASS_ALIASES = {"back cut oil": "OIL", "oil backcut": "OIL", "backcut oil": "OIL", "oil back cut": "OIL",
@@ -196,11 +199,15 @@ def decide(votes: List[FrameVote], voting: Optional[dict] = None, priority: Opti
             return done(str(final), "combination_rule", is_reject)
 
     if seen:
-        others = seen - skin_set - {upw}
         if upw in seen:
             return done(UPW, "upw_seen", False)
         for cls in priority:
             if cls in seen:
+                if cls in skin_set:         # skin would win: a piece class seen in even one frame takes it (PKW + TESTA = PKW)
+                    pieces = [normalize_name(c) for c in PIECE_CLASSES_DEFAULT if weighted.get(normalize_name(c), 0) > 0]
+                    if pieces:
+                        piece = max(pieces, key=lambda c: weighted[c])      # most frames; equal: the first of the list
+                        return done(display.get(piece, piece.upper()), "piece_with_skin", False)
                 return done(display.get(cls, cls.upper()), "defect_seen", False)
         return done(UNDEFINED, NOT_IN_PRIORITY, True)
 

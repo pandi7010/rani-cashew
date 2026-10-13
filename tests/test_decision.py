@@ -84,11 +84,37 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual(decide(frames(*GOOD3_NECK, ("TESTA", 0.8), ("TESTA", 0.8))).result, "TESTA")
         self.assertEqual(decide(frames(*GOOD3_NECK, ("TESTA_SMALL", 0.8), ("testa small", 0.8))).result, "TESTA SMALL")
 
-    def test_skin_with_any_other_defect_is_upw(self):
-        for other in ("PKW1", "OIL", "BROWN", "DW1", "WHITE_DW"):
+    def test_skin_with_another_defect_follows_the_priority_not_upw(self):
+        # owner, 2026-10-14: PKW + TESTA goes to PKW only (the old rule "skin + any other defect = UPW" is gone)
+        for other in ("PKW1", "PKW2", "OIL", "BROWN"):
             d = decide(frames(("TESTA SMALL", 0.8), ("TESTA SMALL", 0.8), (other, 0.8), (other, 0.8)))
-            self.assertEqual((d.result, d.reason), ("UPW", "skin_with_other_defect"), other)
+            self.assertEqual((d.result, d.reject), (other, False), other)
         self.assertEqual(decide(frames(("UPW", 0.8), ("UPW", 0.8), ("PKW2", 0.9), ("PKW2", 0.9))).result, "UPW")
+
+    def test_one_pkw_frame_next_to_skin_is_pkw(self):
+        # R1-001428-like cashews of 2026-10-13: 103 went to the TESTA ejector with PKW seen in one frame
+        d = decide(frames(*GOOD3_NECK, ("TESTA SMALL", 0.8), ("TESTA SMALL", 0.8), ("TESTA SMALL", 0.8), ("PKW1", 0.7)))
+        self.assertEqual((d.result, d.reason, d.reject), ("PKW1", "piece_with_skin", False))
+        d = decide(frames(("TESTA", 0.9), ("TESTA", 0.9), ("PKW2", 0.6), ("PKW1", 0.6), ("PKW1", 0.6)))
+        self.assertEqual(d.result, "PKW1")                                   # the piece class with more frames
+        d = decide(frames(("TESTA", 0.9), ("TESTA", 0.9), ("PKW1", 0.3)))    # below the defect confidence: not found
+        self.assertEqual(d.result, "TESTA")
+
+    def test_one_pkw_frame_alone_is_still_not_enough(self):
+        d = decide(frames(*GOOD3_NECK, ("PKW1", 0.9)), {"single_defect_blocks_good": False})
+        self.assertEqual(d.result, dc.GOOD)
+        d = decide(frames(("OIL", 0.9), ("OIL", 0.9), ("PKW1", 0.9)))        # no skin: the priority list as before
+        self.assertEqual(d.result, "OIL")
+
+    def test_a_frame_below_its_class_confidence_gives_no_vote(self):
+        # the grader marks such a frame not usable (UPW at 0.90 with the UPW class confidence at 95 %)
+        low_upw = [FrameVote(float(n), "UPW", 0.90, None, 0.0, usable=False) for n in range(6)]
+        d = dc.decide(low_upw, STRICT)
+        self.assertEqual((d.result, d.reject), (dc.UNDEFINED, True))        # never GOOD
+        d = dc.decide(frames(*GOOD3_NECK) + low_upw[:2], STRICT)
+        self.assertEqual(d.result, dc.GOOD)                                 # two unsure UPW frames do not spoil a good cashew
+        d = dc.decide(low_upw + frames(("UPW", 0.97), ("UPW", 0.99)), STRICT)
+        self.assertEqual(d.result, "UPW")
 
     def test_neck_view_gives_skin_extra_weight(self):
         d = decide(frames(*GOOD3_NECK, ("TESTA", 0.7, "NECK")))
@@ -135,7 +161,7 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual((d.result, d.reject), ("OIL", False))
         self.assertEqual(d.votes, {"OIL": 2})
         d = decide(frames(("TESTA", 0.9), ("TESTA", 0.9), ("BACK_CUT_OIL", 0.9), ("OIL", 0.9)))
-        self.assertEqual(d.result, "UPW")                       # skin + OIL
+        self.assertEqual(d.result, "OIL")                       # skin + OIL: the priority list (no "skin + other = UPW" rule)
         d = decide(frames(("EDGECUT", 0.9), ("EDGECUT", 0.9), ("GOOD_CASHEW", 0.9)))
         self.assertEqual((d.result, d.reject), ("EDGECUT", True))
 
