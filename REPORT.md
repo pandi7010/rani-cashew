@@ -4,6 +4,65 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-14 (13): PKW + TESTA goes to PKW; UPW below its class confidence is no longer counted as GOOD
+
+Owner: "if you found pkw + testa it should goes to pkw only. then upw is detecting as good cashew. fix these".
+The real PLC and the camera were not contacted. **Restart the program (EXIT, start again) before this acts.**
+
+### 1. PKW + TESTA -> PKW
+
+**Why it went to TESTA.** In the log of 13 Oct, 105 cashews with PKW among their frames went to the TESTA / TESTA SMALL
+ejector. In 103 of them PKW was seen in exactly ONE frame, and a defect needs 2 frames, so PKW did not count and TESTA won.
+(When PKW had 2 frames or more it already won: 165 cashews.)
+
+**Changed (`decision.py`).** When skin (TESTA / TESTA SMALL) would be the result and PKW1 or PKW2 was seen in at least one
+frame at the defect confidence, the result is that PKW class (reason `piece_with_skin`; both PKW classes seen: the one
+with more frames). Everything else is as before: UPW still wins over all, one PKW frame WITHOUT skin is still not enough,
+and the old rule "skin + any other defect = UPW" stays removed (this answers L1 of entry (7)).
+
+Replay of the 2,014 logged decisions of 13 / 14 Oct with your saved settings: 105 change, all TESTA / TESTA SMALL -> PKW1
+(94) or PKW2 (11). No other result changes.
+
+### 2. UPW counted as GOOD
+
+**Why.** The UPW class confidence is 95 % (REJECTION 85 %). The code renamed every CNN result below its class confidence
+to GOOD_CASHEW, so a UPW frame seen at 80 - 94 % became a GOOD vote and the cashew could leave as a good grade (L2 of
+entry (7)). Since the 8-class model is active the log holds no UPW frame at all.
+
+**Changed (`cashew_cnn_grader.py`).** A result below its class confidence now gives **no vote**: not for its class and
+not for GOOD. The name and confidence are still shown and logged (`no_vote` in the frames log, "NO VOTE" in the
+inspection text). So:
+- UPW at 95 % or more in 2 frames -> UPW, as before;
+- a cashew whose frames are all UPW below 95 % -> UNDEFINED -> reject ejector, never GOOD;
+- a good cashew with one or two unsure UPW frames stays GOOD.
+
+If real UPW cashews now land at the reject ejector instead of the UPW ejector, the 95 % is too high for this model:
+lower "UPW" on Sorting Logic (the model reports UPW mostly above 95 %, but not always).
+
+### Tested
+
+- `ast` clean. Unit tests: 213 pass, 4 fail. The 4 are the start values of L1 (code 0.60 / 0.70 / 0.75 / 3 frames,
+  tests 0.50 / 0.80 / 0.50 / 2); your saved settings are 0.50 / 0.80 / 0.50 / 2, so the machine is not affected.
+  Tell me which start values are right and I make code and tests agree. 4 new decision tests, 2 old ones corrected.
+- Self-test with the fake PLC passes; with every class confidence above 100 % no cashew is GOOD (all UNDEFINED -> reject).
+
+### Not tested
+
+Real cashews. Check on the machine: a PKW piece with skin -> PKW ejector (RECENT RESULTS shows PKW1 / PKW2); known UPW
+cashews -> UPW ejector or reject ejector, never a good grade.
+
+### Warning: two assistants are editing this folder at the same time
+
+Entry (12) below and its code (uncommitted in `cashew_cnn_grader.py`) were written by another assistant session while I
+was working. I left them as they are and committed only my own lines. Two things in that work need your decision:
+- it contains fixed size limits in code (length < 8 mm, width < 4 mm, area < 25 mm2 -> ignored, no fire), which are
+  machine values nobody asked you for;
+- a cashew for which the mask is never found is now ignored and never fired. If the belt colour settings are wrong
+  (no mask for any cashew), every cashew would pass unsorted instead of going to the reject ejector.
+Please use one assistant at a time on this folder.
+
+---
+
 ## 2026-10-13 (11): The roller and marks on it no longer fire the reject ejector
 
 Owner: "if there is not a cashew also, the background like the roller is detected ... as a rejection. Work on it."

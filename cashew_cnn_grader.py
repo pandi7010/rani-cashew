@@ -1558,11 +1558,11 @@ class ProcessingThread(threading.Thread):
                     def_px, max_px = self._calculate_defect_area(crop, color_thresh=cv_cfg.get("ww_color_thresh", 85)), cv_cfg.get("ww_defect_size_px", 16)
                 if def_px < max_px:
                     cnn_name = "GOOD_CASHEW"
-            # Enforce per-class confidence thresholds: if CNN confidence is below the
-            # required threshold for this class, downgrade the prediction to GOOD_CASHEW.
+            # Per-class confidence (Sorting Logic): a result below the confidence set for its class gives NO vote,
+            # neither for that class nor for GOOD (owner, 2026-10-14: UPW below its limit was counted as GOOD_CASHEW).
+            # The name and confidence stay in the data, for the screen and the log.
             req_conf = state.get("class_confs", {}).get(cnn_name.lower(), 50)
-            if (cnn_conf * 100) < req_conf:
-                cnn_name = "GOOD_CASHEW"
+            data["below_class_conf"] = (cnn_conf * 100) < req_conf
             self.registry.id_for(cnn_name, register=True)
             data["cnn"], data["cnn_conf"] = cnn_name, float(cnn_conf)
             if not data["edge_cut"] and wanted:
@@ -1601,7 +1601,8 @@ class ProcessingThread(threading.Thread):
         feats = [f["feat"] for f in trk.frames if f["feat"]]
         first = trk.path[0]
         past_at_first = fg.progress(flow, line, first[1], first[2])
-        votes = [decision.FrameVote(f["t"], f["cnn"], f["cnn_conf"], f["yolo"], f["yolo_conf"], f["view"], not f["edge_cut"])
+        votes = [decision.FrameVote(f["t"], f["cnn"], f["cnn_conf"], f["yolo"], f["yolo_conf"], f["view"],
+                                    not f["edge_cut"] and not f.get("below_class_conf"))
                  for f in trk.frames]
         d = decision.decide(votes, grading.get("voting"), grading.get("priority"), grading.get("good_classes"),
                             grading.get("skin_classes"), state.get("priority_rules"),
@@ -1706,7 +1707,7 @@ class ProcessingThread(threading.Thread):
         count_keys = [d.result] + ([f"UNDEFINED: {why}"] if d.result == decision.UNDEFINED else [])
         frame_rows = [{"t": round(f["t"] - trk.born_ms, 1), "cnn": f["cnn"], "cnn_conf": round(f["cnn_conf"], 3),
                        "yolo": f["yolo"], "yolo_conf": round(f["yolo_conf"], 3), "view": f["view"], "edge_cut": f["edge_cut"],
-                       "at": round(f["t"], 1), "box": f["box"],
+                       "no_vote": bool(f.get("below_class_conf")), "at": round(f["t"], 1), "box": f["box"],
                        "feat": {k: round(v, 3) for k, v in f["feat"].items()} if f["feat"] else None} for f in trk.frames]
         detail = [f"{trk.id}   {label}   relay {relay if relay else '-'}   {fire_result}",
                   f"length {mm_length:.1f} mm (median of {len(feats)} frames: " + " ".join(f"{x['length_px'] / px_per_mm:.1f}" for x in feats) + ")   "
@@ -1719,7 +1720,7 @@ class ProcessingThread(threading.Thread):
             feat_txt = (f"L {r['feat']['length_px'] / px_per_mm:5.1f} mm  W {r['feat']['width_px'] / px_per_mm:4.1f} mm  b* {r['feat']['b']:5.1f}   "
                         + view_features.short_text(r["feat"]) + f" dark%{r['feat']['dark_pct']:.1f} red%{r['feat']['red_pct']:.1f}") if r["feat"] else "(no mask)"
             detail.append(f"+{r['t']:6.0f} ms  CNN {str(r['cnn']):<12} {r['cnn_conf']:.2f}  YOLO {str(r['yolo']):<12} {r['yolo_conf']:.2f}  "
-                          f"{r['view']:<5}{' EDGE' if r['edge_cut'] else ''}  {feat_txt}")
+                          f"{r['view']:<5}{' EDGE' if r['edge_cut'] else ''}{' NO VOTE (below class confidence)' if r['no_vote'] else ''}  {feat_txt}")
         shown_class = label
         if d.reason.startswith(decision.SIZE_NOT_READY):        # SHADOW: "GOOD (would be W240)" / "TESTA SMALL (PASS) (would be W240)"
             shown_class = label.replace("UNDEF SIZE_NOT_READY (", "").rstrip(")").replace(", would be ", " (would be ") + ")"
