@@ -14,6 +14,7 @@ class, when, on how many images) are written next to the model as <model>.json.
 import json
 import os
 import random
+import re
 import shutil
 import time
 from datetime import datetime
@@ -47,18 +48,78 @@ def read_metrics(model_path):
         return None
 
 
+# GSN_V21: frames of ONE cashew. The capture names carry the cashew: crop_<time ms>_<track id>.jpg (dataset capture) and
+# <HHMMSS>_<cashew id>_v<n>.jpg (production capture). A cashew is photographed many times while it rolls past.
+_VIEW_NAME = re.compile(r"^(.+)_v\d+$")
+_TRACK_NAME = re.compile(r"^(.*?)(\d{10,})_(\d+)$")
+SAME_CASHEW_GAP_MS = 3000       # a track id is used again later for another cashew; a pause this long starts a new one
+
+
+def cashew_groups(paths):
+    """[[paths of one cashew], ...]. An image whose name does not say which cashew it is forms a group of its own."""
+    views, tracks, groups = {}, {}, []
+    for path in paths:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        view, track = _VIEW_NAME.match(stem), _TRACK_NAME.match(stem)
+        if view:
+            views.setdefault(view.group(1), []).append(path)
+        elif track:
+            tracks.setdefault((track.group(1), track.group(3)), []).append((int(track.group(2)), path))
+        else:
+            groups.append([path])
+    groups += list(views.values())
+    for frames in tracks.values():
+        frames.sort()
+        current = [frames[0][1]]
+        for (before, _), (now, path) in zip(frames, frames[1:]):
+            if now - before > SAME_CASHEW_GAP_MS:
+                groups.append(current)
+                current = []
+            current.append(path)
+        groups.append(current)
+    return groups
+
+
 def split_train_val(images_by_class, val_fraction=0.2, seed=1):
-    """Shuffled split per class, so every class is in both parts."""
+    """Shuffled split per class, so every class is in both parts.
+    GSN_V21: all frames of one cashew go to the same part (cashew_groups). With frames of the same cashew on both sides the
+    validation only measures whether the model remembers that cashew, and the accuracy looks better than it is."""
     rng = random.Random(seed)
     train, val = [], []
     for index, (name, paths) in enumerate(images_by_class.items()):
         paths = list(paths)
-        rng.shuffle(paths)
         n_val = max(MIN_VAL_PER_CLASS, int(round(len(paths) * val_fraction)))
         n_val = min(n_val, max(0, len(paths) - 1))
-        val += [(path, index) for path in paths[:n_val]]
-        train += [(path, index) for path in paths[n_val:]]
+        groups = cashew_groups(paths)
+        rng.shuffle(groups)
+        if len(groups) < 2:                         # one cashew only: its frames have to be divided
+            rng.shuffle(paths)
+            chosen, rest = paths[:n_val], paths[n_val:]
+        else:
+            chosen, rest = [], []
+            for position, group in enumerate(groups):
+                last_for_training = not rest and position == len(groups) - 1
+                too_many = bool(chosen) and len(chosen) + len(group) > 1.5 * n_val
+                if len(chosen) >= n_val or last_for_training or too_many or (not chosen and len(group) > 1.5 * n_val):
+                    rest += group
+                else:
+                    chosen += group
+            if not chosen:                          # every cashew has more frames than the validation part: the smallest one
+                smallest = min(groups, key=len)
+                chosen = list(smallest)
+                rest = [path for group in groups if group is not smallest for path in group]
+        val += [(path, index) for path in chosen]
+        train += [(path, index) for path in rest]
     return train, val
+
+
+def readable_images(paths):
+    """(paths OpenCV can read, paths it cannot). GSN_V21: one broken file must not end a training run."""
+    import cv2
+    good, bad = [], []
+    for path in paths:
+        (good if cv2.imread(path) is not None else bad).append(path)
+    return good, bad
 
 
 def _load_rgb(path):
@@ -86,7 +147,12 @@ def train_cnn(dataset_dir, classes, epochs, out_dir, name_prefix="cnn", progress
     from torchvision import models, transforms
 
     all_images = list_class_images(dataset_dir)
-    images = {name: all_images.get(name, []) for name in classes}
+    images, unreadable = {}, []
+    for name in classes:
+        images[name], broken = readable_images(all_images.get(name, []))
+        unreadable += broken
+    if unreadable:
+        print(f"[TRAIN] {len(unreadable)} image(s) cannot be read and are left out: {unreadable[:5]}")
     empty = [name for name, paths in images.items() if len(paths) < MIN_VAL_PER_CLASS + 1]
     if empty:
         raise ValueError(f"These classes have fewer than {MIN_VAL_PER_CLASS + 1} images: {', '.join(empty)}")
@@ -94,6 +160,7 @@ def train_cnn(dataset_dir, classes, epochs, out_dir, name_prefix="cnn", progress
         raise ValueError("At least 2 classes are needed")
     class_names = list(images.keys())
     train_items, val_items = split_train_val(images)
+    val_cashews = {name: len(cashew_groups([path for path, label in val_items if label == i])) for i, name in enumerate(class_names)}
 
     import preprocess
     normalize = transforms.Normalize(preprocess.IMAGENET_MEAN, preprocess.IMAGENET_STD)
@@ -209,7 +276,8 @@ def train_cnn(dataset_dir, classes, epochs, out_dir, name_prefix="cnn", progress
     result = {
         "type": "cnn", "architecture": "MobileNetV2", "model": os.path.basename(model_path), "trained": stamp.strftime("%Y-%m-%d %H:%M"),
         "dataset": str(dataset_dir), "classes": class_names, "images": {name: len(images[name]) for name in class_names},
-        "train_images": len(train_items), "val_images": len(val_items), "epochs_run": len(history), "best_epoch": best["epoch"],
+        "train_images": len(train_items), "val_images": len(val_items), "val_cashews": val_cashews, "unreadable_images": unreadable,
+        "epochs_run": len(history), "best_epoch": best["epoch"],
         "val_accuracy": round(best["val_acc"], 4), "val_balanced_accuracy": round(best["balanced"], 4),
         "per_class": {name: {"correct": best["correct"][i], "total": best["total"][i],
                              "accuracy": round(best["correct"][i] / best["total"][i], 4) if best["total"][i] else None,
@@ -218,7 +286,8 @@ def train_cnn(dataset_dir, classes, epochs, out_dir, name_prefix="cnn", progress
         "confusion_matrix": best["matrix"], "wrong_images": wrong_images[:2000], "wrong_images_total": len(wrong_images),
         "pass_classes": [str(c) for c in pass_classes],
         "pretrained": pretrained, "device": str(device), "history": history,
-        "note": "Accuracy is measured on validation images that were not used for training.",
+        "note": "Accuracy is measured on validation images that were not used for training. All frames of one cashew are in the "
+                "same part, so a validation cashew was never seen in training.",
     }
     result["reports"] = training_report.save_all(model_path, history, best["matrix"], class_names, pass_classes)
     with open(metrics_path(model_path), "w", encoding="utf-8") as f:

@@ -4,6 +4,89 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-13 (8): Dataset and CNN training check; validation split fixed
+
+Looked at all images of `programs/Default/dataset` and `testset` (class sample sheets, every GOOD_CASHEW image), read
+`training.py`, `preprocess.py`, `training_ui.py`, `training_report.py`, `dataset_import.py` and the CNN part of the grader,
+and ran comparison trainings on the PC (30 epochs, 14 classes, results in a scratch folder, nothing in `saved_models`).
+The real PLC and the camera were not contacted. The rest of the program was checked this morning in entry (7); not repeated.
+
+### Changed (one commit: `training.py`, `tests/test_teaching.py`)
+
+1. **Validation split by cashew.** A cashew is photographed many times while it rolls (UPW: 408 images of about 55
+   cashews; GOOD_CASHEW: 3 cashews have 91 frames each = 273 of 747 images). The old split shuffled single images, so
+   342 of 486 validation images had frames of the same cashew in the training part. The validation accuracy and the
+   "best epoch" were measured on cashews the model had already seen. Now all frames of one cashew go to the same part
+   (`training.cashew_groups`, from the file name: `crop_<time>_<track id>` and `<HHMMSS>_<id>_v<n>`). The result file
+   has the new field `val_cashews` (validation cashews per class).
+2. **An unreadable image no longer ends a training run**; it is left out and listed in `unreadable_images`.
+
+Limit: when the tracker gave one cashew two ids, its frames can still be on both sides. Names without time and id
+(`old_crop_0002.jpg`) count as one cashew each.
+
+### Measured with the new split (30 epochs, pre-trained MobileNetV2, RTX 3050, about 7 minutes)
+
+| | validation | test set (215 images) |
+|---|---|---|
+| new split, training unchanged | 81.5 % (balanced 81.3 %), best epoch 8 | 55 % |
+| new split + milder crop / no saturation change | 84.3 % (balanced 81.2 %), best epoch 16 | 60 % |
+| old model `cnn_Default_20261010_195822` (old split, as reported then) | 87.3 % | 74 % (DOUBLE, DW2 not known) |
+| old model `cnn_Default_20261010_162504` | 84.2 % | 81 % |
+
+- Validation accuracy jumps between 61 % and 85 % from epoch to epoch: with whole cashews the validation part has few
+  cashews (SW 2, WHITE_DW 1, KNIEF_MARK 3, DW2 3), so one cashew moves the number a lot. The number is honest now, but coarse.
+- The milder augmentation is within that noise. It is **not** in the code. A third run (label smoothing, cosine learning
+  rate) was lost when the session restarted; no result.
+- The test-set numbers are low for a reason that is in the data, see D1.
+
+### Dataset findings, most important first
+
+**D1. Classes are tied to capture sessions with different lighting.** Cashew colour b* / background blue:
+GOOD_CASHEW in the dataset 15-22 / 48-50; PKW1 31 / 32; PKW2 28 / 26 (180 of 198 PKW1 and 201 of 208 PKW2 images are from
+the old yellow-looking session). The test set still has yellow-session GOOD images (b* 27.5): the new model calls 28 of
+63 of them PKW1. So the model partly learns "yellow picture = PKW". With today's camera settings only 18 PKW1 and 7 PKW2
+images exist. Whether PKW is found on the machine today cannot be judged from these numbers.
+
+**D2. Classes that look the same in the pictures.** SW and GOOD_CASHEW (b* 21.6 vs 20.8; SW 53-77 % in every training);
+OIL and KNIEF_MARK (both a brown line along the seam); TESTA and TESTA SMALL (no clear size limit in the images).
+Owner's rule of 2026-10-09 was "no SW class", but a `SW` folder with 76 images exists and was trained (see L6 in entry 7).
+
+**D3. Too few images:** JH 1, EDGECUT 2 (both show the same cashew), DW1 8 (about 5 cashews), DW2 37 (17 cashews),
+WHITE_DW 46 (17 cashews).
+
+**D4. 46 images have a white dot drawn on the cashew** (GOOD_CASHEW 30 + 3 in the test set, TESTA SMALL 8, PKW1 3 + 1,
+OIL 1). They come from an older program version; today's capture code saves the clean frame.
+
+**D5. Test set:** about a third of its images have frames of the same cashew in the training dataset, and it has no
+SW, KNIEF_MARK, DW1 images. Its numbers on the AI Model Select page are for the old sessions.
+
+**D6. GOOD_CASHEW was sorted by eye today** (owner's request): 107 images that did not look like a clean whole kernel
+were moved to `programs/Default/review_not_good_from_GOOD_CASHEW/<type>/` (outside the dataset, so they are not a
+class). `moved_files.csv` in that folder lists them. Owner's correction applied: small specks on a light kernel are GOOD.
+
+### Other things seen in the training code (not changed)
+
+- START is not blocked while a training runs (training is blocked while RUNNING, not the other way round). Grading
+  and training would share the graphics card.
+- A low-confidence defect becomes a GOOD vote (L2 in entry 7): still open.
+- No fixed random seed: two trainings on the same data give slightly different models.
+
+### Tests
+
+`ast` clean. Unit tests: 198 pass, 7 fail; the 7 are the decision-rule tests of L1 in entry (7), unchanged. 2 new tests
+(split by cashew, unreadable image) pass. Not tested: the Teaching CNN page on the machine screen with the new split,
+and any new model on real cashews.
+
+### Questions for you
+
+1. D1: can you capture PKW1, PKW2 (and DW1, DW2, WHITE_DW) again with today's camera settings? Or shall I plan a colour
+   correction from the blue roller (same step in training and in live grading; a big change, plan first)?
+2. D2: SW as a CNN class, yes or no? Keep OIL and KNIEF_MARK apart, or one class?
+3. Rebuild the test set by whole cashews (moves files between `dataset` and `testset`)?
+4. Block START while a training runs?
+
+---
+
 ## 2026-10-13 (7): Health and logic check of the whole program
 
 Read-only check. Nothing was changed in code or settings, the real PLC and the camera were not contacted.

@@ -107,6 +107,38 @@ class TrainingTest(unittest.TestCase):
             self.assertLess(got.shape[0], 200)                                               # tight crop around the cashew
             self.assertTrue(np.array_equal(got, expected))
 
+    def test_frames_of_one_cashew_are_never_on_both_sides_of_the_split(self):
+        # dataset capture: crop_<time ms>_<track id>; production capture: <HHMMSS>_<cashew id>_v<n>
+        burst = [f"/d/UPW/crop_{1789975937470 + 50 * n}_1321.jpg" for n in range(9)]
+        later = [f"/d/UPW/crop_{1789975937470 + 60000 + 50 * n}_1321.jpg" for n in range(4)]      # the id used again a minute later
+        views = [f"/d/UPW/020332_R2-000002_v{n}.jpg" for n in range(1, 5)]
+        other = ["/d/UPW/old_crop_0002.jpg", "/d/UPW/old_0088_cashew_1788563085198_1766_1650.jpg", "/d/UPW/old_crop_1789975937470_7.jpg"]
+        groups = sorted(training.cashew_groups(burst + later + views + other), key=len)
+        self.assertEqual([len(g) for g in groups], [1, 1, 1, 4, 4, 9])
+        self.assertEqual(sorted(groups[-1]), sorted(burst))
+
+        images = {"UPW": burst + later + views + other,
+                  "GOOD_CASHEW": [f"/d/GOOD_CASHEW/crop_{1789975000000 + 50 * n}_{n // 10}.jpg" for n in range(60)],     # 6 cashews, 10 frames each
+                  "ONE": [f"/d/ONE/crop_{1789975000000 + 50 * n}_5.jpg" for n in range(12)]}                              # a single cashew
+        train, val = training.split_train_val(images)
+        self.assertEqual(len(train) + len(val), sum(len(v) for v in images.values()))
+        self.assertFalse({p for p, _ in train} & {p for p, _ in val})
+        for index, name in enumerate(images):
+            in_train, in_val = [p for p, l in train if l == index], [p for p, l in val if l == index]
+            self.assertTrue(in_train and in_val, name)                                       # every class is in both parts
+            if name != "ONE":                                                                # one cashew only: it has to be divided
+                group_of = {p: n for n, g in enumerate(training.cashew_groups(images[name])) for p in g}
+                self.assertFalse({group_of[p] for p in in_train} & {group_of[p] for p in in_val}, name)
+        self.assertEqual(len([p for p, l in val if l == 1]), 10)                             # about 20 % of 60, whole cashews
+
+    def test_an_unreadable_image_is_left_out_and_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            good, broken = os.path.join(tmp, "a.jpg"), os.path.join(tmp, "b.jpg")
+            cashew(good)
+            with open(broken, "wb") as f:
+                f.write(b"not a picture")
+            self.assertEqual(training.readable_images([good, broken]), ([good], [broken]))
+
     def test_small_training_run_keeps_validation_apart_and_writes_the_result(self):
         with tempfile.TemporaryDirectory() as tmp:
             data, out = os.path.join(tmp, "dataset"), os.path.join(tmp, "models")
