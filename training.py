@@ -185,6 +185,7 @@ def train_cnn(dataset_dir, classes, epochs, out_dir, name_prefix="cnn", progress
     val_loader = DataLoader(Items(val_items, eval_tf), batch_size=batch_size, shuffle=False, num_workers=0)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(1)        # GSN_V21: the same images give the same order and augmentation in every run
     try:
         if not pretrained:
             raise RuntimeError("pre-trained weights not wanted")
@@ -198,8 +199,14 @@ def train_cnn(dataset_dir, classes, epochs, out_dir, name_prefix="cnn", progress
     model = model.to(device)
     # Rare classes count as much as frequent ones.
     counts = torch.tensor([len(images[name]) for name in class_names], dtype=torch.float32)
-    criterion = nn.CrossEntropyLoss(weight=(counts.sum() / (len(counts) * counts)).to(device))
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3 if not pretrained else 3e-4)
+    # GSN_V21: label smoothing, weight decay and a learning rate that rises and then falls to zero. With a fixed rate the
+    # validation accuracy jumped by 20 points from epoch to epoch and the "best epoch" was luck; now the last epochs settle.
+    criterion = nn.CrossEntropyLoss(weight=(counts.sum() / (len(counts) * counts)).to(device), label_smoothing=0.1)
+    peak_lr = 1e-3 if not pretrained else 3e-4
+    optimizer = torch.optim.AdamW(model.parameters(), lr=peak_lr, weight_decay=1e-2)
+    total_steps = max(2, int(epochs) * len(train_loader))
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=peak_lr, total_steps=total_steps, pct_start=0.15)
+    steps_done = 0
 
     def evaluate():
         """Validation: correct / total per class, the loss, and the confusion matrix (rows = label, columns = prediction)."""
@@ -232,6 +239,9 @@ def train_cnn(dataset_dir, classes, epochs, out_dir, name_prefix="cnn", progress
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+            steps_done += 1
+            if steps_done < total_steps:
+                scheduler.step()
             running += loss.item() * inputs.size(0)
             seen += inputs.size(0)
             train_right += int((outputs.argmax(dim=1) == labels).sum().item())

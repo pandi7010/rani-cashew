@@ -4,6 +4,76 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-13 (9): Dataset cleaned (yellow light, white dots, test set); steadier training; START blocked while training
+
+Owner: "check and solve all the issues, you can delete the yellow lighting images". The real PLC and the camera were
+not contacted. Nothing was deleted for good: every removed image is in `programs/Default/trash/20261013_134423_cleanup/`,
+and `changes.csv` in that folder lists every file (from, to, why).
+
+### Dataset (`programs/Default`, not in git)
+
+| # | What | Count |
+|---|---|---|
+| 1 | Yellow-light images (captured 3 to 7 Sept, names with `_cashew_`, and the yellow ones of `old_crop_NNNN`) taken out of the **dataset** | 357 (PKW2 183, PKW1 147, BROWN 27) |
+| 2 | The same images put back **colour corrected** to today's light, as `wb_<old name>.jpg` | 357 |
+| 3 | Yellow-light images taken out of the **test set** (no corrected copy there) | 103 |
+| 4 | Images with a white dot drawn on the cashew taken out | 46 |
+| 5 | Test images whose cashew also had frames in the dataset moved into the dataset | 68 |
+| 6 | New test set: whole cashews held back, about 10 % per class, never more than 30 % of the real images of a class | 229 images, 14 classes |
+
+Why corrected and not only deleted: without the yellow images only 51 PKW1 and 27 PKW2 images are left. I trained both
+ways and tested on real white-light PKW1 cashews that neither model had seen: yellow images deleted = 12 of 23 found,
+yellow images colour corrected = 20 of 23 found, and no more GOOD cashews called PKW (0 of 37 against 2 of 37).
+The correction is one fixed gain per colour channel (blue x 1.56, green x 1.19, red x 1.17 for the dark yellow session;
+1.08 / 0.82 / 0.81 for the bright one), taken from GOOD cashews of both sessions. It is an approximation: real PKW images
+with today's settings are still better. To undo: delete the `wb_*.jpg` files and move the trash images back.
+
+After the clean-up (dataset / test set): GOOD_CASHEW 670 / 74, UPW 379 / 42, PKW2 202 / 8, TESTA 197 / 23, PKW1 189 / 9,
+TESTA SMALL 108 / 12, BROWN 97 / 11, OIL 85 / 9, REJECTION 81 / 9, SW 67 / 9, KNIEF_MARK 59 / 6, DOUBLE 50 / 6,
+WHITE_DW 43 / 5, DW2 35 / 6, DW1 8 / 0, EDGECUT 2 / 0, JH 1 / 0. No cashew is in both parts.
+
+### Code (one commit)
+
+1. `training.py`: label smoothing 0.1, AdamW with weight decay, learning rate that rises and then falls to zero
+   (OneCycle), fixed random seed. Before, the validation accuracy jumped between 60 % and 82 % from epoch to epoch and
+   the "best epoch" was luck; now the last 10 epochs stay within 1 point.
+2. `cashew_cnn_grader.py`: START is refused while a training runs (message: wait or stop the training). Only this
+   change of that file is in the commit; the other uncommitted edits of that file are untouched.
+
+### Measured on the new test set (229 real white-light images, cashews never trained on)
+
+| Training (30 epochs, all 14 classes with 15+ images) | validation | test set | GOOD_CASHEW found |
+|---|---|---|---|
+| old recipe | 82.2 % | 64 % | 38 of 74 |
+| new recipe (in the code now) | 79.8 % | 69 % | 49 of 74 |
+| new recipe, **SW not ticked** | 85.7 % | 77 % | 60 of 74 |
+
+One run each, so a few points up or down is noise. The old models of 10 Oct score 80-84 % on this test set, but they
+were trained on most of these images, so that number does not count.
+
+**SW is the biggest loss:** with the SW class 16-17 of 74 GOOD cashews are called SW. In the pictures SW and GOOD look
+the same. I did not move the SW folder (yours, made on 10 Oct); in the class list before training you can untick SW.
+
+Still weak in every run: TESTA against TESTA SMALL (3 to 7 of 23 mixed up), PKW2 (3 of 8; 3 more called PKW1),
+WHITE_DW (1 of 5), OIL against KNIEF_MARK.
+
+### Not solved, and why
+
+- The 7 failing decision tests and L1 / L2 / L3 of entry (7): they depend on voting values and rules that are yours
+  (defect / GOOD / REJECTION confidence and frames, the UPW rule, what a low-confidence frame counts as).
+- SW as a class, OIL / KNIEF_MARK as one or two classes, TESTA / TESTA SMALL limit: your grading decisions.
+- DW1 (8), EDGECUT (2), JH (1): too few images to train; only new captures help.
+- `review_not_good_from_GOOD_CASHEW/` (107 images I sorted out of GOOD by eye): still waits for your look.
+
+### Tests
+
+`ast` clean. Unit tests 198 pass, 7 fail (the same 7 as before). Whole-program self-test with the fake PLC
+(`tools/ui_selftest.py` + `tools/selftest_teaching.py`): passes, including START / STOP and a Teaching CNN training.
+Not tested: the new START message on the real screen during a real training; any model on real cashews.
+No model was put into `saved_models`; the active CNN is unchanged.
+
+---
+
 ## 2026-10-13 (8): Dataset and CNN training check; validation split fixed
 
 Looked at all images of `programs/Default/dataset` and `testset` (class sample sheets, every GOOD_CASHEW image), read

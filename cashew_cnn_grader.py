@@ -5560,6 +5560,9 @@ except Exception as e:
             self.relay_output.cancel_pending()      # STOPPED: nothing fires from grading, also not what was still waiting
         elif ph == "READY" and self.ejector_check.busy():
             messagebox.showwarning("Ejector check", "The ejector check is running. Stop it first.")
+        elif ph == "READY" and getattr(self, "is_training", False):
+            # Training uses the same graphics card: the inspection would get slower and the fire timing with it.
+            messagebox.showwarning("Training", "A training is running. Wait for it to finish or stop it in its window, then START.")
         elif ph == "READY":
             st = self.shared_state.get_processing_state()
             if st["roi1"] and st["roi2"] and st["line_pos"] is not None and st["line_pos2"] is not None:
