@@ -100,24 +100,21 @@ class DecisionTest(unittest.TestCase):
         d = decide(frames(*GOOD3_NECK, ("TESTA", 0.7, "NECK")), {"neck_weight": 1})
         self.assertEqual(d.reason, dc.SINGLE_DEFECT_FRAME)
 
-    def test_yolo_rejection_wins_over_everything(self):
-        votes = frames(("GOOD_CASHEW", 0.99, "NECK", "REJECTION", 0.6), ("GOOD_CASHEW", 0.99, "TOP", "REJECTION", 0.7),
-                       ("UPW", 0.9), ("UPW", 0.9), ("GOOD_CASHEW", 0.99))
+    def test_yolo_class_has_no_say_in_rejection(self):
+        # owner, 2026-10-13: YOLO only finds the cashew; the CNN alone says what it is
+        votes = frames(("GOOD_CASHEW", 0.99, "NECK", "REJECTION", 0.9), ("GOOD_CASHEW", 0.99, "TOP", "REJECTION", 0.9),
+                       ("GOOD_CASHEW", 0.99, "OTHER", "REJECTION", 0.9), ("GOOD_CASHEW", 0.99, "OTHER", "REJECTION", 0.9))
         d = decide(votes)
-        self.assertEqual((d.result, d.reject), (dc.REJECTION, True))
-
-    def test_yolo_rejection_needs_two_frames(self):
-        d = decide(frames(("GOOD_CASHEW", 0.99, "NECK", "REJECTION", 0.9), ("GOOD_CASHEW", 0.99), ("GOOD_CASHEW", 0.99)))
-        self.assertEqual(d.result, dc.GOOD)
-        d = decide(frames(("GOOD_CASHEW", 0.9, "NECK", "REJECTION", 0.4), ("GOOD_CASHEW", 0.9, "TOP", "REJECTION", 0.4), ("GOOD_CASHEW", 0.9)))
-        self.assertEqual(d.result, dc.GOOD)                     # below the rejection confidence
+        self.assertEqual((d.result, d.reject), (dc.GOOD, False))
+        self.assertNotIn(dc.REJECTION, d.seen)
 
     def test_cnn_rejection_counts_once_the_cnn_has_that_class(self):
         self.assertEqual(decide(frames(("REJECTION", 0.8), ("REJECTION", 0.6))).result, dc.REJECTION)
 
-    def test_yolo_class_is_used_when_the_cnn_gave_none(self):
-        d = decide(frames((None, 0.0, "OTHER", "DW1", 0.7), (None, 0.0, "OTHER", "DW1", 0.8)))
-        self.assertEqual(d.result, "DW1")
+    def test_yolo_class_is_not_used_when_the_cnn_gave_none(self):
+        d = decide(frames((None, 0.0, "OTHER", "DW1", 0.7), (None, 0.0, "OTHER", "DW1", 0.8), (None, 0.0, "OTHER", "REJECTION", 0.9)))
+        self.assertEqual((d.result, d.reject), (dc.UNDEFINED, True))        # no CNN answer: not decided, never a YOLO class
+        self.assertEqual(d.votes, {})
 
     def test_double_kernel(self):
         d = decide(frames(*GOOD3_NECK), double=True)

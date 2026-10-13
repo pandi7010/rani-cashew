@@ -73,8 +73,9 @@ class FrameVote:
 
     @property
     def cls(self):
-        """The class of the frame: the CNN's, or YOLO's when the CNN gave none."""
-        return (self.cnn_class, self.cnn_conf) if self.cnn_class else (self.yolo_class, self.yolo_conf)
+        """The class of the frame: the CNN's, and only the CNN's. Owner, 2026-10-13: YOLO finds the cashew in the frame;
+        it has no say in what the cashew is. Its class is still stored (yolo_class) for the log and the screen."""
+        return (self.cnn_class, self.cnn_conf)
 
 
 @dataclass
@@ -150,9 +151,8 @@ def decide(votes: List[FrameVote], voting: Optional[dict] = None, priority: Opti
         if name:
             display.setdefault(key, name)
             d.votes[display[key]] = d.votes.get(display[key], 0) + 1
-        if ((f.yolo_class and normalize_name(f.yolo_class) == rejection and f.yolo_conf >= v["rejection_conf"]) or
-                (f.cnn_class and normalize_name(f.cnn_class) == rejection and f.cnn_conf >= v["rejection_conf"])):
-            rejection_frames += 1
+        if f.cnn_class and normalize_name(f.cnn_class) == rejection and f.cnn_conf >= v["rejection_conf"]:
+            rejection_frames += 1       # the CNN's REJECTION only; YOLO's class does not count (owner, 2026-10-13)
         if not key or key == rejection:
             continue
         if key in good_set:

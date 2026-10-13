@@ -4,6 +4,34 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-13 (10): Only the CNN decides the class; YOLO's class has no say
+
+Owner, 2026-10-13: "YOLO's only work is to detect the cashew from the frame, it has no authority to tell what type it is.
+The CNN only should decide what it is."
+
+**Why it came up.** With the new 8-class CNN active, cashew R2-001434 (16:38:07) went to the reject ejector: the CNN said
+GOOD_CASHEW in 36 of 38 frames, YOLO said REJECTION in 5 frames, and the rule "REJECTION from YOLO or CNN in 2 frames"
+rejected it. YOLO's class is right for about 35 % of the labelled test cashews (the 8-class CNN: 84 %), and on today's
+log it called 33 % of all frames DW1.
+
+**Changed (`decision.py`):**
+1. REJECTION counts only when the CNN says REJECTION (confidence and frame number as set in Sorting Logic).
+2. A frame for which the CNN gave no class has no vote. Before, YOLO's class was used for it.
+
+YOLO still finds the cashews, and its class and confidence are still written to the log and shown in the inspection
+window, for information only. The inspection window marks "deciding" frames by the CNN only (that window is part of the
+uncommitted work in `cashew_cnn_grader.py`, so this small edit is not in the commit).
+
+**Consequence to know:** if no CNN model can be loaded, no cashew gets a class: every one is UNDEFINED and goes to the
+reject ejector. Before, the YOLO classes were used in that case.
+
+**Tests.** `ast` clean. Unit tests 198 pass, 6 fail: the decision-rule tests of L1 in entry (7); the old test "YOLO
+rejection wins" is replaced by "YOLO class has no say" and "YOLO class is not used when the CNN gave none" (both pass).
+Whole-program self-test with the fake PLC passes. Not tested on the machine. **The running program must be restarted
+(EXIT, start again) before the change acts.**
+
+---
+
 ## 2026-10-13 (9): Dataset cleaned (yellow light, white dots, test set); steadier training; START blocked while training
 
 Owner: "check and solve all the issues, you can delete the yellow lighting images". The real PLC and the camera were
