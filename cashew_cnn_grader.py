@@ -56,6 +56,7 @@ import dataset_ops
 import relay_mapping
 import decision
 import grading_config
+import lane_tracker
 from lane_tracker import LaneTracker, Detection, crossing_time, track_speed
 from cashew_log import CashewLog
 
@@ -1328,6 +1329,7 @@ class ProcessingThread(threading.Thread):
         self._clean_frame = clean_frame
         self._live_size_cfg = state["size_config"]
         flow, grading = state["flow"], state["grading"]
+        self._live_grading = grading
         lines = {1: state["line_pos"], 2: state.get("line_pos2")}
         if draw:
             self._draw_lines(frame, state, 2)
@@ -1423,7 +1425,7 @@ class ProcessingThread(threading.Thread):
                 progress = fg.progress(flow, line, trk.cx, trk.cy) if line is not None else None
                 if progress is not None and progress < 0 and not trk.missed:
                     self._golden_capture(clean_frame, trk, state)
-                if progress is not None and progress >= 0 and not trk.decided:
+                if progress is not None and progress >= 0 and not trk.decided and not self._awaits_proof(trk, rid, flow, line):
                     # One cashew = one decision = at most one fire: a fragment is closed without a decision.
                     pd = self.perf.start()
                     if not self._close_fragment(trk, rid, flow, "AT_LINE"):
@@ -1607,8 +1609,11 @@ class ProcessingThread(threading.Thread):
                             appeared_after_line=past_at_first >= 0, stuck=trk.stuck, lost_ms=trk.max_gap_ms,
                             max_lost_ms=float(grading.get("rules", {}).get("max_lost_ms", 300.0)),
                             view_engine=engine_mode["view"], reject_classes=grading.get("reject_classes"))
-        # Time already gone since the line (only for a cashew first seen after it): taken off the delay.
-        late_ms = (past_at_first / self.trackers[rid].lane_speed) if (past_at_first >= 0 and self.trackers[rid].lane_speed > 0) else 0.0
+        # Time already gone since the line (a cashew first seen after it, or one that had to show first that it moves
+        # with the belt): taken off the delay. Measured from where the cashew is NOW.
+        belt = self._belt_px_ms(rid)
+        past_now = fg.progress(flow, line, trk.cx, trk.cy)
+        late_ms = (max(0.0, past_now) / belt) if ((past_at_first >= 0 or trk.info.get("waited")) and belt > 0) else 0.0
 
         # Engines can only ADD a reject to an accepted cashew. SHADOW: noted as "would reject", nothing changes.
         shadow = list(d.shadow)
@@ -1848,7 +1853,37 @@ class ProcessingThread(threading.Thread):
         box_area = abs(trk.box[2] - trk.box[0]) * abs(trk.box[3] - trk.box[1])
         if usual > 0 and trk.hits <= self.NOISE_MAX_HITS and box_area < self.NOISE_AREA_SHARE * usual:
             return decision.NOISE, None
+        # Owner's limit (Sorting Logic, "Ignore objects smaller than"): dust, a stain on the belt or on a roller.
+        min_mm = float((getattr(self, "_live_grading", None) or {}).get("rules", {}).get("min_object_mm", 0.0) or 0.0)
+        if min_mm > 0:
+            side = lane_tracker.long_side_px([f.get("box") for f in trk.frames] or [trk.box])
+            if side < min_mm * px_per_mm_of(getattr(self, "_live_size_cfg", None) or {}, rid):
+                return decision.NOISE, None
         return None, None
+
+    def _belt_px_ms(self, rid):
+        """Belt speed in px/ms: measured on the cashews of this lane, or (none seen yet since the start) the
+        Conveyor speed of the Pneumatic page. Only used as "does this move with the belt at all" and for a late fire."""
+        lane = self.trackers[rid].lane_speed
+        if lane > 0:
+            return lane
+        mm_s = float(getattr(self.shared_state, "conveyor_speed_mm_s", 0.0) or 0.0)
+        return mm_s * px_per_mm_of(getattr(self, "_live_size_cfg", None) or {}, rid) / 1000.0
+
+    def _awaits_proof(self, trk, rid, flow, line) -> bool:
+        """At / after the Decision line: True while the detection has not shown that it moves with the belt. It is not
+        decided (so nothing fires) until it has. A roller or a mark at the belt end is seen for a frame or stands
+        still; it ends as BACKGROUND in _log_lost. A standing cashew is still caught by the STUCK rule."""
+        if trk.stuck:
+            return False
+        first = trk.path[0]
+        if trk.hits < lane_tracker.PROOF_HITS and fg.progress(flow, line, first[1], first[2]) < 0:
+            return False                    # seen before the line and then missed: decided as before (too few frames -> reject)
+        fraction = float(self.trackers[rid].params["stuck_speed_fraction"])
+        if lane_tracker.moves_with_belt(trk, flow, self._belt_px_ms(rid), fraction):
+            return False
+        trk.info["waited"] = True
+        return True
 
     def _track_note(self, trk, rid):
         """Where a track was seen and what was next to it, for the log."""
@@ -1890,6 +1925,13 @@ class ProcessingThread(threading.Thread):
         A fragment of another cashew (MERGED) or a tiny short-lived box (NOISE) is logged but is not a lost cashew."""
         flow = self.shared_state.flow_direction
         if self._close_fragment(trk, rid, flow, "ENDED"):
+            return
+        if trk.info.get("waited"):          # reached the line without ever moving with the belt: not a cashew
+            self.shared_state.count_result(f"{decision.IGNORED_PREFIX}{decision.BACKGROUND}")
+            self.cashew_log.write({"id": trk.id, "roi": rid, "frames": len(trk.frames), "result": decision.BACKGROUND,
+                                   "reason": "NOT_MOVING_WITH_BELT", "fire": "NOT_FIRED", "shadow": self._track_note(trk, rid)},
+                                  frames=self._frame_rows(trk))
+            self.undefined_capture.forget(trk.id)
             return
         if trk.hits < 2:
             reason = decision.SEEN_ONLY_ONCE
@@ -6063,8 +6105,12 @@ except Exception as e:
         tk.Label(body, text="M = 0: the not-rolled rule is on hold. A cashew whose NECK was never seen is still written to the log as \"would be not rolled\".",
                  font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.PANEL, justify="left", anchor="w", wraplength=500).pack(fill=tk.X, pady=(0, 6))
         number(body, "voting", "neck_weight", "TESTA vote from a NECK frame counts as", "frames")
-        number(body, "voting", "rejection_conf", "REJECTION (YOLO): confidence at least", "0 - 1")
-        number(body, "voting", "rejection_min_frames", "REJECTION (YOLO): in at least", "frames")
+        number(body, "voting", "rejection_conf", "REJECTION (CNN): confidence at least", "0 - 1")
+        number(body, "voting", "rejection_min_frames", "REJECTION (CNN): in at least", "frames")
+        number(body, "rules", "min_object_mm", "Ignore objects smaller than (0 = off)", "mm")
+        tk.Label(body, text="Longer side of the box. Smaller = dust or a stain on the belt / roller: no decision, nothing fires (logged as NOISE). "
+                            "A detection at the Decision line that does not move with the belt is ignored as BACKGROUND.",
+                 font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.PANEL, justify="left", anchor="w", wraplength=500).pack(fill=tk.X, pady=(0, 6))
         self.single_defect_var = tk.BooleanVar(value=bool(g["voting"].get("single_defect_blocks_good", False)))
         switch(body, "One defect frame blocks GOOD", self.single_defect_var,
                "ON: a single defect frame (below the frame limit) makes the cashew Undefined. OFF: it is ignored.")

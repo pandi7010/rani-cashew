@@ -4,6 +4,68 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-13 (11): The roller and marks on it no longer fire the reject ejector
+
+Owner: "if there is not a cashew also, the background like the roller is detected ... as a rejection. Work on it."
+The real PLC and the camera were not contacted. The running program was not touched: **restart it (EXIT, start again)
+before this acts.**
+
+### What the logs show (today, 23:30-23:38, empty belt, and 15:00-16:45 with cashews)
+
+| Pattern | Looks like | Today | What happened |
+|---|---|---|---|
+| A | A box seen for ONE frame at the exit end of the ROI (x 25-90), after the Decision line | 34 by day, 7 at night | `UNDEFINED APPEARED_AFTER_LINE` -> reject ejector fired every time |
+| B | A mark standing or creeping at the line (0.16 - 0.41 px/ms; the belt runs 2.48) that the CNN calls REJECTION | 2 at night, 11 by day | `REJECTION` -> reject ejector fired |
+| C | A tiny box moving along (longer side 44 - 90 px; the smallest of 2,385 real cashews is about 146 px) | 7 at night, 29 by day | REJECTION / UNDEFINED / TESTA SMALL -> an ejector fired |
+
+Real cashews for comparison (2,385 of today): speed 2.37 - 2.50 px/ms, longer box side 146 px and up.
+
+### Changed
+
+1. **A detection must move with the belt before it is decided** (patterns A and B). At or after the Decision line a
+   detection is decided only when it was seen 3 times and travelled at 30 % of the belt speed or more (the existing
+   tracker value `stuck_speed_fraction`; no new number). Until then nothing is decided and nothing fires. If it
+   disappears without that, it is logged as **BACKGROUND / NOT_MOVING_WITH_BELT**, not counted in TOTAL, never fired.
+   Belt speed = the measured lane speed; after a restart with an empty belt, the Conveyor speed of the Pneumatic page.
+   A cashew first seen after the line and then seen moving is still rejected as before, and the delay is now taken
+   from where it is at that moment. A cashew seen before the line and then missed is decided as before.
+   A cashew that really stands still is still caught by the STUCK rule (700 ms) and gets the reject pulse.
+2. **New field on Sorting Logic: "Ignore objects smaller than (0 = off)", in mm** (pattern C). A detection whose longer
+   box side is below it is NOISE: no decision, nothing fires. **It starts at 0 = off, because the value is yours.**
+   From today's log: the marks are 4 - 9 mm, the smallest real cashew about 14.6 mm (both at the 10 px per mm
+   placeholder; the numbers change when px per mm is calibrated). Do you sort pieces smaller than about 10 mm? If not,
+   10 is a value that sits between the two groups. Until you set it, pattern C still fires.
+3. The two REJECTION fields on Sorting Logic now say "(CNN)" (since entry (10) only the CNN can say REJECTION).
+
+Files: `lane_tracker.py` (`moves_with_belt`, `long_side_px`), `cashew_cnn_grader.py` (`_awaits_proof`, `_belt_px_ms`,
+`_fragment_kind`, `_log_lost`, the field), `decision.py` (`BACKGROUND`), `engines.py` (`min_object_mm`),
+`tests/test_background.py`.
+
+### Tested
+
+- `ast` clean. Unit tests: 207 pass, 6 fail (the same six of entry (7) L1; none new). 9 new tests, built on the logged cases.
+- Today's 2,400 logged tracks replayed through rule 1: all 41 of pattern A and all 13 of pattern B are held back;
+  all real cashews with 3 or more frames are decided at the same frame as before (0 frames later).
+- Self-test with the fake PLC: cashews on the simulated belt are decided and fired as before; a one-frame box at the
+  belt end and a standing mark at the line wait (nothing fires) and end as `IGNORED: BACKGROUND`; with the limit at
+  10 mm a 53 px speck is NOISE and a 228 px cashew is not; the Sorting Logic page shows the new field.
+
+### Not tested
+
+The real machine. Whether a real roller mark is now quiet can only be seen there: run the empty belt for some minutes
+and watch that no ejector fires and that RECENT RESULTS stays empty (`logs/cashews_*.csv` then shows BACKGROUND rows).
+
+### Still open
+
+- **This hides the false detections, it does not remove them.** YOLO still boxes the roller. The lasting fix is to
+  retrain YOLO with pictures of the empty running belt (no boxes). Moving the ROI ends inside the rollers helps at once.
+- A mark that stands longer than 700 ms and reaches the line becomes STUCK and still gets one reject pulse. Should a
+  STUCK object fire at all? A pulse timed for the belt cannot hit something that does not travel. Your decision.
+- My commit `8e51f2e` put the older uncommitted work (speed step and later edits) into git as it was, so that this
+  step is a clean change. L1 - L3 of entry (7) are still unanswered.
+
+---
+
 ## 2026-10-13 (10): Only the CNN decides the class; YOLO's class has no say
 
 Owner, 2026-10-13: "YOLO's only work is to detect the cashew from the frame, it has no authority to tell what type it is.

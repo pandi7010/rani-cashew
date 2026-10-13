@@ -21,7 +21,9 @@ ENGINES = {
 ENGINE_DEFAULTS = {name: SHADOW for name in ENGINES}
 SHAPE_DEFAULTS = {"min_solidity": 0.75, "min_area_mm2": 100.0, "min_length_mm": 16.0, "min_length_width": 1.15}
 DOUBLE_DEFAULTS = {"enabled": True, "max_single_length_mm": 45.0, "min_frames": 2, "min_fraction": 0.5}
-RULE_DEFAULTS = {"max_lost_ms": 300.0}
+# min_object_mm: a detection whose longer box side is below this is not a cashew (NOISE: no decision, no fire).
+# 0 = off. The value is the owner's (smallest piece that must still be sorted).
+RULE_DEFAULTS = {"max_lost_ms": 300.0, "min_object_mm": 0.0}
 
 SHAPE_BROKEN, SHAPE_TOO_SMALL, SHAPE_SPLIT = "SHAPE_BROKEN", "SHAPE_TOO_SMALL", "SHAPE_SPLIT"
 

@@ -275,6 +275,25 @@ def crossing_time(path, flow, line_pos):
     return None
 
 
+PROOF_HITS = 3          # seen at least this often before its speed says anything (same number as the STUCK rule)
+
+
+def moves_with_belt(trk, flow, belt_px_ms, fraction) -> bool:
+    """True when the track has shown that it travels with the belt: seen PROOF_HITS times and, over its whole path,
+    at least `fraction` (tracker setting stuck_speed_fraction) of the belt speed. A mark on a roller or on the belt
+    frame stands still or creeps, a cashew does not. Without a belt speed nothing can be said: True."""
+    if belt_px_ms <= 0:
+        return True
+    speed = track_speed(trk.path, flow)
+    return trk.hits >= PROOF_HITS and speed is not None and speed >= fraction * belt_px_ms
+
+
+def long_side_px(boxes) -> float:
+    """Middle value of the longer box side over the frames of a track (0 without boxes)."""
+    sides = [max(abs(b[2] - b[0]), abs(b[3] - b[1])) for b in boxes if b]
+    return float(median(sides)) if sides else 0.0
+
+
 def track_speed(path, flow):
     """Speed over the whole track in px/ms (first to last real detection), or None."""
     if len(path) < 2:
