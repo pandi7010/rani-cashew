@@ -4,6 +4,67 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-13 (7): Health and logic check of the whole program
+
+Read-only check. Nothing was changed in code or settings, the real PLC and the camera were not contacted.
+
+### Health: good
+
+| Check | Result |
+|---|---|
+| Syntax (`ast`), undefined names, attributes never set | clean in all 41 files |
+| Whole-program self-test, fake PLC (`tools/ui_selftest.py` + pages + teaching + speed) | passes: all 12 pages and tool windows open, START / STOP, manual fire only when STOPPED, addresses written 100-139 only, no forbidden PLC call, STOP cancels waiting pulses, size table / COLOUR SPLIT / PASS chips / change log, Teaching CNN (train, confusion, undo, graphs) |
+| `logs/grader.log` (3,565 lines, 35 program starts on 10 and 11 Oct) | 0 errors, 0 tracebacks. 2,350 pulses OK, 2 not fired (PLC offline for a moment: 10 Oct 18:37, 11 Oct 01:10) |
+| Speed on the machine (LOOP lines in the log) | 63-64 fps, 11.7 ms per frame (YOLO 8.6 ms) |
+| Disk / GPU | 29 GB free (75 % used), RTX 3050 idle, 40 C |
+| Unit tests | **196 pass, 7 fail**, all 7 in the decision rules, see L1 |
+| Safety rules in code | hold: ejectors only through `relay_output.py`, relays 1-40, M140 / M141 refused, opens STOPPED |
+
+Smaller health notes:
+- `logs/cashews_20261010.csv` has 205 empty (NUL) bytes in the middle: the PC was switched off or the program was killed while writing. The rows around it are readable.
+- Simulated full belt (14 cashews in view): the loop needs 42 ms per frame (CNN 17, YOLO 9, features 6, screen picture 5) = at most 24 fps, i.e. about 9 frames per cashew instead of 25. Simulation only; the real limit must be measured on a full belt.
+- `cashew_class_mapping.json` differs from the YOLO model for PKW1 / PKW2 / TESTA SMALL (warning at every start; the model's numbers are used, no effect on grading).
+- A lot of work is not committed: the speed step (`perf.py`, batch CNN, faster Teaching page, `tools/profile_grader.py`) plus later edits in `cashew_cnn_grader.py` (+686 lines), `decision.py`, `teach_ui.py`. 1,370 files of `cnn_final/golden_crops` are deleted in the working tree (still in git).
+
+### Logic: problems found, most important first
+
+**L1. Decision rules were changed after the last commit; tests fail.** `decision.py`, 10 Oct 19:20:
+- the rule "skin (TESTA / TESTA SMALL) + any other defect = UPW" is removed (it decided 16 cashews on 10 Oct);
+- start values changed to defect 0.60, GOOD 0.70, REJECTION 0.75 / 3 frames (were 0.50 / 0.80 / 0.50 / 2). These do **not** act on the machine: the saved settings (0.50 / 0.80 / 0.50 / 2) win.
+I do not know whether you asked for these. Tests and code must agree again, in whichever direction you say.
+
+**L2. A defect below its "class confidence" is counted as GOOD.** New uncommitted code (`cashew_cnn_grader.py:1559-1563`): a CNN result below the per-class confidence is renamed GOOD_CASHEW and keeps its confidence. Saved now: **UPW 95 %, REJECTION 85 %**, others 50 %. So a UPW frame seen at 80-94 % becomes a GOOD vote (GOOD needs 80 %). On 10 Oct 17 % of all UPW frames were below 95 %. A real UPW can now leave as a good grade. Safer: such a frame gives no vote at all.
+
+**L3. Too many UPW: 2 frames out of about 25 are enough.** 10 Oct after 16:00: 641 of about 1,300 decided cashews were UPW. In 236 of them most frames said GOOD_CASHEW; in 193 fewer than a quarter of the frames said UPW. The rule "defect in 2 frames" was set when a cashew had few frames; at 63 fps it has about 25, so two wrong frames decide it. Raising the UPW confidence does not help (83 % of UPW frames are above 95 %). What would help: a limit as a share of the frames (for example "UPW in at least 30 % of the frames") or a higher N. The value is yours.
+
+**L4. SIZE GRADES READY is ON, but px per mm is not calibrated.** `size_config` has no `roi_length_mm`; the program uses the placeholder 10 px per mm. All lengths (median 23 mm in the log) and all W grades come from that guess. Hint only: belt speed in the log is 2.48 px/ms; if the belt really runs 300 mm/s that is about 8.3 px per mm, so real lengths would be about 20 % larger than shown. Calibrate on Vision ROI (ROI 1 real length) before trusting any grade.
+
+**L5. The CNN in use is the old one.** Active: `cashew_color_cnn_new.pth` of 16 Sept (11 classes). The five models trained on 10 Oct are not activated (no `active_models.json`). Their validation accuracy is 83-91 %, the last one (19:58, 12 classes) 87 %, GOOD_CASHEW recall 88 %: about 1 good cashew in 8 is called something else per frame. That is too low for N = 2 voting (see L3).
+
+**L6. SW from the CNN would go to the reject ejector.** Saved PASS list is GOOD, GOOD_CASHEW (SW is not in it) and "SW" stands in the priority list. A cashew with 2 CNN frames "SW" becomes result SW, no ejector is mapped for "SW", so it is rejected as "no ejector". Not seen in the logs yet (0 SW frames), but it will happen with a model that outputs SW.
+
+**L7. Many LOST rows.** 10 Oct: 344 of 2,159 rows; 11 Oct: 79 of 169. LOST = seen but gone before the line, nothing fired. Part of it is not cashews: the same spots repeat (ROI 2 near x 2231 / y 1988, ROI 1 near x 2018 / y 92; standing objects at the ROI edge) and tiny slow boxes. Four objects stood in ROI 2 for 1,500 frames (STUCK -> reject pulse). Whether real cashews are lost can only be seen on the machine: compare the cashews fed with the TOTAL counter.
+
+Smaller:
+- COLOUR SPLIT is OFF and no threshold is saved: all good cashews use the W grades (as intended for now).
+- Engines view / shape / colour / size are all SHADOW: NECK view and shape never reject.
+- Delays of ejectors 19, 20, 39, 40 (about 12.9 / 13.6 s) are still the calculated ones and smaller than ejector 18 (14.3 s). They have no class, so nothing fires there now.
+- CONVEYOR / FEEDER buttons write relay 41 / 42 (M140 / M141) through the PLC controller, not through `relay_output.py`. This is their purpose; noted only because all other outputs go through one place.
+- `decision.py:198` leaves an unused line (`others = ...`) from the edit in L1.
+
+### Not tested
+
+Real valves, real cashews, timing, the camera, the real PLC. Accuracy numbers come from the logs of 10 / 11 Oct and from the model reports, not from a new run.
+
+### Questions for you
+
+1. L1: keep the removed UPW rule removed? Which start values are right?
+2. L2: a result below the class confidence: no vote (my proposal), GOOD as now, or remove the rule?
+3. L3: which rule for a defect: N frames, or a share of the frames, and what value?
+4. Then: finish and commit the speed step?
+
+---
+
 ## 2026-10-10 (6): Manual size table, SIZE GRADES READY, COLOUR SPLIT, PASS classes to size sorting
 
 This replaces parts of entry (5): the size table is now MIN / MAX length only, and SIZE GRADES READY no longer needs
