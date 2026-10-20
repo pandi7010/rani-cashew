@@ -4,6 +4,27 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-20 (14): detects/ folder: one picture of every fired cashew
+
+Owner: "create a folder call detects ... if upw was detected and the command send to the ejector you need to put that
+cashew image in the upw folder, like this you need to do for all types." Owner's choices: 1 best picture per cashew,
+GOOD split by size grade, no daily limit, only fired cashews.
+
+- New `detect_capture.py`; hooked into the decision in `cashew_cnn_grader.py` (only when a fire command was sent,
+  `SCHEDULED`). Path: `detects/<class or grade>/<YYYYMMDD>/<HHMMSS_mmm>_<cashew id>_A<ejector>.jpg`.
+- Folder: the decided class (UPW, TESTA, TESTA_SMALL, PKW1, OIL, REJECTION, DOUBLE_KERNEL ...); the size grade for
+  GOOD / PASS cashews (W450, SW210 ...); UNDEFINED for a cashew sent to the reject ejector without a class.
+- Picture: the frame not cut by the image edge that voted for the decided class with the highest CNN confidence
+  (else the biggest uncut crop). Saved by its own thread; the frame loop never waits.
+- No daily limit; saving pauses while less than 20 GB is free on the disk (27 GB free on 2026-10-20). At full feed
+  this is about 3,600 pictures (about 100 MB) per hour. Nothing is ever deleted by the program. Not in git.
+
+Tested: 8 new unit tests, all 225 tests pass; fake-PLC self-test: 5 fake UPW cashews -> 5 pictures in
+`detects/UPW/<date>/` with ejector 13 / 33 in the name (removed afterwards). Not tested: a real run on the machine.
+**Restart the program before this acts.**
+
+---
+
 ## 2026-10-14 (13): PKW + TESTA goes to PKW; UPW below its class confidence is no longer counted as GOOD
 
 Owner: "if you found pkw + testa it should goes to pkw only. then upw is detecting as good cashew. fix these".

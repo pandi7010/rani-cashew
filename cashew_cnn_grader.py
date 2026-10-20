@@ -49,6 +49,7 @@ import ejector_check
 import ejector_check_ui
 import production_capture
 import undefined_capture
+import detect_capture
 import colour_size
 import perf
 from concurrent.futures import ThreadPoolExecutor
@@ -961,6 +962,8 @@ class ProcessingThread(threading.Thread):
         self.capture = production_capture.ProductionCapture()     # inbox capture; its own saver thread
         # Every Undefined / lost / double cashew: all views + the full frame into captures/<undefined|double>/<date>/
         self.undefined_capture = undefined_capture.UndefinedCapture(app_paths.CAPTURES_DIR)
+        # One picture of every fired cashew: detects/<class or grade>/<date>/ (owner, 2026-10-20)
+        self.detect_capture = detect_capture.DetectCapture(app_paths.DETECTS_DIR)
         self._box_areas = {1: deque(maxlen=40), 2: deque(maxlen=40)}      # box size of real cashews per ROI (noise filter)
         self.perf = perf.Stages()           # ms per frame of every stage of the loop (Info page, tools/profile_grader.py)
         self._last_shown = 0.0
@@ -1695,6 +1698,12 @@ class ProcessingThread(threading.Thread):
             if cid is not None:
                 with self.fire_lock:
                     self.fire_counts[int(cid)] = self.fire_counts.get(int(cid), 0) + 1
+
+        if fire_result == "SCHEDULED":      # one picture of every fired cashew, in detects/<class or grade>/<date>/
+            good = d.result == decision.GOOD
+            wanted = ["GOOD_CASHEW", "GOOD", "SW", *(grading.get("good_classes") or [])] if good else [d.result]
+            best = detect_capture.best_frame(trk.frames, wanted, decision.canonical)
+            self.detect_capture.on_fired(trk.id, grade if good else d.result, relay, best.get("crop_img") if best else None)
 
         # Production capture: uncertain cashews, rejects and a few good ones go to the inbox (never waits).
         self.capture.on_decision(trk.id, rid, "ACCEPT" if d.result == decision.GOOD else "REJECT", d.reason,
@@ -7336,6 +7345,7 @@ except Exception as e:
         if hasattr(self, 'processing_thread'):
             self.processing_thread.capture.stop()
             self.processing_thread.undefined_capture.stop()
+            self.processing_thread.detect_capture.stop()
         if hasattr(self, 'relay_output'):
             self.relay_output.cancel_pending()
             self.relay_output.stop()
