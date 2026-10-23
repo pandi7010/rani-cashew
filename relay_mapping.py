@@ -9,6 +9,8 @@ Rules (owner, 2026-10-09):
   * An ejector without a class is free and is never fired by grading.
   * ROI 2 mirrors ROI 1: ejector r in ROI 1 and r + 20 in ROI 2 (when the mirror option is used).
   * A grade in the "no fire" list runs to the end of the belt: no ejector and not a reject (BUDDS, SW_BUDDS).
+  * REJECTION goes to its own ejector when it has one in the mapping, else to the reject ejector (owner, 2026-10-23).
+    DOUBLE KERNEL, Undefined and the other reject classes always go to the reject ejector.
 """
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -17,6 +19,7 @@ from class_registry import normalize_name
 RELAYS_PER_ROI = 20
 REJECT_RELAY = {1: 1, 2: 21}
 ROI_RELAYS = {1: range(2, 21), 2: range(22, 41)}        # the ejectors a class can be assigned to
+OWN_EJECTOR_REJECTS = ["REJECTION"]                     # rejected classes that may have their own ejector (owner, 2026-10-23)
 ALL_RELAYS = range(1, 41)
 
 GRADES_WW = ["W180", "W210", "W240", "W320", "W450", "BUDDS"]
@@ -176,6 +179,14 @@ def target_of(table: Dict[str, int], roi: int, candidates: Iterable[str], no_fir
         return None, True
     relay = resolve(table, candidates)
     return (relay, True) if relay is not None else (REJECT_RELAY[roi], False)
+
+
+def reject_target(table: Dict[str, int], roi: int, result: str) -> int:
+    """Ejector of a cashew the decision rejects: REJECTION its own ejector when it has one; DOUBLE, Undefined and every
+    other reject the reject ejector of the ROI."""
+    if _in(result, OWN_EJECTOR_REJECTS):
+        return target_of(table, roi, [result])[0]
+    return REJECT_RELAY[roi]
 
 
 def unassigned(mapping, classes: Iterable[str], grades: Iterable[str] = (), roi: int = 1, no_fire: Iterable[str] = ()) -> List[str]:

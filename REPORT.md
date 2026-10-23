@@ -4,6 +4,28 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-23 (15): REJECTION can have its own ejector; DOUBLE and Undefined stay on the reject ejector
+
+Owner: "you should keep rejection as a seperate class and double kernal or undefined should be as a seperate rejection
+class."
+
+- `relay_mapping.reject_target()`: a rejected cashew decided as REJECTION goes to the ejector REJECTION has in the
+  mapping; with no ejector it still goes to the reject ejector 1 / 21 (as before). DOUBLE KERNEL, Undefined and the
+  other reject classes always go to 1 / 21, even if their name is put in the mapping.
+- `cashew_cnn_grader.py`: the decision uses `reject_target`; REJECTION is offered in the ejector picker (DEFECT
+  CLASSES) and listed in the class -> ejector table and in NOT ASSIGNED while it has no ejector; its chip on the
+  Pneumatic page shows its ejector (or REJECT) and stays FIXED (it can never be PASS). Help texts updated.
+- No ejector is chosen by the code: **the owner picks REJECTION's ejector** (free now: 18-20 / 38-40) on the
+  Pneumatic page and presses SAVE PNEUMATICS. Until then nothing changes on the machine.
+
+Tested: 1 new unit test, all 226 tests pass; fake-PLC self-test: REJECTION shows in the ejector picker, its chip shows
+REJECT / FIXED, NOT ASSIGNED lists it. Not tested: a real REJECTION fire on its own ejector on the machine.
+**Restart the program before this acts.** How to test: STOP, map REJECTION to a free ejector (e.g. A18 with "the same
+for ROI 2"), SAVE PNEUMATICS, run; REJECTION fires on that ejector (grader.log "[FIRE] ejector 18 ... REJECTION"),
+DOUBLE / UNDEF still on 1 / 21; pictures still go to `detects/REJECTION`.
+
+---
+
 ## 2026-10-20 (14): detects/ folder: one picture of every fired cashew
 
 Owner: "create a folder call detects ... if upw was detected and the command send to the ejector you need to put that

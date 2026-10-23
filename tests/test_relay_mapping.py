@@ -132,6 +132,17 @@ class RelayMappingTest(unittest.TestCase):
         self.assertEqual(rm.duplicates(mapping), {})
         self.assertEqual(rm.wrongly_on_reject(mapping), {})
 
+    def test_rejection_has_its_own_ejector_when_mapped(self):
+        tables = rm.lookup(rm.owner_mapping())
+        for roi in (1, 2):                                          # not mapped: the reject ejector, as before
+            self.assertEqual(rm.reject_target(tables[roi], roi, "REJECTION"), rm.REJECT_RELAY[roi])
+        tables = rm.lookup(rm.assign(rm.owner_mapping(), 18, ["REJECTION"]))
+        self.assertEqual((rm.reject_target(tables[1], 1, "REJECTION"), rm.reject_target(tables[2], 2, "rejection")), (18, 38))
+        for name in ("DOUBLE KERNEL", "UNDEFINED", "EDGECUT"):       # the other rejects stay on the reject ejector
+            self.assertEqual((rm.reject_target(tables[1], 1, name), rm.reject_target(tables[2], 2, name)), (1, 21))
+        mapped = rm.lookup(rm.assign({}, 19, ["DOUBLE KERNEL"]))     # even if someone puts them in the mapping
+        self.assertEqual(rm.reject_target(mapped[1], 1, "DOUBLE KERNEL"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

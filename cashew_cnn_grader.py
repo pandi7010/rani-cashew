@@ -1646,7 +1646,7 @@ class ProcessingThread(threading.Thread):
         colour, colour_value = colour_size.colour_of(colour_values, size_cfg.get("colour"))
         relay, grade = None, ""
         if d.reject:
-            relay = REJECT_RELAY[rid]
+            relay = relay_mapping.reject_target(map_dict, rid, d.result)     # REJECTION: its own ejector when mapped
             label = d.result if d.result != decision.UNDEFINED else f"UNDEF {d.reason}"
             colour = None
         elif d.result == decision.GOOD:
@@ -2702,8 +2702,9 @@ class App(tk.Tk):
             table = dict(ss.mapping_t1)
             engine_counts = dict(ss.engine_counts)
         good = {normalize_name(c) for c in g.get("good_classes", [])}
-        fixed = [decision.REJECTION, decision.DOUBLE_CLASS] + list(g.get("reject_classes", []))
-        names = list(g.get("priority", [])) + ["GOOD_CASHEW"] + [c for c in g.get("good_classes", []) if normalize_name(c) not in ("good cashew", "good")]
+        fixed = [decision.DOUBLE_CLASS] + list(g.get("reject_classes", []))
+        own_rejects = {normalize_name(c) for c in relay_mapping.OWN_EJECTOR_REJECTS}
+        names = list(g.get("priority", [])) + relay_mapping.OWN_EJECTOR_REJECTS + ["GOOD_CASHEW"] + [c for c in g.get("good_classes", []) if normalize_name(c) not in ("good cashew", "good")]
         seen, chips = set(), []
         for name in names + fixed:
             key = normalize_name(name)
@@ -2712,6 +2713,9 @@ class App(tk.Tk):
             seen.add(key)
             if name in fixed:
                 chips.append((name, "REJECT", ui.BAD, True))
+            elif key in own_rejects:                # its own ejector when mapped, never PASS
+                relay = table.get(key)
+                chips.append((name, f"A{relay:02d}" if relay else "REJECT", ui.BAD, True))
             elif key in good:
                 chips.append((name, "PASS", ui.GOOD, False))
             else:
@@ -5643,6 +5647,7 @@ except Exception as e:
         fixed = {normalize_name(n) for n in (decision.REJECTION, decision.DOUBLE, decision.UNDEFINED)}
         fixed |= {normalize_name(c) for c in self.shared_state.grading.get("good_classes", [])}       # a PASS class needs no ejector
         classes = [c for c in self.shared_state.grading.get("priority", []) if normalize_name(c) not in fixed]
+        classes += relay_mapping.OWN_EJECTOR_REJECTS            # REJECTION may have its own ejector (owner, 2026-10-23)
         return classes, relay_mapping.GRADES_WW + relay_mapping.GRADES_SW
 
     def _update_all_map_labels(self):
@@ -5716,7 +5721,7 @@ except Exception as e:
         ejector of the ROI is moved here only after the question "move it here?"."""
         if relay_mapping.is_reject(act_id):
             messagebox.showinfo(f"A{act_id:02d}", f"A{act_id:02d} is the reject ejector of ROI {relay_mapping.roi_of(act_id)} (Double, Undefined, "
-                                "REJECTION and every class without an ejector).\n\nNo class can be assigned to it.")
+                                "REJECTION while it has no ejector, and every class without an ejector).\n\nNo class can be assigned to it.")
             return
         roi, mirror_id = relay_mapping.roi_of(act_id), relay_mapping.mirror(act_id)
         with self.shared_state.lock:
@@ -5830,7 +5835,7 @@ except Exception as e:
         win = self._dialog("Class -> ejector", width=760, height=660)
         F = ui.FONT
         tk.Label(win, text="CLASS  ->  EJECTOR", font=(F, ui.F_HEAD, "bold"), fg=ui.TEXT, bg=ui.BG).pack(anchor="w", padx=20, pady=(16, 2))
-        tk.Label(win, text="Check the table. REJECT = no ejector assigned: it goes to the reject ejector. REJECTION, DOUBLE and Undefined always go to A01 / A21.",
+        tk.Label(win, text="Check the table. REJECT = no ejector assigned: it goes to the reject ejector. DOUBLE and Undefined always go to A01 / A21; REJECTION too while it has no ejector.",
                  font=(F, ui.F_SMALL), fg=ui.MUTED, bg=ui.BG, wraplength=640, justify="left").pack(anchor="w", padx=20, pady=(0, 8))
         style = ttk.Style(self)
         style.configure("Summary.Treeview", rowheight=22, font=(F, -13), background=ui.PANEL, fieldbackground=ui.PANEL, foreground=ui.TEXT, borderwidth=0)
@@ -6125,7 +6130,7 @@ except Exception as e:
         switch(body, "One defect frame blocks GOOD", self.single_defect_var,
                "ON: a single defect frame (below the frame limit) makes the cashew Undefined. OFF: it is ignored.")
 
-        body = panel(cols[0], "PRIORITY (highest first)", "Before this list: tracking faults, DOUBLE and REJECTION go to the reject relay; skin together with another defect is UPW.")
+        body = panel(cols[0], "PRIORITY (highest first)", "Before this list: tracking faults and DOUBLE go to the reject relay, REJECTION to its ejector (or the reject relay); skin together with another defect is UPW.")
         prio = tk.Frame(body, bg=ui.PANEL)
         prio.pack(fill=tk.X)
         self.priority_list = tk.Listbox(prio, height=10, width=24, bg=ui.FIELD, fg=ui.TEXT, selectbackground=ui.ACCENT, selectforeground="#06222A",
