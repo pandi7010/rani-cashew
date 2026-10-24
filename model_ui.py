@@ -62,10 +62,15 @@ def plan_class_changes(new_classes, old_classes, fire_classes, good_classes):
     return rows, removed
 
 
+COMPARISON_ROWS = 6      # GSN_V21: rows of the old / new comparison shown at once in the activation popup
+
+
 def confirm_activation(app, kind, model_name, new_classes, old_name, old_classes, fire_classes, good_classes, comparison, on_confirm):
     """Popup before a model becomes active. on_confirm({class: 'PASS' | 'FIRE'}) is called only on CONFIRM."""
     rows, removed = plan_class_changes(new_classes, old_classes, fire_classes, good_classes)
-    height = min(980, 330 + 38 * len(rows) + (60 if removed else 0) + (60 + 30 * len(comparison["rows"]) if comparison else 40))
+    shown_rows = min(COMPARISON_ROWS, len(comparison["rows"])) if comparison else 0
+    height = min(980, app.winfo_screenheight() - 80,
+                 330 + 38 * len(rows) + (60 if removed else 0) + (60 + 30 * shown_rows if comparison else 40))
     top = tk.Toplevel(app)
     top.title("Activate model")
     top.configure(bg=hu.BG)
@@ -77,6 +82,10 @@ def confirm_activation(app, kind, model_name, new_classes, old_name, old_classes
     head.pack(fill=tk.X)
     tk.Label(head, text=f"ACTIVATE {kind} MODEL - CLASS CHANGES", font=HEAD_BOLD, fg=hu.TEXT, bg=hu.PANEL).pack(side=tk.LEFT, padx=16, pady=12)
     tk.Frame(top, bg=hu.BORDER, height=1).pack(fill=tk.X)
+    # GSN_V21: the buttons are packed before the rest, so a long class list can never push them off the screen
+    # (13 classes + the test set comparison needed about 1270 px on the owner's 1080 px screen).
+    buttons = tk.Frame(top, bg=hu.BG)
+    buttons.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=16)
     tk.Label(top, text=f"New model: {model_name}        Now active: {old_name or 'none'}\nCheck every class. Nothing changes until you press CONFIRM.",
              font=SMALL, fg=hu.MUTED, bg=hu.BG, anchor="w", justify="left").pack(fill=tk.X, padx=16, pady=(12, 8))
 
@@ -116,7 +125,13 @@ def confirm_activation(app, kind, model_name, new_classes, old_name, old_classes
         text = f"Model comparison on the test set ({comparison['images']} images never used for training):"
     tk.Label(top, text=text, font=SMALL, fg=hu.MUTED, bg=hu.BG, anchor="w", justify="left", wraplength=width - 40).pack(fill=tk.X, padx=16, pady=(12, 4))
     if comparison and comparison["rows"]:
-        tree = ttk.Treeview(top, columns=("class", "n", "old", "new"), show="headings", style="Home.Treeview", height=len(comparison["rows"]))
+        table = tk.Frame(top, bg=hu.BG)
+        table.pack(fill=tk.X, padx=16)
+        tree = ttk.Treeview(table, columns=("class", "n", "old", "new"), show="headings", style="Home.Treeview", height=shown_rows)
+        if len(comparison["rows"]) > shown_rows:          # GSN_V21: the rest scrolls
+            scroll = ttk.Scrollbar(table, orient=tk.VERTICAL, command=tree.yview)
+            tree.configure(yscrollcommand=scroll.set)
+            scroll.pack(side=tk.RIGHT, fill=tk.Y)
         for col, title, w in (("class", "CLASS", 240), ("n", "TEST IMAGES", 150), ("old", "ACTIVE MODEL", 220), ("new", "NEW MODEL", 220)):
             tree.heading(col, text=title, anchor="w")
             tree.column(col, width=w, anchor="w")
@@ -127,10 +142,7 @@ def confirm_activation(app, kind, model_name, new_classes, old_name, old_classes
                 return "cannot compare (class unknown)" if value is None else f"{value * 100:.0f} %"
             tag = "" if old_acc is None or new_acc is None else ("better" if new_acc > old_acc else ("worse" if new_acc < old_acc else ""))
             tree.insert("", "end", values=(name, f"{total}" + ("  (too few)" if total < 30 else ""), show(old_acc), show(new_acc)), tags=(tag,))
-        tree.pack(fill=tk.X, padx=16)
-
-    buttons = tk.Frame(top, bg=hu.BG)
-    buttons.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=16)
+        tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     def confirm():
         top.destroy()
