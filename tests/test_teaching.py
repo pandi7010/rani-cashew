@@ -139,6 +139,31 @@ class TrainingTest(unittest.TestCase):
                 f.write(b"not a picture")
             self.assertEqual(training.readable_images([good, broken]), ([good], [broken]))
 
+    def test_rare_class_neither_takes_over_nor_keeps_a_right_model_unsure(self):
+        # the image counts of the model of 2026-10-24 13:36 (DW1 8 ... UPW 1784)
+        counts = [89, 50, 8, 35, 1010, 59, 85, 1000, 1063, 191, 102, 1631, 1417, 1784, 43]
+        weights = training.class_weights(counts)
+        self.assertEqual(weights[counts.index(1784)], 1.0)
+        self.assertLessEqual(max(weights), training.MAX_CLASS_WEIGHT)
+        self.assertLess(weights[counts.index(1631)], weights[counts.index(89)])     # rarer still counts more
+        import torch
+        criterion = training.smoothed_loss(torch.tensor(weights), training.LABEL_SMOOTHING)
+        # the best answer the loss allows for a batch of UPW images: free logits, trained until they settle
+        upw = counts.index(1784)
+        logits = torch.zeros(1, len(counts), requires_grad=True)
+        optimizer = torch.optim.Adam([logits], lr=0.1)
+        for _ in range(500):
+            optimizer.zero_grad()
+            criterion(logits, torch.tensor([upw])).backward()
+            optimizer.step()
+        probs = torch.softmax(logits.detach(), 1)[0]
+        self.assertEqual(int(probs.argmax()), upw)
+        self.assertGreater(float(probs[upw]), 0.85)     # the old loss: DW1 0.48 > UPW 0.29
+        # with equal weights it is PyTorch's own label smoothing
+        x, y = torch.randn(6, 4), torch.tensor([0, 1, 2, 3, 0, 1])
+        own = training.smoothed_loss(torch.ones(4), 0.1)(x, y)
+        self.assertAlmostEqual(float(own), float(torch.nn.CrossEntropyLoss(label_smoothing=0.1)(x, y)), places=5)
+
     def test_small_training_run_keeps_validation_apart_and_writes_the_result(self):
         with tempfile.TemporaryDirectory() as tmp:
             data, out = os.path.join(tmp, "dataset"), os.path.join(tmp, "models")

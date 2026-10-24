@@ -4,6 +4,34 @@ New entries are in English. Older entries below are in Tamil.
 
 ---
 
+## 2026-10-24 (16): Training: limited class weights, label smoothing without weights
+
+Owner: "now check i have trained a new model. tell me shall i use that or not." Two models trained today, neither usable:
+
+- `cnn_Default_20261024_133651` (15 classes): val accuracy 34 %. It called almost everything DW1 (all 357 UPW, 324 of 326
+  TESTA, 268 of 283 TESTA SMALL).
+- `cnn_Default_20261024_150930` (13 classes, without DW1 / WHITE_DW): val accuracy 90 %, the new classes recognised
+  (BROWN 89 %, DW2 10/10, DOUBLE 11/12, SW 86 %), but never sure: on the held-back images UPW was at most 0.50 confident
+  (119 of 119 below 50 %), TESTA 107 of 109 below 50 %, PKW about 2/3 below. With class confidence 50 these give no
+  vote on the machine and would pass as good. The 8-class model: 3 of 119 UPW below 50 %.
+
+Cause (training code, not the pictures): each class was weighted by 1 / image count (DW1 8 images -> 71, UPW 1784 ->
+0.32) and the weights went into `CrossEntropyLoss(label_smoothing=0.1)`, which weights the smoothing part too, so every
+image was pulled towards the rare classes. For a UPW image the old loss was lowest at DW1 0.48 / UPW 0.29.
+
+Change (`training.py`):
+- `class_weights()`: sqrt(largest count / count), at most `MAX_CLASS_WEIGHT` = 5; the most frequent class gets 1.
+- `smoothed_loss()`: weighted cross entropy plus label smoothing (0.1) WITHOUT the weights. With equal weights it is
+  exactly PyTorch's label smoothing.
+- Test `test_rare_class_neither_takes_over_nor_keeps_a_right_model_unsure`: with today's image counts the best answer the
+  loss allows for a UPW image is UPW above 0.85.
+
+Tested: ast, all 227 tests. Not tested: a real training run on the dataset (the owner trains in Teaching CNN).
+The active model is unchanged (8-class). How to test: train again with the same classes (DW1, WHITE_DW unticked), then
+let Claude compare accuracy AND confidence with the 8-class model before switching in AI Model Select.
+
+---
+
 ## 2026-10-23 (15): REJECTION can have its own ejector; DOUBLE and Undefined stay on the reject ejector
 
 Owner: "you should keep rejection as a seperate class and double kernal or undefined should be as a seperate rejection

@@ -133,6 +133,33 @@ def _load_rgb(path):
     return Image.fromarray(preprocess.prepare_crop(image, tight=True))
 
 
+# GSN_V21: class weights and label smoothing. The 5-track code weighted each class by 1 / its image count and gave the
+# weights to CrossEntropyLoss(label_smoothing=0.1), which weights the smoothing part too. Model of 2026-10-24 13:36:
+# DW1 with 8 images got weight 71, UPW with 1784 got 0.32, and the model called almost everything DW1. Without DW1
+# (15:09) it was right but never sure: every UPW stayed at 50 % confidence or less, so on the machine it gave no vote.
+MAX_CLASS_WEIGHT = 5.0      # the rarest class counts at most this many times as much as the most frequent one
+LABEL_SMOOTHING = 0.1
+
+
+def class_weights(counts):
+    """Loss weight per class: sqrt(largest count / count), at most MAX_CLASS_WEIGHT; the most frequent class gets 1."""
+    largest = max(counts)
+    return [min(MAX_CLASS_WEIGHT, (largest / max(1, n)) ** 0.5) for n in counts]
+
+
+def smoothed_loss(weights, smoothing):
+    """Cross entropy with the class weights, plus label smoothing WITHOUT the weights, so a rare class cannot pull
+    every image towards itself and a model that is right can still be sure."""
+    import torch.nn as nn
+    import torch.nn.functional as F
+    weighted = nn.CrossEntropyLoss(weight=weights)
+
+    def loss(outputs, labels):
+        uniform = -F.log_softmax(outputs, dim=1).mean(dim=1).mean()
+        return (1.0 - smoothing) * weighted(outputs, labels) + smoothing * uniform
+    return loss
+
+
 def train_cnn(dataset_dir, classes, epochs, out_dir, name_prefix="cnn", progress=None, stop=None, batch_size=32, pretrained=True,
               pass_classes=()):
     """Train MobileNetV2 on the chosen class folders.
@@ -197,11 +224,11 @@ def train_cnn(dataset_dir, classes, epochs, out_dir, name_prefix="cnn", progress
         pretrained = False
     model.classifier[1] = nn.Linear(model.last_channel, len(class_names))
     model = model.to(device)
-    # Rare classes count as much as frequent ones.
-    counts = torch.tensor([len(images[name]) for name in class_names], dtype=torch.float32)
+    # Rare classes count more than frequent ones (GSN_V21: limited, see class_weights).
+    weights = torch.tensor(class_weights([len(images[name]) for name in class_names]), dtype=torch.float32)
     # GSN_V21: label smoothing, weight decay and a learning rate that rises and then falls to zero. With a fixed rate the
     # validation accuracy jumped by 20 points from epoch to epoch and the "best epoch" was luck; now the last epochs settle.
-    criterion = nn.CrossEntropyLoss(weight=(counts.sum() / (len(counts) * counts)).to(device), label_smoothing=0.1)
+    criterion = smoothed_loss(weights.to(device), LABEL_SMOOTHING)
     peak_lr = 1e-3 if not pretrained else 3e-4
     optimizer = torch.optim.AdamW(model.parameters(), lr=peak_lr, weight_decay=1e-2)
     total_steps = max(2, int(epochs) * len(train_loader))
