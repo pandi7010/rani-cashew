@@ -1,0 +1,2310 @@
+{
+  "type": "cnn",
+  "architecture": "MobileNetV2",
+  "model": "cnn_Default_20261013_155818.pth",
+  "trained": "2026-10-13 15:58",
+  "dataset": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset",
+  "classes": [
+    "BROWN",
+    "DOUBLE",
+    "DW1",
+    "DW2",
+    "GOOD_CASHEW",
+    "KNIEF_MARK",
+    "OIL",
+    "PKW1",
+    "PKW2",
+    "REJECTION",
+    "SW",
+    "TESTA",
+    "TESTA SMALL",
+    "UPW",
+    "WHITE_DW"
+  ],
+  "images": {
+    "BROWN": 89,
+    "DOUBLE": 50,
+    "DW1": 8,
+    "DW2": 35,
+    "GOOD_CASHEW": 670,
+    "KNIEF_MARK": 59,
+    "OIL": 85,
+    "PKW1": 189,
+    "PKW2": 202,
+    "REJECTION": 81,
+    "SW": 67,
+    "TESTA": 197,
+    "TESTA SMALL": 108,
+    "UPW": 379,
+    "WHITE_DW": 43
+  },
+  "train_images": 1728,
+  "val_images": 534,
+  "val_cashews": {
+    "BROWN": 12,
+    "DOUBLE": 4,
+    "DW1": 1,
+    "DW2": 4,
+    "GOOD_CASHEW": 41,
+    "KNIEF_MARK": 3,
+    "OIL": 10,
+    "PKW1": 36,
+    "PKW2": 40,
+    "REJECTION": 13,
+    "SW": 2,
+    "TESTA": 14,
+    "TESTA SMALL": 8,
+    "UPW": 10,
+    "WHITE_DW": 1
+  },
+  "unreadable_images": [],
+  "epochs_run": 30,
+  "best_epoch": 11,
+  "val_accuracy": 0.8109,
+  "val_balanced_accuracy": 0.7728,
+  "per_class": {
+    "BROWN": {
+      "correct": 17,
+      "total": 19,
+      "accuracy": 0.8947,
+      "precision": 1.0,
+      "recall": 0.8947
+    },
+    "DOUBLE": {
+      "correct": 10,
+      "total": 12,
+      "accuracy": 0.8333,
+      "precision": 0.5,
+      "recall": 0.8333
+    },
+    "DW1": {
+      "correct": 1,
+      "total": 2,
+      "accuracy": 0.5,
+      "precision": 0.1111,
+      "recall": 0.5
+    },
+    "DW2": {
+      "correct": 8,
+      "total": 8,
+      "accuracy": 1.0,
+      "precision": 0.7273,
+      "recall": 1.0
+    },
+    "GOOD_CASHEW": {
+      "correct": 146,
+      "total": 182,
+      "accuracy": 0.8022,
+      "precision": 0.9542,
+      "recall": 0.8022
+    },
+    "KNIEF_MARK": {
+      "correct": 10,
+      "total": 15,
+      "accuracy": 0.6667,
+      "precision": 0.7143,
+      "recall": 0.6667
+    },
+    "OIL": {
+      "correct": 10,
+      "total": 17,
+      "accuracy": 0.5882,
+      "precision": 0.8333,
+      "recall": 0.5882
+    },
+    "PKW1": {
+      "correct": 30,
+      "total": 38,
+      "accuracy": 0.7895,
+      "precision": 0.8571,
+      "recall": 0.7895
+    },
+    "PKW2": {
+      "correct": 34,
+      "total": 40,
+      "accuracy": 0.85,
+      "precision": 0.8718,
+      "recall": 0.85
+    },
+    "REJECTION": {
+      "correct": 18,
+      "total": 18,
+      "accuracy": 1.0,
+      "precision": 0.8571,
+      "recall": 1.0
+    },
+    "SW": {
+      "correct": 7,
+      "total": 19,
+      "accuracy": 0.3684,
+      "precision": 0.2188,
+      "recall": 0.3684
+    },
+    "TESTA": {
+      "correct": 40,
+      "total": 43,
+      "accuracy": 0.9302,
+      "precision": 0.8163,
+      "recall": 0.9302
+    },
+    "TESTA SMALL": {
+      "correct": 11,
+      "total": 28,
+      "accuracy": 0.3929,
+      "precision": 0.6111,
+      "recall": 0.3929
+    },
+    "UPW": {
+      "correct": 80,
+      "total": 82,
+      "accuracy": 0.9756,
+      "precision": 0.9877,
+      "recall": 0.9756
+    },
+    "WHITE_DW": {
+      "correct": 11,
+      "total": 11,
+      "accuracy": 1.0,
+      "precision": 0.4783,
+      "recall": 1.0
+    }
+  },
+  "confusion_matrix": [
+    [
+      17,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      2,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      10,
+      1,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      8,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      2,
+      3,
+      0,
+      146,
+      1,
+      0,
+      0,
+      0,
+      0,
+      16,
+      0,
+      5,
+      0,
+      9
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      10,
+      1,
+      0,
+      0,
+      0,
+      4,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      3,
+      1,
+      0,
+      0,
+      0,
+      10,
+      0,
+      0,
+      0,
+      3,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      1,
+      0,
+      0,
+      0,
+      1,
+      0,
+      30,
+      5,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1
+    ],
+    [
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      5,
+      34,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      18,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      2,
+      2,
+      0,
+      3,
+      2,
+      0,
+      0,
+      0,
+      0,
+      7,
+      0,
+      1,
+      0,
+      2
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      40,
+      1,
+      1,
+      0
+    ],
+    [
+      0,
+      1,
+      1,
+      2,
+      4,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      8,
+      11,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      1,
+      0,
+      80,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      11
+    ]
+  ],
+  "wrong_images": [
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975756194_133.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.897,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/SW/crop_1789975883121_838.jpg",
+      "label": "SW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.834,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/crop_1789975934031_1306.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "SW",
+      "confidence": 0.769,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975937042_1320.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.756,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975756433_133.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.753,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975887099_901.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.746,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975887269_901.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.734,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975881602_825.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.725,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/OIL/old_crop_1789502536954_279.jpg",
+      "label": "OIL",
+      "predicted": "DOUBLE",
+      "confidence": 0.718,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975934493_1311.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.682,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/KNIEF_MARK/crop_1789975933446_1280.jpg",
+      "label": "KNIEF_MARK",
+      "predicted": "SW",
+      "confidence": 0.681,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/crop_1789975884485_856.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "TESTA",
+      "confidence": 0.674,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/wb_old_0088_cashew_1788563085198_376_1662.jpg",
+      "label": "PKW2",
+      "predicted": "PKW1",
+      "confidence": 0.665,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/crop_1789975884539_856.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "TESTA",
+      "confidence": 0.656,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/KNIEF_MARK/crop_1789975933398_1280.jpg",
+      "label": "KNIEF_MARK",
+      "predicted": "SW",
+      "confidence": 0.642,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/old_crop_1789502449392_60.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "TESTA",
+      "confidence": 0.642,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975887044_901.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.624,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/OIL/crop_1789975882423_830.jpg",
+      "label": "OIL",
+      "predicted": "SW",
+      "confidence": 0.615,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/UPW/crop_1790065847973_28.jpg",
+      "label": "UPW",
+      "predicted": "REJECTION",
+      "confidence": 0.615,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/wb_old_0095_cashew_1788563527114_2226_1718.jpg",
+      "label": "PKW2",
+      "predicted": "PKW1",
+      "confidence": 0.611,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/old_crop_1789502466463_84.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "TESTA",
+      "confidence": 0.609,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975934150_1308.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.594,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/OIL/crop_1789975882482_830.jpg",
+      "label": "OIL",
+      "predicted": "SW",
+      "confidence": 0.593,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/wb_old_0089_cashew_1788563133661_837_1646.jpg",
+      "label": "PKW2",
+      "predicted": "PKW1",
+      "confidence": 0.586,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/wb_old_crop_cashew_1788563358554_7491.jpg",
+      "label": "PKW2",
+      "predicted": "PKW1",
+      "confidence": 0.581,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/wb_old_crop_cashew_1788563133661_4867.jpg",
+      "label": "PKW2",
+      "predicted": "PKW1",
+      "confidence": 0.58,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975752967_125.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.579,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA/crop_1789975884072_850.jpg",
+      "label": "TESTA",
+      "predicted": "TESTA SMALL",
+      "confidence": 0.576,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/OIL/old_crop_1789502537640_308.jpg",
+      "label": "OIL",
+      "predicted": "DOUBLE",
+      "confidence": 0.573,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/old_crop_1789502435639_19.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "TESTA",
+      "confidence": 0.57,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975936992_1320.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.567,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975934307_1310.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.565,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/SW/crop_1789975883623_838.jpg",
+      "label": "SW",
+      "predicted": "KNIEF_MARK",
+      "confidence": 0.557,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW1/old_crop_1789502539727_354.jpg",
+      "label": "PKW1",
+      "predicted": "BROWN",
+      "confidence": 0.549,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/OIL/crop_1789975883067_830.jpg",
+      "label": "OIL",
+      "predicted": "SW",
+      "confidence": 0.541,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/OIL/old_crop_1789502526896_141.jpg",
+      "label": "OIL",
+      "predicted": "DOUBLE",
+      "confidence": 0.539,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/old_crop_1789502449221_60.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "TESTA",
+      "confidence": 0.535,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/wb_old_crop_cashew_1788562332979_0.jpg",
+      "label": "PKW2",
+      "predicted": "PKW1",
+      "confidence": 0.534,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975938347_1332.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.529,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975884866_860.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.528,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/OIL/old_crop_1789502538546_325.jpg",
+      "label": "OIL",
+      "predicted": "DOUBLE",
+      "confidence": 0.526,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502901713_11163.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "TESTA SMALL",
+      "confidence": 0.518,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/BROWN/wb_old_crop_cashew_1788561495606_7.jpg",
+      "label": "BROWN",
+      "predicted": "REJECTION",
+      "confidence": 0.517,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/wb_old_0103_cashew_1788562861368_839_1695.jpg",
+      "label": "PKW2",
+      "predicted": "PKW1",
+      "confidence": 0.514,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502441987_28.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.513,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/old_crop_1789502430294_4.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "DOUBLE",
+      "confidence": 0.513,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975755514_130.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.513,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975756377_133.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.508,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/old_crop_1789502466505_84.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "TESTA",
+      "confidence": 0.503,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW1/wb_old_crop_cashew_1788562656265_38.jpg",
+      "label": "PKW1",
+      "predicted": "PKW2",
+      "confidence": 0.5,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW1/wb_old_crop_cashew_1788563358554_4273.jpg",
+      "label": "PKW1",
+      "predicted": "PKW2",
+      "confidence": 0.5,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975887329_913.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.498,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/OIL/crop_1789975886148_881.jpg",
+      "label": "OIL",
+      "predicted": "DOUBLE",
+      "confidence": 0.492,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/crop_1789975884431_857.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "TESTA",
+      "confidence": 0.49,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975933766_1288.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.489,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/wb_old_0091_cashew_1788563252389_1752_1667.jpg",
+      "label": "PKW2",
+      "predicted": "PKW1",
+      "confidence": 0.489,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW1/wb_old_crop_cashew_1788563085198_2262.jpg",
+      "label": "PKW1",
+      "predicted": "PKW2",
+      "confidence": 0.477,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975755921_133.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.475,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/OIL/old_crop_1789502525918_111.jpg",
+      "label": "OIL",
+      "predicted": "DOUBLE",
+      "confidence": 0.473,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA/old_crop_1789502449651_61.jpg",
+      "label": "TESTA",
+      "predicted": "OIL",
+      "confidence": 0.471,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW1/wb_old_crop_cashew_1788562955671_5057.jpg",
+      "label": "PKW1",
+      "predicted": "PKW2",
+      "confidence": 0.469,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/SW/crop_1789975886926_903.jpg",
+      "label": "SW",
+      "predicted": "GOOD_CASHEW",
+      "confidence": 0.462,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975884817_860.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.46,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/OIL/old_crop_1789502537425_297.jpg",
+      "label": "OIL",
+      "predicted": "DOUBLE",
+      "confidence": 0.459,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975755986_133.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.454,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975932686_1265.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.447,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/wb_old_crop_cashew_1788562286709_9767.jpg",
+      "label": "PKW2",
+      "predicted": "PKW1",
+      "confidence": 0.445,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/SW/crop_1789975882970_838.jpg",
+      "label": "SW",
+      "predicted": "GOOD_CASHEW",
+      "confidence": 0.44,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975887043_891.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.439,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/SW/crop_1789975882913_838.jpg",
+      "label": "SW",
+      "predicted": "KNIEF_MARK",
+      "confidence": 0.439,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975933833_1295.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.434,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/DOUBLE/old_crop_1789502535034_209.jpg",
+      "label": "DOUBLE",
+      "predicted": "DW2",
+      "confidence": 0.432,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975939494_1358.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.431,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975887201_901.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.431,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975936757_1320.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.425,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW1/wb_old_crop_cashew_1788563252389_7.jpg",
+      "label": "PKW1",
+      "predicted": "PKW2",
+      "confidence": 0.425,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975936799_1320.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.424,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/wb_old_crop_cashew_1788563192720_9.jpg",
+      "label": "PKW2",
+      "predicted": "PKW1",
+      "confidence": 0.424,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/wb_old_crop_cashew_1788562861368_174.jpg",
+      "label": "PKW2",
+      "predicted": "PKW1",
+      "confidence": 0.424,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/wb_old_crop_cashew_1788732650579_2621.jpg",
+      "label": "PKW2",
+      "predicted": "PKW1",
+      "confidence": 0.424,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975937941_1323.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.422,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502526159_114.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DOUBLE",
+      "confidence": 0.42,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/WHITE_DW/old_crop_1789502449701_61.jpg",
+      "label": "WHITE_DW",
+      "predicted": "TESTA SMALL",
+      "confidence": 0.419,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975756288_134.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.418,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA/crop_1789975935845_1318.jpg",
+      "label": "TESTA",
+      "predicted": "TESTA SMALL",
+      "confidence": 0.408,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975934538_1308.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.407,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975935748_1314.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.405,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502442224_28.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "TESTA SMALL",
+      "confidence": 0.405,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/old_crop_1789502435418_19.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "TESTA",
+      "confidence": 0.405,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/REJECTION/old_crop_1789502776190_7964.jpg",
+      "label": "REJECTION",
+      "predicted": "BROWN",
+      "confidence": 0.404,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975886338_877.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.404,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW1/wb_old_crop_cashew_1788563085198_4284.jpg",
+      "label": "PKW1",
+      "predicted": "PKW2",
+      "confidence": 0.402,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975756090_130.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.398,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975756236_134.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.396,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/BROWN/old_crop_1789502557793_537.jpg",
+      "label": "BROWN",
+      "predicted": "REJECTION",
+      "confidence": 0.395,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975755869_129.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.393,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975933631_1286.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.393,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975936052_1314.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.392,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975933902_1281.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.391,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975755457_129.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.39,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/wb_old_crop_cashew_1788732650579_8247.jpg",
+      "label": "PKW2",
+      "predicted": "DOUBLE",
+      "confidence": 0.387,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975884920_860.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.384,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW1/wb_old_crop_cashew_1788563435818_8996.jpg",
+      "label": "PKW1",
+      "predicted": "PKW2",
+      "confidence": 0.384,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975884984_860.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.383,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/old_crop_1789502436235_19.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "DOUBLE",
+      "confidence": 0.382,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/wb_old_crop_cashew_1788562656265_8696.jpg",
+      "label": "PKW2",
+      "predicted": "PKW1",
+      "confidence": 0.379,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975932431_1260.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.377,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502533120_164.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "TESTA SMALL",
+      "confidence": 0.375,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975755921_130.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.375,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975756524_133.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "KNIEF_MARK",
+      "confidence": 0.373,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975932431_1259.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.37,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW1/wb_old_crop_cashew_1788563358554_7.jpg",
+      "label": "PKW1",
+      "predicted": "PKW2",
+      "confidence": 0.37,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/wb_old_crop_cashew_1788562814232_6382.jpg",
+      "label": "PKW2",
+      "predicted": "PKW1",
+      "confidence": 0.37,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/SW/crop_1789975886592_881.jpg",
+      "label": "SW",
+      "predicted": "GOOD_CASHEW",
+      "confidence": 0.37,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502444793_41.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DOUBLE",
+      "confidence": 0.366,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975887404_911.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.366,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA/crop_1789975886022_877.jpg",
+      "label": "TESTA",
+      "predicted": "TESTA SMALL",
+      "confidence": 0.363,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/SW/crop_1789975883269_838.jpg",
+      "label": "SW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.362,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975756142_133.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.361,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW1/wb_old_crop_cashew_1788563252389_9.jpg",
+      "label": "PKW1",
+      "predicted": "PKW2",
+      "confidence": 0.36,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789409944840_26.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.357,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975934624_1312.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.356,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA/old_crop_1789502466208_80.jpg",
+      "label": "TESTA",
+      "predicted": "TESTA SMALL",
+      "confidence": 0.355,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502430824_5.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DOUBLE",
+      "confidence": 0.349,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975932748_1273.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.348,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975755716_132.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.345,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975936106_1314.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.344,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/DW1/crop_1789975933060_1276.jpg",
+      "label": "DW1",
+      "predicted": "SW",
+      "confidence": 0.344,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975935232_1312.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "PKW1",
+      "confidence": 0.342,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/wb_old_crop_cashew_1788562543418_6207.jpg",
+      "label": "PKW2",
+      "predicted": "PKW1",
+      "confidence": 0.341,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975937300_1320.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.34,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/KNIEF_MARK/crop_1789975938734_1350.jpg",
+      "label": "KNIEF_MARK",
+      "predicted": "SW",
+      "confidence": 0.339,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/old_crop_1789502435684_19.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "GOOD_CASHEW",
+      "confidence": 0.339,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW1/old_crop_1789502544308_437.jpg",
+      "label": "PKW1",
+      "predicted": "DOUBLE",
+      "confidence": 0.337,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975758504_140.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.336,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975936604_1320.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.336,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975755513_129.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.332,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA/old_crop_1789502466752_86.jpg",
+      "label": "TESTA",
+      "predicted": "TESTA SMALL",
+      "confidence": 0.327,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/DOUBLE/old_crop_1789502526240_115.jpg",
+      "label": "DOUBLE",
+      "predicted": "TESTA",
+      "confidence": 0.326,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/OIL/old_crop_1789502537639_306.jpg",
+      "label": "OIL",
+      "predicted": "DOUBLE",
+      "confidence": 0.326,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975885922_874.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.324,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/SW/crop_1789975883357_838.jpg",
+      "label": "SW",
+      "predicted": "TESTA SMALL",
+      "confidence": 0.324,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975756433_134.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.323,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975755870_130.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.32,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975756525_134.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.319,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502531567_153.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.318,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/UPW/old_crop_1789502599061_1020.jpg",
+      "label": "UPW",
+      "predicted": "TESTA",
+      "confidence": 0.317,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975937260_1320.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.316,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/SW/crop_1789975883409_838.jpg",
+      "label": "SW",
+      "predicted": "DOUBLE",
+      "confidence": 0.316,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975755768_132.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.31,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/wb_old_0100_cashew_1788562543418_791_213.jpg",
+      "label": "PKW2",
+      "predicted": "PKW1",
+      "confidence": 0.31,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975753338_125.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.308,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975934097_1301.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.307,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502530729_149.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "TESTA SMALL",
+      "confidence": 0.306,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW1/wb_old_crop_cashew_1788563304200_8313.jpg",
+      "label": "PKW1",
+      "predicted": "PKW2",
+      "confidence": 0.306,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975752420_121.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.305,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975885155_866.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.304,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/UPW/old_crop_1789502622423_1675.jpg",
+      "label": "UPW",
+      "predicted": "TESTA",
+      "confidence": 0.303,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975932621_1266.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "TESTA SMALL",
+      "confidence": 0.303,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975937216_1320.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.3,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502430823_4.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "TESTA SMALL",
+      "confidence": 0.3,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789409944594_26.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.3,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/OIL/proj_crop_1789975753658_126.jpg",
+      "label": "OIL",
+      "predicted": "KNIEF_MARK",
+      "confidence": 0.3,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975756046_133.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.3,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/UPW/old_crop_1789502607089_1170.jpg",
+      "label": "UPW",
+      "predicted": "TESTA",
+      "confidence": 0.299,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975884984_859.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "OIL",
+      "confidence": 0.297,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/SW/crop_1789975883315_838.jpg",
+      "label": "SW",
+      "predicted": "DW1",
+      "confidence": 0.295,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW1/old_crop_1789502617280_1516.jpg",
+      "label": "PKW1",
+      "predicted": "KNIEF_MARK",
+      "confidence": 0.294,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975936273_1314.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.292,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502537424_296.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DOUBLE",
+      "confidence": 0.29,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW1/old_crop_1789502616903_1500.jpg",
+      "label": "PKW1",
+      "predicted": "PKW2",
+      "confidence": 0.289,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/SW/crop_1789975886725_881.jpg",
+      "label": "SW",
+      "predicted": "GOOD_CASHEW",
+      "confidence": 0.287,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975935401_1312.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.286,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975932491_1261.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.283,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/DOUBLE/old_crop_1789502535102_209.jpg",
+      "label": "DOUBLE",
+      "predicted": "DW1",
+      "confidence": 0.283,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975881796_825.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.28,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/old_crop_1789502793383_8774.jpg",
+      "label": "PKW2",
+      "predicted": "PKW1",
+      "confidence": 0.278,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502526426_122.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.278,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975937999_1323.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.278,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975933700_1288.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.276,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW1/crop_1789975938945_1357.jpg",
+      "label": "PKW1",
+      "predicted": "TESTA SMALL",
+      "confidence": 0.276,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975881494_825.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.274,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/old_crop_1789502435818_19.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "GOOD_CASHEW",
+      "confidence": 0.272,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975752175_122.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "TESTA SMALL",
+      "confidence": 0.269,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/SW/crop_1789975883020_838.jpg",
+      "label": "SW",
+      "predicted": "DOUBLE",
+      "confidence": 0.266,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502469635_103.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.263,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975885328_868.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.262,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975934097_1281.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.261,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW2/crop_1789975933109_1275.jpg",
+      "label": "PKW2",
+      "predicted": "OIL",
+      "confidence": 0.26,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502846985_10757.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "TESTA SMALL",
+      "confidence": 0.26,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW1/wb_old_crop_0202.jpg",
+      "label": "PKW1",
+      "predicted": "PKW2",
+      "confidence": 0.26,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/OIL/old_crop_1789502537567_308.jpg",
+      "label": "OIL",
+      "predicted": "DOUBLE",
+      "confidence": 0.259,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/KNIEF_MARK/crop_1789975938892_1350.jpg",
+      "label": "KNIEF_MARK",
+      "predicted": "OIL",
+      "confidence": 0.257,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/old_crop_1789502435772_19.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "SW",
+      "confidence": 0.256,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975881900_825.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.255,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW1/old_crop_1789502545819_465.jpg",
+      "label": "PKW1",
+      "predicted": "WHITE_DW",
+      "confidence": 0.255,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/UPW/old_crop_1789502622181_1673.jpg",
+      "label": "UPW",
+      "predicted": "TESTA",
+      "confidence": 0.254,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975886148_882.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.251,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975934711_1312.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "WHITE_DW",
+      "confidence": 0.244,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA/old_crop_1789502558742_565.jpg",
+      "label": "TESTA",
+      "predicted": "WHITE_DW",
+      "confidence": 0.243,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975934784_1312.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.241,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975932747_1271.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.241,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502441618_28.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "TESTA SMALL",
+      "confidence": 0.24,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975884429_855.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.237,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975756288_133.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.232,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/UPW/crop_1790065833295_22.jpg",
+      "label": "UPW",
+      "predicted": "DW1",
+      "confidence": 0.23,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975881645_825.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.227,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975881698_825.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "KNIEF_MARK",
+      "confidence": 0.226,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/proj_crop_1789975753601_125.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.224,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/KNIEF_MARK/crop_1789975938782_1350.jpg",
+      "label": "KNIEF_MARK",
+      "predicted": "SW",
+      "confidence": 0.224,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502469449_103.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.223,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502531970_161.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.223,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502469784_103.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.22,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA/old_crop_1789502558875_568.jpg",
+      "label": "TESTA",
+      "predicted": "UPW",
+      "confidence": 0.217,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502536226_243.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.208,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/OIL/old_crop_1789502535103_212.jpg",
+      "label": "OIL",
+      "predicted": "DW1",
+      "confidence": 0.208,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502536717_261.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.207,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975935950_1317.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.207,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975932795_1273.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.206,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502536297_247.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DOUBLE",
+      "confidence": 0.206,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975939206_1358.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.205,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975936505_1317.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.202,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/old_crop_1789502811444_9734.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW1",
+      "confidence": 0.199,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975934149_1281.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "SW",
+      "confidence": 0.188,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/SW/crop_1789975883567_838.jpg",
+      "label": "SW",
+      "predicted": "DW1",
+      "confidence": 0.187,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/old_crop_1789502435909_19.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "GOOD_CASHEW",
+      "confidence": 0.184,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/PKW1/old_crop_1789502436770_20.jpg",
+      "label": "PKW1",
+      "predicted": "WHITE_DW",
+      "confidence": 0.179,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/old_crop_1789502435952_19.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "GOOD_CASHEW",
+      "confidence": 0.179,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/old_crop_1789502435994_19.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "DW2",
+      "confidence": 0.175,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/old_crop_1789502435869_19.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "DW2",
+      "confidence": 0.161,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/TESTA SMALL/old_crop_1789502436089_19.jpg",
+      "label": "TESTA SMALL",
+      "predicted": "DW1",
+      "confidence": 0.144,
+      "kind": "WRONG AFTER TRAINING"
+    },
+    {
+      "path": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/programs/Default/dataset/GOOD_CASHEW/crop_1789975887329_912.jpg",
+      "label": "GOOD_CASHEW",
+      "predicted": "DW2",
+      "confidence": 0.139,
+      "kind": "WRONG AFTER TRAINING"
+    }
+  ],
+  "wrong_images_total": 232,
+  "pass_classes": [
+    "GOOD",
+    "GOOD_CASHEW"
+  ],
+  "pretrained": true,
+  "device": "cuda",
+  "history": [
+    {
+      "epoch": 1,
+      "loss": 3.2577,
+      "val_acc": 0.0637,
+      "val_balanced_acc": 0.134,
+      "train_acc": 0.0706,
+      "val_loss": 4.0268
+    },
+    {
+      "epoch": 2,
+      "loss": 3.1311,
+      "val_acc": 0.1554,
+      "val_balanced_acc": 0.2376,
+      "train_acc": 0.1204,
+      "val_loss": 3.7771
+    },
+    {
+      "epoch": 3,
+      "loss": 2.6694,
+      "val_acc": 0.6348,
+      "val_balanced_acc": 0.5369,
+      "train_acc": 0.3247,
+      "val_loss": 3.2076
+    },
+    {
+      "epoch": 4,
+      "loss": 2.1055,
+      "val_acc": 0.5805,
+      "val_balanced_acc": 0.5789,
+      "train_acc": 0.6354,
+      "val_loss": 2.9276
+    },
+    {
+      "epoch": 5,
+      "loss": 1.9129,
+      "val_acc": 0.6742,
+      "val_balanced_acc": 0.6672,
+      "train_acc": 0.6684,
+      "val_loss": 2.8425
+    },
+    {
+      "epoch": 6,
+      "loss": 1.7446,
+      "val_acc": 0.588,
+      "val_balanced_acc": 0.7603,
+      "train_acc": 0.7199,
+      "val_loss": 2.8037
+    },
+    {
+      "epoch": 7,
+      "loss": 1.6218,
+      "val_acc": 0.6142,
+      "val_balanced_acc": 0.7299,
+      "train_acc": 0.7604,
+      "val_loss": 2.7465
+    },
+    {
+      "epoch": 8,
+      "loss": 1.576,
+      "val_acc": 0.573,
+      "val_balanced_acc": 0.7315,
+      "train_acc": 0.7795,
+      "val_loss": 2.9581
+    },
+    {
+      "epoch": 9,
+      "loss": 1.521,
+      "val_acc": 0.7191,
+      "val_balanced_acc": 0.7687,
+      "train_acc": 0.8177,
+      "val_loss": 2.6882
+    },
+    {
+      "epoch": 10,
+      "loss": 1.4915,
+      "val_acc": 0.6423,
+      "val_balanced_acc": 0.7513,
+      "train_acc": 0.8333,
+      "val_loss": 2.7088
+    },
+    {
+      "epoch": 11,
+      "loss": 1.4479,
+      "val_acc": 0.8109,
+      "val_balanced_acc": 0.7728,
+      "train_acc": 0.8501,
+      "val_loss": 2.5537
+    },
+    {
+      "epoch": 12,
+      "loss": 1.4129,
+      "val_acc": 0.7903,
+      "val_balanced_acc": 0.7689,
+      "train_acc": 0.8617,
+      "val_loss": 2.5962
+    },
+    {
+      "epoch": 13,
+      "loss": 1.385,
+      "val_acc": 0.7491,
+      "val_balanced_acc": 0.764,
+      "train_acc": 0.8785,
+      "val_loss": 2.6708
+    },
+    {
+      "epoch": 14,
+      "loss": 1.3593,
+      "val_acc": 0.6966,
+      "val_balanced_acc": 0.7306,
+      "train_acc": 0.901,
+      "val_loss": 2.6558
+    },
+    {
+      "epoch": 15,
+      "loss": 1.3593,
+      "val_acc": 0.6816,
+      "val_balanced_acc": 0.725,
+      "train_acc": 0.9062,
+      "val_loss": 2.6407
+    },
+    {
+      "epoch": 16,
+      "loss": 1.3611,
+      "val_acc": 0.6367,
+      "val_balanced_acc": 0.7482,
+      "train_acc": 0.9172,
+      "val_loss": 2.6999
+    },
+    {
+      "epoch": 17,
+      "loss": 1.3318,
+      "val_acc": 0.6592,
+      "val_balanced_acc": 0.7439,
+      "train_acc": 0.9253,
+      "val_loss": 2.5915
+    },
+    {
+      "epoch": 18,
+      "loss": 1.3099,
+      "val_acc": 0.6124,
+      "val_balanced_acc": 0.7358,
+      "train_acc": 0.9363,
+      "val_loss": 2.6537
+    },
+    {
+      "epoch": 19,
+      "loss": 1.3157,
+      "val_acc": 0.6217,
+      "val_balanced_acc": 0.7474,
+      "train_acc": 0.9288,
+      "val_loss": 2.7042
+    },
+    {
+      "epoch": 20,
+      "loss": 1.2836,
+      "val_acc": 0.618,
+      "val_balanced_acc": 0.7333,
+      "train_acc": 0.9456,
+      "val_loss": 2.6902
+    },
+    {
+      "epoch": 21,
+      "loss": 1.3222,
+      "val_acc": 0.6461,
+      "val_balanced_acc": 0.7539,
+      "train_acc": 0.9155,
+      "val_loss": 2.6183
+    },
+    {
+      "epoch": 22,
+      "loss": 1.308,
+      "val_acc": 0.706,
+      "val_balanced_acc": 0.7542,
+      "train_acc": 0.9306,
+      "val_loss": 2.6414
+    },
+    {
+      "epoch": 23,
+      "loss": 1.2842,
+      "val_acc": 0.6742,
+      "val_balanced_acc": 0.76,
+      "train_acc": 0.9479,
+      "val_loss": 2.6281
+    },
+    {
+      "epoch": 24,
+      "loss": 1.2897,
+      "val_acc": 0.6536,
+      "val_balanced_acc": 0.7512,
+      "train_acc": 0.9537,
+      "val_loss": 2.6601
+    },
+    {
+      "epoch": 25,
+      "loss": 1.2887,
+      "val_acc": 0.6779,
+      "val_balanced_acc": 0.7601,
+      "train_acc": 0.9508,
+      "val_loss": 2.6249
+    },
+    {
+      "epoch": 26,
+      "loss": 1.2807,
+      "val_acc": 0.7097,
+      "val_balanced_acc": 0.7611,
+      "train_acc": 0.9531,
+      "val_loss": 2.6189
+    },
+    {
+      "epoch": 27,
+      "loss": 1.2879,
+      "val_acc": 0.6929,
+      "val_balanced_acc": 0.7653,
+      "train_acc": 0.952,
+      "val_loss": 2.6193
+    },
+    {
+      "epoch": 28,
+      "loss": 1.2599,
+      "val_acc": 0.6404,
+      "val_balanced_acc": 0.7594,
+      "train_acc": 0.9635,
+      "val_loss": 2.6694
+    },
+    {
+      "epoch": 29,
+      "loss": 1.2747,
+      "val_acc": 0.6798,
+      "val_balanced_acc": 0.7584,
+      "train_acc": 0.9583,
+      "val_loss": 2.6284
+    },
+    {
+      "epoch": 30,
+      "loss": 1.2637,
+      "val_acc": 0.6742,
+      "val_balanced_acc": 0.7644,
+      "train_acc": 0.9485,
+      "val_loss": 2.6292
+    }
+  ],
+  "note": "Accuracy is measured on validation images that were not used for training. All frames of one cashew are in the same part, so a validation cashew was never seen in training.",
+  "reports": {
+    "curves": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/saved_models/cnn_Default_20261013_155818_curves.png",
+    "classes": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/saved_models/cnn_Default_20261013_155818_classes.png",
+    "confusion": "/home/phoenix/Documents/GSN_V21_ANTIGRAVITY/CNN/saved_models/cnn_Default_20261013_155818_confusion.png"
+  }
+}

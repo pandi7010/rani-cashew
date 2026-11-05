@@ -1375,7 +1375,7 @@ class ProcessingThread(threading.Thread):
                                    zip(boxes, classes, confs))
             pt = self.perf.lap("mask + tight box", pt)
             for det in detections:
-                det.weak = det.data["yolo_conf"] < target_conf
+                det.weak = (det.data["yolo_conf"] < target_conf) or det.data.get("is_bg", False)
             tracker = self.trackers[rid]
             tracker.params = {**tracker.params, **grading.get("tracker", {})}
             tracks = tracker.update(detections, t_ms, flow, roi)
@@ -1480,12 +1480,18 @@ class ProcessingThread(threading.Thread):
         data["_seg"] = (seg, seg_crop)              # for step 2; taken out again before the data is stored
 
         # CNN crop: made exactly as before (preprocess.py), so the model sees what it was trained on.
+        is_bg = False
         if self.cnn_model is not None:
             cashew_area, cashew_rect = self._get_cashew_contour_rect(clean_frame[by1:by2, bx1:bx2])
             if cashew_rect is not None and cashew_area >= 150:
                 rx, ry, rw, rh = cashew_rect
                 margin = 4
                 data["box"] = [max(0, bx1 + rx - margin), max(0, by1 + ry - margin), min(W, bx1 + rx + rw + margin), min(H, by1 + ry + rh + margin)]
+            elif seg is None:
+                is_bg = True
+        elif seg is None:
+            is_bg = True
+        data["is_bg"] = is_bg
         return Detection(cx, cy, data["box"], data)
 
     def _measure_features(self, det, rules):
@@ -1602,12 +1608,24 @@ class ProcessingThread(threading.Thread):
         engine_mode = {**engines.ENGINE_DEFAULTS, **grading.get("engines", {})}
         px_per_mm = px_per_mm_of(state["size_config"], rid)
         feats = [f["feat"] for f in trk.frames if f["feat"]]
+        if not feats:
+            trk.info["result"] = decision.BACKGROUND
+            self.shared_state.count_result(f"{decision.IGNORED_PREFIX}{decision.BACKGROUND}")
+            self.cashew_log.write({
+                "id": trk.id, "roi": rid, "frames": len(trk.frames), "result": decision.BACKGROUND,
+                "reason": "NO_CASHEW_MASK", "fire": "NOT_FIRED", "shadow": self._track_note(trk, rid)
+            }, frames=self._frame_rows(trk))
+            self.undefined_capture.forget(trk.id)
+            return
         first = trk.path[0]
         past_at_first = fg.progress(flow, line, first[1], first[2])
         votes = [decision.FrameVote(f["t"], f["cnn"], f["cnn_conf"], f["yolo"], f["yolo_conf"], f["view"],
                                     not f["edge_cut"] and not f.get("below_class_conf"))
                  for f in trk.frames]
-        d = decision.decide(votes, grading.get("voting"), grading.get("priority"), grading.get("good_classes"),
+        v_dict = dict(grading.get("voting", {}))
+        if "good_cashew" in state.get("class_confs", {}):
+            v_dict["good_conf"] = float(state["class_confs"]["good_cashew"]) / 100.0
+        d = decision.decide(votes, v_dict, grading.get("priority"), grading.get("good_classes"),
                             grading.get("skin_classes"), state.get("priority_rules"),
                             double=engines.is_double([x["length_px"] for x in feats], px_per_mm, grading.get("double")),
                             appeared_after_line=past_at_first >= 0, stuck=trk.stuck, lost_ms=trk.max_gap_ms,
@@ -1642,6 +1660,18 @@ class ProcessingThread(threading.Thread):
         mm_width = (med("width_px") or 0.0) / px_per_mm
         mm_area = (med("area_px") or 0.0) / px_per_mm ** 2
         size_cfg = state["size_config"]
+
+        if mm_length < 8.0 or mm_width < 4.0 or mm_area < 25.0:
+            trk.info["result"] = decision.NOISE
+            self.shared_state.count_result(f"{decision.IGNORED_PREFIX}{decision.NOISE}")
+            self.cashew_log.write({
+                "id": trk.id, "roi": rid, "frames": len(trk.frames), "result": decision.NOISE,
+                "reason": f"TOO_SMALL_{mm_length:.1f}x{mm_width:.1f}mm", "fire": "NOT_FIRED",
+                "shadow": self._track_note(trk, rid)
+            }, frames=self._frame_rows(trk))
+            self.undefined_capture.forget(trk.id)
+            return
+
         colour_values = colour_size.track_colour(feats)
         colour, colour_value = colour_size.colour_of(colour_values, size_cfg.get("colour"))
         relay, grade = None, ""
@@ -1738,7 +1768,7 @@ class ProcessingThread(threading.Thread):
         norm_res = normalize_name(d.result)
         v_cfg = grading.get("voting", {})
         def_conf = float(v_cfg.get("defect_conf", 0.5))
-        gd_conf = float(v_cfg.get("good_conf", 0.8))
+        gd_conf = float(v_cfg.get("good_conf", state.get("class_confs", {}).get("good_cashew", 50) / 100.0))
         rej_conf = float(v_cfg.get("rejection_conf", 0.5))
 
         cashew_frame_cards = []
@@ -1859,6 +1889,9 @@ class ProcessingThread(threading.Thread):
         other = self.trackers[rid].companion(trk, flow)
         if other is not None and (trk.hits <= other.hits or trk.hits <= self.FRAGMENT_MAX_HITS):
             return decision.MERGED, other
+        # Roller background / dust / stain: never had a valid cashew mask in any frame
+        if trk.frames and not any(bool(f.get("feat")) for f in trk.frames):
+            return decision.BACKGROUND, None
         usual = self._usual_box_area(rid)
         box_area = abs(trk.box[2] - trk.box[0]) * abs(trk.box[3] - trk.box[1])
         if usual > 0 and trk.hits <= self.NOISE_MAX_HITS and box_area < self.NOISE_AREA_SHARE * usual:
@@ -5607,6 +5640,10 @@ except Exception as e:
         try:
             val = int(var.get())
             self.shared_state.set_class_conf(cname, val)
+            if cname.lower() == "good_cashew":
+                self.shared_state.grading.setdefault("voting", {})["good_conf"] = val / 100.0
+                if hasattr(self, "grading_vars") and ("voting", "good_conf") in self.grading_vars:
+                    self.grading_vars[("voting", "good_conf")].set(f"{val / 100.0:g}")
         except (ValueError, tk.TclError): pass
 
     def _add_priority_logic(self):
@@ -6253,6 +6290,11 @@ except Exception as e:
                         raise ValueError(f"{key} must be a whole number")
                     value = int(value)
                 g[section][key] = value
+                if key == "good_conf":
+                    c_val = int(round(value * 100))
+                    self.shared_state.set_class_conf("good_cashew", c_val)
+                    if hasattr(self, "conf_vars") and "good_cashew" in self.conf_vars:
+                        self.conf_vars["good_cashew"].set(c_val)
             if g["voting"]["neck_weight"] < 1 or g["voting"]["defect_min_frames"] < 1 or g["voting"]["good_min_frames"] < 1 or g["voting"]["rejection_min_frames"] < 1:
                 raise ValueError("frame counts and the NECK weight must be at least 1")
             if g["segmentation"]["blue_h_min"] >= g["segmentation"]["blue_h_max"] or g["segmentation"]["blue_h_max"] > 179:

@@ -59,5 +59,14 @@ class SmallObjects(unittest.TestCase):
         self.assertEqual(engines.RULE_DEFAULTS["min_object_mm"], 0.0)
 
 
+class MasklessRollerMarks(unittest.TestCase):
+    def test_track_with_no_feat_is_background(self):
+        # A track whose frames all have feat=None (roller stain, dust, scratch)
+        trk = track([(0, 240), (16, 202), (32, 164)])
+        trk.frames = [{"t": 0, "feat": None}, {"t": 16, "feat": None}, {"t": 32, "feat": None}]
+        self.assertFalse(any(bool(f.get("feat")) for f in trk.frames))
+
+
 if __name__ == "__main__":
     unittest.main()
+

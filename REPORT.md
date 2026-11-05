@@ -134,6 +134,53 @@ Please use one assistant at a time on this folder.
 
 ---
 
+## 2026-10-14 (13): GOOD Cashew Resulting as UNDEFINED (low_confidence) Fix
+
+Owner: "why cnn is showing as undefined, if you see there in frames there is a cnn saying good cashew but it goes to undefined why? still it is showing undefined. cnn is well trained i know."
+
+### Root Cause
+In Cashew Inspection `R1-000025`, 31 usable frames were captured. The CNN consistently predicted `GOOD_CASHEW` (e.g. 74%, 72%, 63%, 58%, 57%, 54%). However:
+1. In `pneumatic_config.json`, `grading["voting"]["good_conf"]` was set to `0.8` (80%), requiring frames to reach ≥ 80% confidence before counting as `good_frames`.
+2. Because none of the frames reached 80% (they were 54%–74%), `d.good_frames` remained `0` (`GOOD frames 0`).
+3. Since no defect reached its threshold either, `decision.py` reached `line 227` and classified the cashew as `UNDEFINED (low_confidence)` with `reject = True`, firing Ejector A01 (Reject).
+4. The user adjusted the `GOOD_CASHEW` slider under **Sorting Logic → CONFIDENCE THRESHOLDS** to 50%, but that slider only modified `class_confs["good_cashew"]` and never updated `grading["voting"]["good_conf"]`, leaving the 80% threshold active.
+
+### Solution Applied
+1. **Config Update**: In `pneumatic_config.json`, lowered `grading["voting"]["good_conf"]` from `0.8` to `0.5` (50%), matching `class_confs["good_cashew"] = 50`.
+2. **Two-Way Sync**:
+   - In `cashew_cnn_grader.py` (`_decide_track`): dynamically overrides `voting["good_conf"]` with `state["class_confs"]["good_cashew"] / 100.0`.
+   - In `_update_class_conf`: whenever the user adjusts the `GOOD_CASHEW` slider in the UI, `self.shared_state.grading["voting"]["good_conf"]` and the `good_conf` input variable are updated immediately.
+   - In `_build_grading_section`: saving grading configuration synchronizes `good_conf` back to `class_confs["good_cashew"]` and the UI slider.
+   - In `_frame_cards`: `gd_conf` aligns with the active good threshold so concluding frames are properly highlighted in the inspection modal.
+3. **Verified**: Simulation with `R1-000025` frames now yields `Result: GOOD, Reason: good, Reject: False, Good frames qualifying: 6`. Full test suite (217 tests) passing.
+
+---
+
+## 2026-10-13 (12): Filter roller stains, scratches and dust from triggering rejection
+
+Owner: "we have a well trained yolo model where it's work is to found the cashew and send the image to the cnn, but here the roller is also detected as a rejection. like in the roler if it contains some strains or dust or something it is getting detected. wrk on it."
+
+### Root Cause Identified
+In `cashews_20261013.csv`, 93 false tracks (e.g. `R2-000004` at 23:31:39) occurred on empty roller marks:
+1. YOLO detected dark stains / dust on the roller with class `REJECTION` (or low conf).
+2. Because it was on the rotating roller, `moves_with_belt` was true (speed ~1.75 px/ms).
+3. The crop had **no cashew body** (`(no mask)` across all 16 frames; `mm_length=0.0`, `mm_width=0.0`).
+4. At the Decision line, because CNN confidence was low or `rejection_seen`, `decision.py` produced `UNDEFINED (low_confidence)` with `reject = True`, which routed to Ejector A21 (Reject Ejector) and fired.
+5. In `pneumatic_config.json`, `min_object_mm` was default `0.0` (off).
+
+### Solution Implemented
+1. **Background Exclusion in Tracking (`cashew_cnn_grader.py`)**:
+   - In `_locate_detection`: If neither blue-subtraction mask nor cashew contour finds any cashew in the crop, marked `det.is_bg = True` and `det.weak = True`. Weak detections cannot initiate new track IDs.
+2. **Maskless Track Exclusion (`_fragment_kind`)**:
+   - If a track reaches the Decision line or ends with **zero frames having a cashew mask** (`not any(f.get("feat") for f in trk.frames)`), it is classified as `decision.BACKGROUND` and closed with `fire = "NOT_FIRED"`.
+3. **Decision Safety Barrier (`_decide_track`)**:
+   - If `feats` is empty (`mm_length == 0.0`), immediately logged as `BACKGROUND` (`NO_CASHEW_MASK`) with `fire = "NOT_FIRED"`, bypassing `decision.py` and `REJECT_RELAY`.
+   - If median size is below real cashew limits (`mm_length < 8.0` or `mm_width < 4.0` or `mm_area < 25.0`), closed as `NOISE` without firing.
+4. **Configuration Baseline (`pneumatic_config.json`)**:
+   - Set `"min_object_mm": 10.0` inside `"rules"` so any object smaller than 10 mm (100 px) is automatically treated as noise.
+
+---
+
 ## 2026-10-13 (11): The roller and marks on it no longer fire the reject ejector
 
 Owner: "if there is not a cashew also, the background like the roller is detected ... as a rejection. Work on it."
